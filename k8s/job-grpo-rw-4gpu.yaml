@@ -1,0 +1,127 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grpo-rw-4gpu-job
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: ghcr.io/kkuntal990/ms-swift-qwen:latest
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "=== GRPO RW Training (4-GPU, vLLM colocate) ==="
+          echo "Model: ${MODEL_ID}"
+          echo "Dataset: ${DATASET_PATH}"
+          echo "Output: ${OUTPUT_DIR}"
+
+          # Install additional dependencies
+          pip install trl>=0.16.0 peft>=0.14.0
+
+          # Copy code
+          cp -r /app/vlm-grpo/* /workspace/
+          cd /workspace
+
+          # Run training
+          accelerate launch --num_processes=4 train_grpo_rw.py \
+            --model_id "${MODEL_ID}" \
+            --dataset_path "${DATASET_PATH}" \
+            --val_dataset_path "${VAL_DATASET_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            --image_base_dir "${IMAGE_BASE_DIR}" \
+            --num_generations "${NUM_GENERATIONS:-4}" \
+            --max_completion_length "${MAX_COMPLETION_LENGTH:-512}" \
+            --learning_rate "${LEARNING_RATE:-1e-5}" \
+            --per_device_train_batch_size "${BATCH_SIZE:-1}" \
+            --gradient_accumulation_steps "${GRAD_ACC:-4}" \
+            --num_train_epochs "${EPOCHS:-1}" \
+            --vllm_mode colocate \
+            --vllm_gpu_memory_utilization "${VLLM_GPU_MEM:-0.3}" \
+            --lora_r "${LORA_R:-16}" \
+            --lora_alpha "${LORA_ALPHA:-32}" \
+            --w_rw "${W_RW:-2.0}" \
+            --w_final "${W_FINAL:-1.0}" \
+            --w_format "${W_FORMAT:-0.5}" \
+            --w_edit "${W_EDIT:-0.3}" \
+            --w_fb "${W_FB:-0.5}" \
+            --seed "${SEED:-42}"
+
+          echo "=== Training complete ==="
+        env:
+        - name: MODEL_ID
+          value: "/outputs/llava-1.5-sft-checkpoint"
+        - name: DATASET_PATH
+          value: "/outputs/grpo_data/answer1_correct_train.jsonl"
+        - name: VAL_DATASET_PATH
+          value: "/outputs/grpo_data/answer1_correct_test.jsonl"
+        - name: OUTPUT_DIR
+          value: "/outputs/grpo_rw_v1"
+        - name: IMAGE_BASE_DIR
+          value: "/outputs/image_base"
+        - name: NUM_GENERATIONS
+          value: "4"
+        - name: MAX_COMPLETION_LENGTH
+          value: "512"
+        - name: LEARNING_RATE
+          value: "1e-5"
+        - name: BATCH_SIZE
+          value: "1"
+        - name: GRAD_ACC
+          value: "4"
+        - name: EPOCHS
+          value: "1"
+        - name: VLLM_GPU_MEM
+          value: "0.3"
+        - name: LORA_R
+          value: "16"
+        - name: LORA_ALPHA
+          value: "32"
+        - name: W_RW
+          value: "2.0"
+        - name: W_FINAL
+          value: "1.0"
+        - name: W_FORMAT
+          value: "0.5"
+        - name: W_EDIT
+          value: "0.3"
+        - name: W_FB
+          value: "0.5"
+        - name: SEED
+          value: "42"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+        - name: HF_HOME
+          value: "/cache/huggingface"
+        - name: WANDB_PROJECT
+          value: "vlm-grpo-rw"
+        resources:
+          limits:
+            nvidia.com/gpu: "4"
+          requests:
+            nvidia.com/gpu: "4"
+            memory: "64Gi"
+            cpu: "16"
+        volumeMounts:
+        - name: cache
+          mountPath: /cache
+        - name: outputs
+          mountPath: /outputs
+        - name: code
+          mountPath: /app/vlm-grpo
+      volumes:
+      - name: cache
+        persistentVolumeClaim:
+          claimName: cache-pvc
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: outputs-pvc
+      - name: code
+        configMap:
+          name: grpo-rw-code
