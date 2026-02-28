@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: grpo-jupyter-dev
+  labels:
+    app: vlm-grpo
+    task: development
+spec:
+  restartPolicy: Never
+  containers:
+  - name: jupyter-container
+    image: huggingface/trl:0.29.0
+    command: ["bash", "-c"]
+    args:
+    - |
+      set -e
+      echo "=== Installing runtime dependencies ==="
+      uv pip install --system "vllm==0.12.0" wandb jupyterlab ipywidgets 2>&1 | tail -5
+      echo "=== Starting JupyterLab ==="
+      jupyter lab --ip=0.0.0.0 --port=8889 --no-browser --allow-root --NotebookApp.token=selfimprove
+
+    resources:
+      limits:
+        nvidia.com/rtxa6000: "1"
+        memory: "32Gi"
+        cpu: "2"
+      requests:
+        nvidia.com/rtxa6000: "1"
+        memory: "32Gi"
+        cpu: "2"
+
+    volumeMounts:
+      - name: cache-volume
+        mountPath: /cache
+      - name: outputs-volume
+        mountPath: /outputs
+      - name: dev-shm
+        mountPath: /dev/shm
+
+    env:
+    # HuggingFace token
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: hf-token
+          key: token
+          optional: true
+
+    # Cache directories
+    - name: HF_HOME
+      value: "/cache/hf"
+    - name: TRANSFORMERS_CACHE
+      value: "/cache/hf/transformers"
+    - name: HF_DATASETS_CACHE
+      value: "/cache/hf/datasets"
+    - name: TORCH_HOME
+      value: "/cache/torch"
+    - name: PIP_CACHE_DIR
+      value: "/cache/pip"
+    - name: OUTPUT_DIR
+      value: "/outputs"
+
+    # Python and CUDA settings
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: "expandable_segments:True"
+
+  tolerations:
+    - key: nautilus.io/reservation
+      operator: Exists
+      effect: NoSchedule
+    - key: nautilus.io/hardware
+      operator: Equal
+      value: large-gpu
+    - effect: PreferNoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    # - key: nautilus.io/issue
+    #   operator: Exists
+    #   effect: NoSchedule
+
+  volumes:
+    - name: cache-volume
+      emptyDir:
+        sizeLimit: 100Gi
+    - name: outputs-volume
+      persistentVolumeClaim:
+        claimName: ms-swift-outputs-pvc
+    - name: dev-shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
