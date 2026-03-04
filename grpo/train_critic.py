@@ -284,11 +284,11 @@ def main() -> None:
         return
 
     # Full training mode — lazy imports for heavy ML libraries
-    import copy
+    import os
 
     import torch
     from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
     from vlm_grpo.config import (
         CriticRewardWeights,
@@ -299,9 +299,13 @@ def main() -> None:
     from vlm_grpo.data import _load_jsonl
     from vlm_grpo.rollout import RolloutEngine
 
+    # Required for loading local checkpoints with long paths on newer
+    # huggingface_hub versions (avoids HFValidationError on path strings)
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     logger.info(f"Loading model: {args.model_id}")
     processor = AutoProcessor.from_pretrained(args.model_id)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
@@ -319,8 +323,15 @@ def main() -> None:
         logger.info(f"Applied LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
         model.print_trainable_parameters()
 
-    # Create frozen reference model
-    ref_model = copy.deepcopy(model)
+    # Create frozen reference model by re-loading from checkpoint (not deepcopy,
+    # which would OOM by allocating a second full model on GPU during the copy).
+    # Force all layers onto GPU 0 to prevent device_map="auto" from silently
+    # offloading layers to CPU when VRAM appears tight due to fragmentation.
+    ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        args.model_id,
+        torch_dtype=torch.bfloat16,
+        device_map={"": "cuda:0"},
+    )
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False

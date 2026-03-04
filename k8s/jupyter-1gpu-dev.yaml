@@ -16,8 +16,14 @@ spec:
       set -e
       echo "=== Installing runtime dependencies ==="
       uv pip install --system "vllm==0.12.0" wandb jupyterlab ipywidgets 2>&1 | tail -5
+
+      echo "=== Cloning repo ==="
+      git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+      cd /workspace/vlm-self-reflection-RL
+      uv pip install --system -e . 2>&1 | tail -3
+
       echo "=== Starting JupyterLab ==="
-      jupyter lab --ip=0.0.0.0 --port=8889 --no-browser --allow-root --NotebookApp.token=selfimprove
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=selfimprove
 
     resources:
       limits:

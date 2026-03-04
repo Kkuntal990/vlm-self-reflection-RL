@@ -254,6 +254,7 @@ class CriticGRPOTrainer:
         # Collect all (prompt, completion, reward) triples
         all_rewards = []
         all_log_probs = []
+        all_old_log_probs = []
         all_ref_log_probs = []
 
         for result in rollout_results:
@@ -264,27 +265,31 @@ class CriticGRPOTrainer:
             rewards_group = result.rewards
             all_rewards.extend(rewards_group)
 
+            sample_image = result.image if hasattr(result, "image") else (
+                batch[0].get("image") if batch else None
+            )
+
             # Compute log probabilities for each feedback
             for f1 in result.feedbacks:
-                log_prob = self._compute_log_prob(
+                kwargs = dict(
                     question=result.question,
                     answer1=result.answer1,
                     answer_type=result.answer_type,
                     choices=result.choices,
                     completion=f1,
-                    image=batch[0].get("image") if batch else None,
-                    model=self.model,
+                    image=sample_image,
                 )
-                ref_log_prob = self._compute_log_prob(
-                    question=result.question,
-                    answer1=result.answer1,
-                    answer_type=result.answer_type,
-                    choices=result.choices,
-                    completion=f1,
-                    image=batch[0].get("image") if batch else None,
-                    model=self.ref_model,
-                )
+                # π_old: log prob under current model weights, no grad (rollout snapshot)
+                with torch.no_grad():
+                    old_log_prob = self._compute_log_prob(**kwargs, model=self.model)
+                # π_θ: log prob under current model weights, with grad (for backprop)
+                log_prob = self._compute_log_prob(**kwargs, model=self.model)
+                # π_ref: log prob under frozen reference model
+                with torch.no_grad():
+                    ref_log_prob = self._compute_log_prob(**kwargs, model=self.ref_model)
+
                 all_log_probs.append(log_prob)
+                all_old_log_probs.append(old_log_prob)
                 all_ref_log_probs.append(ref_log_prob)
 
         if not all_rewards:
@@ -304,12 +309,12 @@ class CriticGRPOTrainer:
 
         # Step 4: Compute GRPO loss
         log_probs = torch.stack(all_log_probs)
+        old_log_probs = torch.stack(all_old_log_probs)
         ref_log_probs = torch.stack(all_ref_log_probs)
 
-        # Policy ratio: r(θ) = exp(log π_θ - log π_old)
-        # For GRPO, π_old is from the rollout (same model), so ratio starts at 1.0
-        # We use the current log_probs vs detached rollout log_probs
-        ratio = torch.exp(log_probs - log_probs.detach())
+        # Policy ratio: r(θ) = π_θ(F1) / π_old(F1)
+        # π_old is the no-grad snapshot from before this backward pass
+        ratio = torch.exp(log_probs - old_log_probs)
 
         # Clipped surrogate loss
         clip_range = self.config.clip_range
@@ -412,8 +417,7 @@ class CriticGRPOTrainer:
                 text=text, return_tensors="pt"
             ).to(self.device)
 
-        with torch.no_grad() if model is self.ref_model else torch.enable_grad():
-            outputs = model(**inputs, labels=inputs["input_ids"])
+        outputs = model(**inputs, labels=inputs["input_ids"])
 
         # outputs.loss is cross-entropy averaged over tokens
         # Convert to total log prob: -loss * num_tokens
