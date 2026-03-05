@@ -296,7 +296,7 @@ def main() -> None:
         bf16=True,
         gradient_checkpointing=True,
         log_completions=True,
-        report_to="wandb",
+        report_to="none",
         reward_weights=reward_weights.to_list(),
         **(
             {

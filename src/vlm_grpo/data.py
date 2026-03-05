@@ -116,6 +116,10 @@ def load_grpo_dataset(
             question, fields["answer1"], fields["answer_type"], fields["choices"]
         )
 
+        # Normalize all content to list format so TRL's
+        # prepare_multimodal_messages doesn't add extra image placeholders
+        prompt = _normalize_prompt_content(prompt)
+
         # Store as JSON strings for Arrow compatibility
         records["prompt"].append(json.dumps(prompt))
         records["images"].append(json.dumps([image_path]))
@@ -215,6 +219,27 @@ def detect_answer_type(
         pass
 
     return "open"
+
+
+def _normalize_prompt_content(prompt: list[dict]) -> list[dict]:
+    """Normalize all message content to list-of-dicts format.
+
+    TRL's prepare_multimodal_messages checks if content is a string to
+    decide whether to insert image placeholders. If some messages have
+    list content (already structured) and others have string content,
+    it incorrectly adds extra image placeholders. Normalizing all content
+    to list format prevents this.
+
+    Args:
+        prompt: List of message dicts with role/content
+
+    Returns:
+        Prompt with all content fields as list-of-dicts
+    """
+    for msg in prompt:
+        if isinstance(msg["content"], str):
+            msg["content"] = [{"type": "text", "text": msg["content"]}]
+    return prompt
 
 
 def _grpo_transform(batch: dict) -> dict:
