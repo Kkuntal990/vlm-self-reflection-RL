@@ -284,7 +284,7 @@ def main() -> None:
         output_dir=args.output_dir,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
-        max_prompt_length=None,  # Critical for VLMs
+        # max_prompt_length removed in TRL >=0.29
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,

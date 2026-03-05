@@ -49,19 +49,18 @@ def load_grpo_dataset(
     image_base_dir: str = "/outputs/image_base",
     max_samples: int = 0,
 ) -> Dataset:
-    """Load precomputed Answer1-correct JSONL and convert to HF Dataset.
+    """Load JSONL and convert to HF Dataset for GRPOTrainer.
 
-    The JSONL file should have rows with:
-    - image_path: str (absolute or relative to image_base_dir)
-    - question: str
-    - ground_truth: str
-    - answer1: str
-    - answer_type: str ("mcq", "yesno", "numeric", "open")
-    - choices: str (comma-separated for MCQ, empty otherwise)
-    - dataset_name: str
+    Supports two JSONL formats:
+    1. Flat format: image_path, question, ground_truth, answer1, answer_type,
+       choices, dataset_name
+    2. Messages format: messages (list of role/content dicts), images (list of paths)
+
+    Prompts and image paths are stored as JSON strings for Arrow compatibility,
+    then deserialized lazily via set_transform.
 
     Args:
-        dataset_path: Path to precomputed Answer1-correct JSONL
+        dataset_path: Path to JSONL dataset
         image_base_dir: Base directory for resolving relative image paths
         max_samples: Maximum samples to load (0 = all)
 
@@ -74,7 +73,7 @@ def load_grpo_dataset(
     raw_samples = _load_jsonl(dataset_path, max_samples)
     logger.info(f"Loaded {len(raw_samples)} raw samples")
 
-    # Convert to TRL format
+    # All values stored as Arrow-safe strings
     records = {
         "prompt": [],
         "images": [],
@@ -87,43 +86,53 @@ def load_grpo_dataset(
 
     skipped = 0
     for i, sample in enumerate(raw_samples):
-        image_path = sample.get("image_path", "")
-        question = sample.get("question", "")
-        ground_truth = sample.get("ground_truth", "")
-        answer1 = sample.get("answer1", "")
-        answer_type = sample.get("answer_type", "open")
-        choices = sample.get("choices", "")
-        dataset_name = sample.get("dataset_name", "unknown")
+        # Extract fields (handle both flat and messages format)
+        if "messages" in sample and "question" not in sample:
+            fields = _parse_messages_format(sample)
+        else:
+            fields = {
+                "question": sample.get("question", ""),
+                "ground_truth": sample.get("ground_truth", ""),
+                "answer1": sample.get("answer1", ""),
+                "answer_type": sample.get("answer_type", "open"),
+                "choices": sample.get("choices", ""),
+                "dataset_name": sample.get("dataset_name", "unknown"),
+            }
 
         # Resolve image path
-        if not os.path.isabs(image_path):
-            image_path = os.path.join(image_base_dir, image_path)
+        image_path = _resolve_image_path(sample, image_base_dir)
 
-        # Load image
-        image = load_image_safe(image_path)
-        if image is None:
+        # Verify image exists
+        if not os.path.isfile(image_path):
+            logger.warning(f"Image not found: {image_path}")
             skipped += 1
             continue
 
         # Clean question (remove <image> placeholder)
-        question = question.replace("<image>", "").strip()
+        question = fields["question"].replace("<image>", "").strip()
 
         # Build prompt messages
-        prompt = build_reflection_prompt(question, answer1, answer_type, choices)
+        prompt = build_reflection_prompt(
+            question, fields["answer1"], fields["answer_type"], fields["choices"]
+        )
 
-        records["prompt"].append(prompt)
-        records["images"].append([image])
-        records["ground_truth"].append(ground_truth)
-        records["answer1"].append(answer1)
-        records["answer_type"].append(answer_type)
-        records["choices"].append(choices)
-        records["dataset_name"].append(dataset_name)
+        # Store as JSON strings for Arrow compatibility
+        records["prompt"].append(json.dumps(prompt))
+        records["images"].append(json.dumps([image_path]))
+        records["ground_truth"].append(fields["ground_truth"])
+        records["answer1"].append(fields["answer1"])
+        records["answer_type"].append(fields["answer_type"])
+        records["choices"].append(fields["choices"])
+        records["dataset_name"].append(fields["dataset_name"])
 
     if skipped > 0:
         logger.warning(f"Skipped {skipped} samples due to missing/invalid images")
 
     dataset = Dataset.from_dict(records)
     logger.info(f"Created dataset with {len(dataset)} samples")
+
+    # Lazy transform: deserialize prompts and load images on access
+    dataset.set_transform(_grpo_transform)
 
     return dataset
 
@@ -208,6 +217,121 @@ def detect_answer_type(
     return "open"
 
 
+def _grpo_transform(batch: dict) -> dict:
+    """Lazy transform to deserialize prompts and load images on access.
+
+    Applied via Dataset.set_transform so prompts (mixed-type dicts) and
+    images (PIL objects) are never serialized to Arrow.
+
+    Args:
+        batch: Dict of column values (single item or batch)
+
+    Returns:
+        Transformed dict with deserialized prompt and loaded images
+    """
+    result = {}
+    for key, val in batch.items():
+        if key == "prompt":
+            if isinstance(val, list):
+                result[key] = [json.loads(v) for v in val]
+            else:
+                result[key] = json.loads(val)
+        elif key == "images":
+            if isinstance(val, list):
+                result[key] = [
+                    [load_image_safe(p) for p in json.loads(v)] for v in val
+                ]
+            else:
+                result[key] = [load_image_safe(p) for p in json.loads(val)]
+        else:
+            result[key] = val
+    return result
+
+
+def _resolve_image_path(sample: dict, image_base_dir: str) -> str:
+    """Resolve image path from sample, checking image_path and images fields.
+
+    Args:
+        sample: JSONL record
+        image_base_dir: Base directory for relative paths
+
+    Returns:
+        Absolute image path string
+    """
+    image_path = sample.get("image_path", "")
+    if not image_path:
+        images_list = sample.get("images", [])
+        if images_list:
+            image_path = images_list[0]
+    if image_path and not os.path.isabs(image_path):
+        image_path = os.path.join(image_base_dir, image_path)
+    return image_path
+
+
+def _parse_messages_format(sample: dict) -> dict:
+    """Extract flat fields from messages-format JSONL.
+
+    Parses conversation messages to extract question, answer1, and
+    ground_truth. Uses the last assistant response as ground_truth proxy.
+
+    Args:
+        sample: JSONL record with 'messages' key
+
+    Returns:
+        Dict with question, answer1, ground_truth, answer_type, choices,
+        dataset_name
+    """
+    messages = sample.get("messages", [])
+
+    user_msgs = [m for m in messages if m["role"] == "user"]
+    assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+
+    question = user_msgs[0]["content"] if user_msgs else ""
+    answer1 = assistant_msgs[0]["content"] if assistant_msgs else ""
+    # Last assistant response as ground truth proxy
+    ground_truth = assistant_msgs[-1]["content"] if assistant_msgs else ""
+
+    # Detect answer type from question and ground truth
+    answer_type = detect_answer_type(question, ground_truth)
+
+    # Extract choices from question if MCQ
+    choices = ""
+    if answer_type == "mcq":
+        choices = _extract_choices_from_question(question)
+
+    # Infer dataset name from image path
+    images = sample.get("images", [])
+    dataset_name = "unknown"
+    if images:
+        parts = images[0].replace(f"/outputs/image_base/", "").split("/")
+        if parts:
+            dataset_name = parts[0]
+
+    return {
+        "question": question,
+        "answer1": answer1,
+        "ground_truth": ground_truth,
+        "answer_type": answer_type,
+        "choices": choices,
+        "dataset_name": dataset_name,
+    }
+
+
+def _extract_choices_from_question(question: str) -> str:
+    """Extract MCQ choices from question text.
+
+    Args:
+        question: Question text potentially containing (A)...(B)... patterns
+
+    Returns:
+        Comma-separated choices string, e.g. "(A) Yes, (B) No"
+    """
+    matches = re.findall(r"(\([A-F]\)\s*[^()\n]+)", question)
+    if matches:
+        return ", ".join(m.strip() for m in matches)
+    return ""
+
+
 # =============================================================================
 # Private Helpers
 # =============================================================================
@@ -257,6 +381,10 @@ def load_critic_dataset(
     skipped = 0
     for sample in raw_samples:
         image_path = sample.get("image_path", "")
+        if not image_path:
+            images_list = sample.get("images", [])
+            if images_list:
+                image_path = images_list[0]
         question = sample.get("question", "")
         ground_truth = sample.get("ground_truth", "")
         answer1 = sample.get("answer1", "")
@@ -353,6 +481,10 @@ def load_refiner_dataset(
     skipped = 0
     for i, sample in enumerate(raw_samples):
         image_path = sample.get("image_path", "")
+        if not image_path:
+            images_list = sample.get("images", [])
+            if images_list:
+                image_path = images_list[0]
         question = sample.get("question", "")
         ground_truth = sample.get("ground_truth", "")
         answer1 = sample.get("answer1", "")
