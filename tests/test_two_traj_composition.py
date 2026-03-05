@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Tests for two-trajectory reward composition."""
 
-
 from vlm_grpo.rewards.composition import (
     CriticRewardWeights,
     RefinerRewardWeights,
@@ -271,7 +270,7 @@ class TestRefinerTRLFunctions:
             choices=["", ""],
         )
         assert len(rewards) == 2
-        assert rewards[0] == 1.0   # Correct
+        assert rewards[0] == 1.0  # Correct
         assert rewards[1] == -1.0  # Incorrect
 
     def test_no_regression_reward_fn(self) -> None:
@@ -283,7 +282,7 @@ class TestRefinerTRLFunctions:
             a1_is_correct=[True, True],
         )
         assert len(rewards) == 2
-        assert rewards[0] == 1.0   # RR
+        assert rewards[0] == 1.0  # RR
         assert rewards[1] == -3.0  # RW
 
     def test_minimal_edit_reward_fn(self) -> None:

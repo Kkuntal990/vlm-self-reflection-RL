@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Tests for stability reward functions."""
 
-
 from vlm_grpo.rewards.stability import (
     compute_minimal_edit_reward,
     compute_no_regression_reward,
@@ -41,13 +40,21 @@ class TestNoRegressionReward:
 
     def test_yesno_rw(self) -> None:
         r = compute_no_regression_reward(
-            "No", "Yes", "yesno", a1_is_correct=True, format_valid=True,
+            "No",
+            "Yes",
+            "yesno",
+            a1_is_correct=True,
+            format_valid=True,
         )
         assert r == -3.0
 
     def test_numeric_rr(self) -> None:
         r = compute_no_regression_reward(
-            "3.14", "3.14", "numeric", a1_is_correct=True, format_valid=True,
+            "3.14",
+            "3.14",
+            "numeric",
+            a1_is_correct=True,
+            format_valid=True,
         )
         assert r == 1.0
 
@@ -77,9 +84,7 @@ class TestMinimalEditReward:
 
     def test_different_but_correct(self) -> None:
         """Both correct, different text → < 1.0 but > 0.0."""
-        r = compute_minimal_edit_reward(
-            "Yes", "Yes", "Yes", "yesno", format_valid=True
-        )
+        r = compute_minimal_edit_reward("Yes", "Yes", "Yes", "yesno", format_valid=True)
         assert r == 1.0
 
     def test_a1_wrong_returns_zero(self) -> None:
@@ -110,9 +115,7 @@ class TestMinimalEditReward:
 
     def test_open_ended_similar(self) -> None:
         """Open-ended: exact match required for match_answer to return True."""
-        r = compute_minimal_edit_reward(
-            "cat", "cat", "cat", "open", format_valid=True
-        )
+        r = compute_minimal_edit_reward("cat", "cat", "cat", "open", format_valid=True)
         assert r == 1.0
 
     def test_reward_clamped_at_zero(self) -> None:

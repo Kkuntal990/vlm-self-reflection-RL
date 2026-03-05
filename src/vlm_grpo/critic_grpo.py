@@ -158,9 +158,7 @@ class CriticGRPOTrainer:
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        total_steps = (
-            math.ceil(len(train_dataset) / batch_size) * num_epochs
-        ) // grad_acc_steps
+        total_steps = (math.ceil(len(train_dataset) / batch_size) * num_epochs) // grad_acc_steps
         logger.info(f"Starting critic GRPO training: {total_steps} optimization steps")
         logger.info(f"  Epochs: {num_epochs}, Batch size: {batch_size}")
         logger.info(f"  Gradient accumulation: {grad_acc_steps}")
@@ -265,8 +263,10 @@ class CriticGRPOTrainer:
             rewards_group = result.rewards
             all_rewards.extend(rewards_group)
 
-            sample_image = result.image if hasattr(result, "image") else (
-                batch[0].get("image") if batch else None
+            sample_image = (
+                result.image
+                if hasattr(result, "image")
+                else (batch[0].get("image") if batch else None)
             )
 
             # Compute log probabilities for each feedback
@@ -295,17 +295,18 @@ class CriticGRPOTrainer:
         if not all_rewards:
             self.global_step += 1
             return CriticTrainStepResult(
-                loss=0.0, policy_loss=0.0, kl_loss=0.0,
-                reward_mean=0.0, reward_std=0.0,
+                loss=0.0,
+                policy_loss=0.0,
+                kl_loss=0.0,
+                reward_mean=0.0,
+                reward_std=0.0,
                 rollout_metrics=rollout_metrics,
                 global_step=self.global_step,
             )
 
         # Step 3: Group-relative advantage normalization
         rewards_tensor = torch.tensor(all_rewards, device=self.device)
-        advantages = self._compute_group_advantages(
-            rewards_tensor, self.config.rollout.k_samples
-        )
+        advantages = self._compute_group_advantages(rewards_tensor, self.config.rollout.k_samples)
 
         # Step 4: Compute GRPO loss
         log_probs = torch.stack(all_log_probs)
@@ -398,7 +399,6 @@ class CriticGRPOTrainer:
         Returns:
             Scalar tensor of total log probability
         """
-        import torch
 
         messages = build_critic_prompt_with_completion(
             question, answer1, answer_type, choices, completion
@@ -409,13 +409,9 @@ class CriticGRPOTrainer:
         )
 
         if image is not None:
-            inputs = self.processor(
-                text=text, images=image, return_tensors="pt"
-            ).to(self.device)
+            inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
         else:
-            inputs = self.processor(
-                text=text, return_tensors="pt"
-            ).to(self.device)
+            inputs = self.processor(text=text, return_tensors="pt").to(self.device)
 
         outputs = model(**inputs, labels=inputs["input_ids"])
 
@@ -555,3 +551,575 @@ def build_critic_prompt_with_completion(
         {"role": "assistant", "content": completion},
     ]
     return messages
+
+
+# =============================================================================
+# Full Self-Reflection GRPO Trainer (two-reward, single model)
+# =============================================================================
+
+
+@dataclass
+class SelfReflectionTrainStepResult:
+    """Result of a single self-reflection training step.
+
+    Attributes:
+        loss: Total loss (response + feedback)
+        response_loss: Clipped policy gradient loss for A1+A2
+        feedback_loss: Clipped policy gradient loss for F1
+        kl_loss: KL divergence from reference model
+        response_reward_mean: Mean response reward across batch
+        feedback_reward_mean: Mean feedback reward across batch
+        rollout_metrics: Dict of rollout statistics
+        global_step: Current global training step
+    """
+
+    loss: float
+    response_loss: float
+    feedback_loss: float
+    kl_loss: float
+    response_reward_mean: float
+    feedback_reward_mean: float
+    rollout_metrics: dict[str, float]
+    global_step: int
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for logging."""
+        return asdict(self)
+
+
+class SelfReflectionGRPOTrainer:
+    """GRPO trainer for full self-reflection with two separate reward signals.
+
+    Single model generates A1 -> F1 -> A2. Two GRPO losses:
+    1. Response loss: advantage from response reward, applied to
+       log_prob(A1) + log_prob(A2)
+    2. Feedback loss: advantage from feedback reward, applied to
+       log_prob(F1)
+
+    Both losses backprop into the same model weights (shared LoRA).
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        ref_model: Any,
+        processor: Any,
+        config: Any,
+        optimizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+    ) -> None:
+        """Initialize the self-reflection GRPO trainer.
+
+        Uses lazy imports for heavy ML libraries.
+
+        Args:
+            model: The policy model (with LoRA adapter)
+            ref_model: Frozen reference model for KL regularization
+            processor: Tokenizer/processor for the model
+            config: SelfReflectionConfig
+            optimizer: Optional pre-configured optimizer
+            scheduler: Optional learning rate scheduler
+        """
+        from torch.optim import AdamW
+
+        self.model = model
+        self.ref_model = ref_model
+        self.processor = processor
+        self.config = config
+        self.device = next(model.parameters()).device
+
+        if optimizer is not None:
+            self.optimizer = optimizer
+        else:
+            self.optimizer = AdamW(
+                model.parameters(),
+                lr=config.learning_rate,
+                weight_decay=0.01,
+            )
+
+        self.scheduler = scheduler
+        self.global_step = 0
+        self.best_metric = float("inf") if config.early_stopping.mode == "min" else float("-inf")
+        self.patience_counter = 0
+
+    def train(
+        self,
+        train_dataset: list[dict],
+        val_dataset: Optional[list[dict]] = None,
+    ) -> dict[str, float]:
+        """Run the full self-reflection GRPO training loop.
+
+        Args:
+            train_dataset: List of training sample dicts
+            val_dataset: Optional list of validation sample dicts
+
+        Returns:
+            Dict of final training metrics
+        """
+
+        config = self.config
+        batch_size = config.rollout.batch_size
+        num_epochs = config.num_train_epochs
+        grad_acc_steps = config.gradient_accumulation_steps
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        total_steps = (math.ceil(len(train_dataset) / batch_size) * num_epochs) // grad_acc_steps
+        logger.info(f"Starting self-reflection GRPO training: {total_steps} optimization steps")
+        logger.info(f"  Epochs: {num_epochs}, Batch size: {batch_size}")
+        logger.info(f"  Gradient accumulation: {grad_acc_steps}")
+        logger.info(f"  Dataset size: {len(train_dataset)}")
+        logger.info("  Two-reward design: response (A1+A2) + feedback (F1)")
+
+        all_metrics = {}
+        should_stop = False
+
+        for epoch in range(num_epochs):
+            if should_stop:
+                break
+
+            logger.info(f"=== Epoch {epoch + 1}/{num_epochs} ===")
+            epoch_loss = 0.0
+            epoch_steps = 0
+
+            for batch_start in range(0, len(train_dataset), batch_size):
+                batch = train_dataset[batch_start : batch_start + batch_size]
+
+                # Load images for the batch
+                from vlm_grpo.data import load_image_safe
+
+                for sample in batch:
+                    if "image" not in sample:
+                        sample["image"] = load_image_safe(sample["image_path"])
+
+                step_result = self.train_step(batch)
+                epoch_loss += step_result.loss
+                epoch_steps += 1
+
+                if self.global_step % config.logging_steps == 0:
+                    logger.info(
+                        f"Step {self.global_step}: loss={step_result.loss:.4f}, "
+                        f"resp_loss={step_result.response_loss:.4f}, "
+                        f"fb_loss={step_result.feedback_loss:.4f}, "
+                        f"resp_reward={step_result.response_reward_mean:.3f}, "
+                        f"fb_reward={step_result.feedback_reward_mean:.3f}, "
+                        f"rw_rate={step_result.rollout_metrics.get('sr/rw_rate', 0):.3f}"
+                    )
+
+                # Validate
+                if (
+                    val_dataset
+                    and config.val_check_interval > 0
+                    and self.global_step % config.val_check_interval == 0
+                    and self.global_step > 0
+                ):
+                    val_metrics = self.validate(val_dataset)
+                    all_metrics.update(val_metrics)
+                    logger.info(f"Validation: {val_metrics}")
+
+                    should_stop = self._check_early_stopping(val_metrics)
+                    if should_stop:
+                        logger.info("Early stopping triggered!")
+                        break
+
+                # Save checkpoint
+                if (
+                    config.save_steps > 0
+                    and self.global_step % config.save_steps == 0
+                    and self.global_step > 0
+                ):
+                    self._save_checkpoint(output_dir / f"checkpoint-{self.global_step}")
+
+            avg_loss = epoch_loss / max(epoch_steps, 1)
+            logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
+
+        # Final save
+        self._save_checkpoint(output_dir / "final")
+        logger.info(f"Training complete. Model saved to {output_dir / 'final'}")
+
+        return all_metrics
+
+    def train_step(self, batch: list[dict]) -> SelfReflectionTrainStepResult:
+        """Execute a single self-reflection GRPO training step.
+
+        Steps:
+        1. ROLLOUT: Generate K (A1, F1, A2) trajectories per sample
+        2. REWARD: Compute response rewards and feedback rewards separately
+        3. ADVANTAGE: Group-relative normalization for each reward type
+        4. LOG-PROB: Compute log_prob(A1)+log_prob(A2) and log_prob(F1)
+        5. LOSS: Two clipped policy gradient losses + shared KL
+        6. BACKWARD + STEP
+
+        Args:
+            batch: List of sample dicts for this batch
+
+        Returns:
+            SelfReflectionTrainStepResult with loss and metrics
+        """
+        import torch
+
+        from vlm_grpo.prompts import (
+            build_critic_prompt,
+            build_initial_answer_prompt,
+            build_prompt_with_completion,
+            build_refiner_prompt,
+        )
+        from vlm_grpo.rollout import (
+            compute_self_reflection_metrics,
+            generate_self_reflection_rollout,
+        )
+
+        self.model.train()
+
+        # Step 1: Rollout
+        rollout_results = generate_self_reflection_rollout(
+            model=self.model,
+            processor=self.processor,
+            samples=batch,
+            config=self.config.rollout,
+            response_weights=self.config.response_weights,
+            feedback_weights=self.config.feedback_weights,
+            device=str(self.device),
+        )
+        rollout_metrics = compute_self_reflection_metrics(rollout_results)
+
+        # Collect per-trajectory data
+        all_resp_rewards = []
+        all_fb_rewards = []
+        all_resp_log_probs = []  # log_prob(A1) + log_prob(A2)
+        all_fb_log_probs = []  # log_prob(F1)
+        all_resp_old_log_probs = []
+        all_fb_old_log_probs = []
+        all_resp_ref_log_probs = []
+        all_fb_ref_log_probs = []
+
+        for result in rollout_results:
+            k = len(result.answer1s)
+            if k == 0:
+                continue
+
+            all_resp_rewards.extend(result.response_rewards)
+            all_fb_rewards.extend(result.feedback_rewards)
+
+            image = None
+            for s in batch:
+                if s.get("question", "").replace("<image>", "").strip() == result.question:
+                    image = s.get("image")
+                    break
+
+            for a1, f1, a2 in zip(result.answer1s, result.feedbacks, result.answer2s):
+                # Build prompts for log-prob computation
+                a1_prompt = build_initial_answer_prompt(result.question)
+                a1_full = build_prompt_with_completion(a1_prompt, a1)
+
+                f1_prompt = build_critic_prompt(result.question, a1)
+                f1_full = build_prompt_with_completion(f1_prompt, f1)
+
+                a2_prompt = build_refiner_prompt(result.question, a1, f1)
+                a2_full = build_prompt_with_completion(a2_prompt, a2)
+
+                # Response log-prob = log_prob(A1) + log_prob(A2)
+                with torch.no_grad():
+                    old_a1_lp = self._compute_log_prob(a1_full, image, self.model)
+                    old_a2_lp = self._compute_log_prob(a2_full, image, self.model)
+                    old_resp_lp = old_a1_lp + old_a2_lp
+
+                a1_lp = self._compute_log_prob(a1_full, image, self.model)
+                a2_lp = self._compute_log_prob(a2_full, image, self.model)
+                resp_lp = a1_lp + a2_lp
+
+                with torch.no_grad():
+                    ref_a1_lp = self._compute_log_prob(a1_full, image, self.ref_model)
+                    ref_a2_lp = self._compute_log_prob(a2_full, image, self.ref_model)
+                    ref_resp_lp = ref_a1_lp + ref_a2_lp
+
+                all_resp_log_probs.append(resp_lp)
+                all_resp_old_log_probs.append(old_resp_lp)
+                all_resp_ref_log_probs.append(ref_resp_lp)
+
+                # Feedback log-prob = log_prob(F1)
+                with torch.no_grad():
+                    old_fb_lp = self._compute_log_prob(f1_full, image, self.model)
+                fb_lp = self._compute_log_prob(f1_full, image, self.model)
+                with torch.no_grad():
+                    ref_fb_lp = self._compute_log_prob(f1_full, image, self.ref_model)
+
+                all_fb_log_probs.append(fb_lp)
+                all_fb_old_log_probs.append(old_fb_lp)
+                all_fb_ref_log_probs.append(ref_fb_lp)
+
+        if not all_resp_rewards:
+            self.global_step += 1
+            return SelfReflectionTrainStepResult(
+                loss=0.0,
+                response_loss=0.0,
+                feedback_loss=0.0,
+                kl_loss=0.0,
+                response_reward_mean=0.0,
+                feedback_reward_mean=0.0,
+                rollout_metrics=rollout_metrics,
+                global_step=self.global_step,
+            )
+
+        k = self.config.rollout.k_samples
+
+        # Step 3: Group-relative advantages (separate for each reward)
+        resp_rewards_t = torch.tensor(all_resp_rewards, device=self.device)
+        fb_rewards_t = torch.tensor(all_fb_rewards, device=self.device)
+        resp_advantages = self._compute_group_advantages(resp_rewards_t, k)
+        fb_advantages = self._compute_group_advantages(fb_rewards_t, k)
+
+        # Step 4: Stack log-probs
+        resp_lps = torch.stack(all_resp_log_probs)
+        resp_old_lps = torch.stack(all_resp_old_log_probs)
+        resp_ref_lps = torch.stack(all_resp_ref_log_probs)
+
+        fb_lps = torch.stack(all_fb_log_probs)
+        fb_old_lps = torch.stack(all_fb_old_log_probs)
+        fb_ref_lps = torch.stack(all_fb_ref_log_probs)
+
+        clip_range = self.config.clip_range
+
+        # Step 5a: Response GRPO loss
+        resp_ratio = torch.exp(resp_lps - resp_old_lps)
+        resp_surr1 = resp_ratio * resp_advantages
+        resp_surr2 = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range) * resp_advantages
+        response_loss = -torch.min(resp_surr1, resp_surr2).mean()
+
+        # Step 5b: Feedback GRPO loss
+        fb_ratio = torch.exp(fb_lps - fb_old_lps)
+        fb_surr1 = fb_ratio * fb_advantages
+        fb_surr2 = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range) * fb_advantages
+        feedback_loss = -torch.min(fb_surr1, fb_surr2).mean()
+
+        # Step 5c: Shared KL loss (average over all log-probs)
+        all_lps = torch.cat([resp_lps, fb_lps])
+        all_ref_lps = torch.cat([resp_ref_lps, fb_ref_lps])
+        kl = (all_lps - all_ref_lps).mean()
+        kl_loss = self.config.kl_coeff * kl
+
+        # Total loss
+        loss = response_loss + feedback_loss + kl_loss
+
+        # Step 6: Backward + step
+        loss.backward()
+
+        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+            import torch.nn.utils
+
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+        self.global_step += 1
+
+        return SelfReflectionTrainStepResult(
+            loss=loss.item(),
+            response_loss=response_loss.item(),
+            feedback_loss=feedback_loss.item(),
+            kl_loss=kl_loss.item(),
+            response_reward_mean=resp_rewards_t.mean().item(),
+            feedback_reward_mean=fb_rewards_t.mean().item(),
+            rollout_metrics=rollout_metrics,
+            global_step=self.global_step,
+        )
+
+    def validate(self, val_dataset: list[dict]) -> dict[str, float]:
+        """Run validation and return metrics.
+
+        Args:
+            val_dataset: List of validation sample dicts
+
+        Returns:
+            Dict of validation metrics
+        """
+        import torch
+
+        from vlm_grpo.data import load_image_safe
+        from vlm_grpo.rollout import (
+            compute_self_reflection_metrics,
+            generate_self_reflection_rollout,
+        )
+
+        self.model.eval()
+
+        # Load images for validation
+        for sample in val_dataset:
+            if "image" not in sample:
+                sample["image"] = load_image_safe(sample["image_path"])
+
+        with torch.no_grad():
+            rollout_results = generate_self_reflection_rollout(
+                model=self.model,
+                processor=self.processor,
+                samples=val_dataset,
+                config=self.config.rollout,
+                response_weights=self.config.response_weights,
+                feedback_weights=self.config.feedback_weights,
+                device=str(self.device),
+            )
+
+        metrics = compute_self_reflection_metrics(rollout_results)
+        val_metrics = {f"val/{k.split('/')[-1]}": v for k, v in metrics.items()}
+
+        self.model.train()
+        return val_metrics
+
+    def _compute_log_prob(
+        self,
+        messages: list[dict],
+        image: Any,
+        model: Any,
+    ) -> Any:
+        """Compute log probability of completion tokens under a model.
+
+        Masks prompt tokens so only generated tokens contribute to the
+        log probability sum.
+
+        Args:
+            messages: Full message list (prompt + assistant completion)
+            image: PIL Image (or None)
+            model: The model to compute log probs with
+
+        Returns:
+            Scalar tensor of total log probability over completion tokens
+        """
+        import torch.nn.functional as F
+
+        # Build prompt-only messages (all except last assistant turn)
+        prompt_messages = messages[:-1]
+
+        # Tokenize full sequence (prompt + completion)
+        full_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        # Tokenize prompt only (to find where completion starts)
+        prompt_text = self.processor.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
+
+        if image is not None:
+            full_inputs = self.processor(text=full_text, images=image, return_tensors="pt").to(
+                self.device
+            )
+            prompt_inputs = self.processor(text=prompt_text, images=image, return_tensors="pt").to(
+                self.device
+            )
+        else:
+            full_inputs = self.processor(text=full_text, return_tensors="pt").to(self.device)
+            prompt_inputs = self.processor(text=prompt_text, return_tensors="pt").to(self.device)
+
+        prompt_len = prompt_inputs["input_ids"].shape[1]
+
+        # Forward pass on full sequence
+        outputs = model(**full_inputs)
+        logits = outputs.logits  # (1, seq_len, vocab_size)
+
+        # Shift: logits[t] predicts token[t+1]
+        # We want log P(token[t]) for t in [prompt_len, seq_len)
+        # That means logits[prompt_len-1 : seq_len-1] predicting tokens[prompt_len : seq_len]
+        shift_logits = logits[:, prompt_len - 1 : -1, :]
+        shift_labels = full_inputs["input_ids"][:, prompt_len:]
+
+        # Compute per-token log probs
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+
+        # Sum over completion tokens
+        total_log_prob = token_log_probs.sum()
+
+        return total_log_prob
+
+    def _compute_group_advantages(
+        self,
+        rewards: Any,
+        k: int,
+    ) -> Any:
+        """Compute group-relative advantages for GRPO.
+
+        Normalizes rewards within each group of K samples.
+
+        Args:
+            rewards: Tensor of all rewards (shape: [N * K])
+            k: Group size
+
+        Returns:
+            Tensor of advantages (same shape as rewards)
+        """
+        import torch
+
+        n_groups = len(rewards) // k
+        advantages = torch.zeros_like(rewards)
+
+        for i in range(n_groups):
+            start = i * k
+            end = start + k
+            group = rewards[start:end]
+
+            mean = group.mean()
+            std = group.std()
+            if std > 0:
+                advantages[start:end] = (group - mean) / (std + 1e-8)
+            else:
+                advantages[start:end] = 0.0
+
+        # Handle remaining samples
+        remaining = len(rewards) - n_groups * k
+        if remaining > 0:
+            start = n_groups * k
+            group = rewards[start:]
+            mean = group.mean()
+            std = group.std()
+            if std > 0:
+                advantages[start:] = (group - mean) / (std + 1e-8)
+
+        return advantages
+
+    def _check_early_stopping(self, val_metrics: dict[str, float]) -> bool:
+        """Check if training should stop based on validation metrics.
+
+        Args:
+            val_metrics: Dict of validation metrics
+
+        Returns:
+            True if training should stop
+        """
+        es_config = self.config.early_stopping
+        metric_key = es_config.metric
+        val_key = f"val/{metric_key.split('/')[-1]}"
+
+        if val_key not in val_metrics:
+            return False
+
+        current = val_metrics[val_key]
+
+        if es_config.mode == "min":
+            improved = current < (self.best_metric - es_config.min_delta)
+        else:
+            improved = current > (self.best_metric + es_config.min_delta)
+
+        if improved:
+            self.best_metric = current
+            self.patience_counter = 0
+        else:
+            self.patience_counter += 1
+
+        return self.patience_counter >= es_config.patience
+
+    def _save_checkpoint(self, path: Path) -> None:
+        """Save model checkpoint.
+
+        Args:
+            path: Directory to save to
+        """
+        path.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(path)
+        self.processor.save_pretrained(path)
+
+        config_path = path / "training_config.json"
+        with open(config_path, "w") as f:
+            json.dump(self.config.to_dict(), f, indent=2)
+
+        logger.info(f"Saved checkpoint to {path}")

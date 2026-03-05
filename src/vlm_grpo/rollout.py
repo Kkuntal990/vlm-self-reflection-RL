@@ -26,10 +26,18 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from vlm_grpo.config import CriticRewardWeights, RolloutConfig
-from vlm_grpo.prompts import build_critic_prompt, build_refiner_prompt
+from vlm_grpo.prompts import (
+    build_critic_prompt,
+    build_initial_answer_prompt,
+    build_refiner_prompt,
+)
 from vlm_grpo.rewards.composition import (
     CriticRewardBreakdown,
+    TrajectoryFeedbackRewardBreakdown,
+    TrajectoryResponseRewardBreakdown,
     compute_critic_reward_breakdown,
+    compute_feedback_reward_breakdown,
+    compute_response_reward_breakdown,
 )
 
 logging.basicConfig(
@@ -303,13 +311,9 @@ class RolloutEngine:
         )
 
         if image is not None:
-            inputs = self.processor(
-                text=text, images=image, return_tensors="pt"
-            ).to(self.device)
+            inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
         else:
-            inputs = self.processor(
-                text=text, return_tensors="pt"
-            ).to(self.device)
+            inputs = self.processor(text=text, return_tensors="pt").to(self.device)
 
         feedbacks = []
         for _ in range(k):
@@ -352,22 +356,16 @@ class RolloutEngine:
             A2 text string
         """
 
-        messages = build_refiner_prompt(
-            question, answer1, feedback1, answer_type, choices
-        )
+        messages = build_refiner_prompt(question, answer1, feedback1, answer_type, choices)
 
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
         if image is not None:
-            inputs = self.processor(
-                text=text, images=image, return_tensors="pt"
-            ).to(self.device)
+            inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
         else:
-            inputs = self.processor(
-                text=text, return_tensors="pt"
-            ).to(self.device)
+            inputs = self.processor(text=text, return_tensors="pt").to(self.device)
 
         temp = self.config.a2_temperature
         do_sample = temp > 0
@@ -446,3 +444,302 @@ def compute_rollout_metrics(
     }
 
     return metrics
+
+
+# =============================================================================
+# Full Self-Reflection Rollout
+# =============================================================================
+
+
+@dataclass
+class SelfReflectionRolloutResult:
+    """Result of a full self-reflection rollout for one sample.
+
+    Contains K trajectories of (A1, F1, A2) with two separate reward
+    breakdowns per trajectory: one for response quality, one for feedback.
+
+    Attributes:
+        sample_index: Index in the original dataset
+        question: Visual question text
+        image_path: Path to the image
+        ground_truth: Ground truth answer
+        answer_type: Answer type
+        choices: MCQ choices string
+        dataset_name: Source dataset name
+        answer1s: K initial answers
+        feedbacks: K feedback texts
+        answer2s: K refined answers
+        response_rewards: K response reward scalars
+        feedback_rewards: K feedback reward scalars
+        response_breakdowns: K response reward breakdowns
+        feedback_breakdowns: K feedback reward breakdowns
+    """
+
+    sample_index: int
+    question: str
+    image_path: str
+    ground_truth: str
+    answer_type: str
+    choices: str
+    dataset_name: str
+    answer1s: list[str] = field(default_factory=list)
+    feedbacks: list[str] = field(default_factory=list)
+    answer2s: list[str] = field(default_factory=list)
+    response_rewards: list[float] = field(default_factory=list)
+    feedback_rewards: list[float] = field(default_factory=list)
+    response_breakdowns: list[TrajectoryResponseRewardBreakdown] = field(default_factory=list)
+    feedback_breakdowns: list[TrajectoryFeedbackRewardBreakdown] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+def _generate_completions(
+    model: Any,
+    processor: Any,
+    messages: list[dict],
+    image: Any,
+    device: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    k: int,
+) -> list[str]:
+    """Generate K completions for given messages.
+
+    Args:
+        model: HuggingFace model with generate() method
+        processor: Tokenizer/processor for the model
+        messages: Conversation messages
+        image: PIL Image (or None)
+        device: Device string
+        max_new_tokens: Maximum tokens per generation
+        temperature: Sampling temperature
+        top_p: Top-p sampling
+        k: Number of completions
+
+    Returns:
+        List of K text completions
+    """
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    if image is not None:
+        inputs = processor(text=text, images=image, return_tensors="pt").to(device)
+    else:
+        inputs = processor(text=text, return_tensors="pt").to(device)
+
+    do_sample = temperature > 0
+    completions = []
+    for _ in range(k):
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            do_sample=do_sample,
+        )
+        generated_ids = outputs[0][inputs["input_ids"].shape[1] :]
+        text_out = processor.decode(generated_ids, skip_special_tokens=True)
+        completions.append(text_out.strip())
+
+    return completions
+
+
+def generate_self_reflection_rollout(
+    model: Any,
+    processor: Any,
+    samples: list[dict],
+    config: RolloutConfig,
+    response_weights: Any,
+    feedback_weights: Any,
+    device: str = "cuda",
+) -> list[SelfReflectionRolloutResult]:
+    """Generate K full self-reflection trajectories per sample.
+
+    For each sample, generates K independent chains:
+        A1 (temperature) -> F1 (temperature) -> A2 (greedy)
+    Then computes two separate rewards per trajectory.
+
+    All generation runs under torch.no_grad().
+
+    Args:
+        model: HuggingFace model with generate() method
+        processor: Tokenizer/processor
+        samples: List of sample dicts with: question, image_path,
+            ground_truth, answer_type, choices, dataset_name, image
+        config: Rollout configuration
+        response_weights: ResponseRewardWeights for scoring A1+A2
+        feedback_weights: FeedbackRewardWeights for scoring F1
+        device: Device for generation
+
+    Returns:
+        List of SelfReflectionRolloutResult, one per sample
+    """
+    import torch
+
+    results = []
+    k = config.k_samples
+
+    for i, sample in enumerate(samples):
+        question = sample.get("question", "").replace("<image>", "").strip()
+        image_path = sample.get("image_path", "")
+        ground_truth = sample.get("ground_truth", "")
+        answer_type = sample.get("answer_type", "open")
+        choices_str = sample.get("choices", "")
+        dataset_name = sample.get("dataset_name", "unknown")
+        sample_index = sample.get("sample_index", i)
+        image = sample.get("image")
+
+        result = SelfReflectionRolloutResult(
+            sample_index=sample_index,
+            question=question,
+            image_path=image_path,
+            ground_truth=ground_truth,
+            answer_type=answer_type,
+            choices=choices_str,
+            dataset_name=dataset_name,
+        )
+
+        with torch.no_grad():
+            # Step 1: Generate K initial answers (A1)
+            a1_prompt = build_initial_answer_prompt(question)
+            answer1s = _generate_completions(
+                model,
+                processor,
+                a1_prompt,
+                image,
+                device,
+                max_new_tokens=config.max_completion_length,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                k=k,
+            )
+
+            # Step 2: For each A1, generate F1
+            feedbacks = []
+            for a1 in answer1s:
+                critic_prompt = build_critic_prompt(question, a1)
+                f1_list = _generate_completions(
+                    model,
+                    processor,
+                    critic_prompt,
+                    image,
+                    device,
+                    max_new_tokens=config.max_completion_length,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    k=1,
+                )
+                feedbacks.append(f1_list[0])
+
+            # Step 3: For each (A1, F1), generate A2 (greedy)
+            answer2s = []
+            for a1, f1 in zip(answer1s, feedbacks):
+                refiner_prompt = build_refiner_prompt(question, a1, f1)
+                a2_temp = config.a2_temperature
+                a2_list = _generate_completions(
+                    model,
+                    processor,
+                    refiner_prompt,
+                    image,
+                    device,
+                    max_new_tokens=config.max_completion_length,
+                    temperature=a2_temp,
+                    top_p=config.top_p,
+                    k=1,
+                )
+                answer2s.append(a2_list[0])
+
+        # Step 4: Compute two separate rewards per trajectory
+        for a1, f1, a2 in zip(answer1s, feedbacks, answer2s):
+            resp_bd = compute_response_reward_breakdown(
+                a1_text=a1,
+                a2_text=a2,
+                ground_truth=ground_truth,
+                answer_type=answer_type,
+                choices=choices_str,
+                weights=response_weights,
+            )
+            fb_bd = compute_feedback_reward_breakdown(
+                feedback_text=f1,
+                a1_text=a1,
+                a2_text=a2,
+                ground_truth=ground_truth,
+                answer_type=answer_type,
+                choices=choices_str,
+                weights=feedback_weights,
+            )
+            result.response_rewards.append(resp_bd.total_reward)
+            result.feedback_rewards.append(fb_bd.total_reward)
+            result.response_breakdowns.append(resp_bd)
+            result.feedback_breakdowns.append(fb_bd)
+
+        result.answer1s = answer1s
+        result.feedbacks = feedbacks
+        result.answer2s = answer2s
+        results.append(result)
+
+        if (i + 1) % config.batch_size == 0 or (i + 1) == len(samples):
+            logger.info(f"Self-reflection rollout: {i + 1}/{len(samples)} samples")
+
+    return results
+
+
+def compute_self_reflection_metrics(
+    results: list[SelfReflectionRolloutResult],
+) -> dict[str, float]:
+    """Compute aggregate metrics from self-reflection rollout results.
+
+    Args:
+        results: List of SelfReflectionRolloutResult
+
+    Returns:
+        Dict of metric name -> value
+    """
+    if not results:
+        return {}
+
+    total = 0
+    a1_correct_count = 0
+    rr_count = 0
+    rw_count = 0
+    wr_count = 0
+    ww_count = 0
+    resp_reward_sum = 0.0
+    fb_reward_sum = 0.0
+    fb_format_valid_count = 0
+
+    for r in results:
+        for resp_bd, fb_bd in zip(r.response_breakdowns, r.feedback_breakdowns):
+            total += 1
+            resp_reward_sum += resp_bd.total_reward
+            fb_reward_sum += fb_bd.total_reward
+            if resp_bd.a1_correct:
+                a1_correct_count += 1
+            if fb_bd.feedback_format_valid:
+                fb_format_valid_count += 1
+
+            if resp_bd.a1_correct:
+                if resp_bd.a2_correct:
+                    rr_count += 1
+                else:
+                    rw_count += 1
+            else:
+                if resp_bd.a2_correct:
+                    wr_count += 1
+                else:
+                    ww_count += 1
+
+    n = max(total, 1)
+    return {
+        "sr/total_trajectories": float(total),
+        "sr/a1_accuracy": a1_correct_count / n,
+        "sr/rr_rate": rr_count / n,
+        "sr/rw_rate": rw_count / n,
+        "sr/wr_rate": wr_count / n,
+        "sr/ww_rate": ww_count / n,
+        "sr/response_reward_mean": resp_reward_sum / n,
+        "sr/feedback_reward_mean": fb_reward_sum / n,
+        "sr/feedback_format_valid_rate": fb_format_valid_count / n,
+    }

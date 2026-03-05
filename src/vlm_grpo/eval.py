@@ -190,7 +190,8 @@ def log_transition_metrics(
         f"{prefix}/rw_rate": metrics.rw_rate,
         f"{prefix}/wr_rate": metrics.wr_rate,
         f"{prefix}/ww_rate": metrics.ww_rate,
-        f"{prefix}/format_invalid_rate": metrics.format_invalid_count / max(metrics.total_samples, 1),
+        f"{prefix}/format_invalid_rate": metrics.format_invalid_count
+        / max(metrics.total_samples, 1),
         f"{prefix}/parse_failure_rate": metrics.parse_failure_count / max(metrics.total_samples, 1),
     }
 

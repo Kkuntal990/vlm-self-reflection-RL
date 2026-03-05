@@ -77,15 +77,9 @@ def compute_feedback_calibration_reward(
     if not feedback_text.strip():
         return 0.0
 
-    positive_count = sum(
-        1 for p in _POSITIVE_FEEDBACK_PATTERNS if p.search(feedback_text)
-    )
-    negative_count = sum(
-        1 for p in _NEGATIVE_FEEDBACK_PATTERNS if p.search(feedback_text)
-    )
-    soft_doubt_count = sum(
-        1 for p in _SOFT_DOUBT_PATTERNS if p.search(feedback_text)
-    )
+    positive_count = sum(1 for p in _POSITIVE_FEEDBACK_PATTERNS if p.search(feedback_text))
+    negative_count = sum(1 for p in _NEGATIVE_FEEDBACK_PATTERNS if p.search(feedback_text))
+    soft_doubt_count = sum(1 for p in _SOFT_DOUBT_PATTERNS if p.search(feedback_text))
 
     # Clear positive or negative feedback
     if positive_count > 0 and negative_count == 0:
@@ -145,15 +139,13 @@ def compute_downstream_aware_reward(
     if not feedback_text.strip():
         return 0.0
 
-    result = verify_answer(
-        a2_extracted, ground_truth, answer_type, tolerance=tolerance
-    )
+    result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
     a2_correct = result.is_correct
 
     if a1_is_correct:
         if a2_correct:
-            return 1.0   # RR: good feedback maintained correctness
-        return -2.0      # RW: bad feedback caused regression
+            return 1.0  # RR: good feedback maintained correctness
+        return -2.0  # RW: bad feedback caused regression
     if a2_correct:
-        return 3.0       # WR: great feedback fixed the error
-    return -1.0          # WW: feedback failed to help
+        return 3.0  # WR: great feedback fixed the error
+    return -1.0  # WW: feedback failed to help

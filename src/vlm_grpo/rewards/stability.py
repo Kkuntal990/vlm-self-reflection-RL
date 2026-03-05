@@ -56,18 +56,16 @@ def compute_no_regression_reward(
     if not format_valid:
         return 0.0
 
-    result = verify_answer(
-        a2_extracted, ground_truth, answer_type, tolerance=tolerance
-    )
+    result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
     a2_correct = result.is_correct
 
     if a1_is_correct:
         if a2_correct:
-            return 1.0   # RR: maintained correctness
-        return -3.0      # RW: regression (heavy penalty)
+            return 1.0  # RR: maintained correctness
+        return -3.0  # RW: regression (heavy penalty)
     if a2_correct:
-        return 2.0       # WR: fixed the error
-    return 0.0           # WW: neutral
+        return 2.0  # WR: fixed the error
+    return 0.0  # WW: neutral
 
 
 def compute_minimal_edit_reward(
@@ -104,9 +102,7 @@ def compute_minimal_edit_reward(
     if not a1_result.is_correct:
         return 0.0
 
-    a2_result = verify_answer(
-        a2_extracted, ground_truth, answer_type, tolerance=tolerance
-    )
+    a2_result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
     if not a2_result.is_correct:
         return 0.0
 

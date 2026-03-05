@@ -71,7 +71,6 @@ class AnswerTypeConfig:
         return asdict(self)
 
 
-@dataclass
 # =============================================================================
 # Two-Trajectory GRPO Configuration
 # =============================================================================
@@ -240,9 +239,7 @@ class TwoTrajectoryConfig:
     )
     kl_coeff: float = 0.05
     clip_range: float = 0.2
-    early_stopping: EarlyStoppingConfig = field(
-        default_factory=EarlyStoppingConfig
-    )
+    early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     sanity_check_samples: int = 0
     logging_steps: int = 10
     save_steps: int = 500
@@ -320,6 +317,132 @@ class GRPORWConfig:
     val_check_interval: int = 500
     logging_steps: int = 10
     save_steps: int = 500
+    seed: int = 42
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+# =============================================================================
+# Full Self-Reflection GRPO Configuration
+# =============================================================================
+
+
+@dataclass
+class ResponseRewardWeights:
+    """Weights for response reward (applied to A1 + A2 log-probs).
+
+    reward_resp = w_a1_correctness * R_a1_correct
+               + w_a2_correctness * R_a2_correct
+               + w_no_regression * R_no_regression
+               + w_a2_format * R_a2_format
+               + w_minimal_edit * R_minimal_edit
+
+    Attributes:
+        w_a1_correctness: Weight for A1 correctness
+        w_a2_correctness: Weight for A2 correctness
+        w_no_regression: Weight for no-regression penalty (dominant)
+        w_a2_format: Weight for A2 format compliance
+        w_minimal_edit: Weight for minimal edit reward
+    """
+
+    w_a1_correctness: float = 0.5
+    w_a2_correctness: float = 1.0
+    w_no_regression: float = 2.0
+    w_a2_format: float = 0.5
+    w_minimal_edit: float = 0.3
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+@dataclass
+class FeedbackRewardWeights:
+    """Weights for feedback reward (applied to F1 log-prob).
+
+    reward_fb = w_downstream * R_downstream
+              + w_calibration * R_calibration
+              + w_format * R_format
+
+    Attributes:
+        w_downstream: Weight for downstream-aware reward (dominant)
+        w_calibration: Weight for feedback calibration
+        w_format: Weight for format compliance
+    """
+
+    w_downstream: float = 2.0
+    w_calibration: float = 1.0
+    w_format: float = 0.5
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+@dataclass
+class SelfReflectionConfig:
+    """Top-level configuration for full self-reflection GRPO training.
+
+    Single model generates A1 -> F1 -> A2, trained with two separate
+    GRPO updates: one for response quality (A1+A2), one for feedback
+    quality (F1). Both updates share the same LoRA adapter.
+
+    Attributes:
+        model_id: HuggingFace model identifier or local checkpoint path
+        dataset_path: Path to JSONL dataset
+        val_dataset_path: Path to validation JSONL dataset
+        image_base_dir: Base directory for resolving relative image paths
+        output_dir: Directory for checkpoints and logs
+        rollout: Rollout configuration (k_samples, temperatures, etc.)
+        response_weights: Response reward weights (for A1+A2 GRPO update)
+        feedback_weights: Feedback reward weights (for F1 GRPO update)
+        learning_rate: Training learning rate
+        per_device_train_batch_size: Batch size per GPU
+        gradient_accumulation_steps: Gradient accumulation steps
+        num_train_epochs: Number of training epochs
+        max_samples: Maximum training samples (0 = all)
+        use_peft: Whether to use LoRA
+        lora_r: LoRA rank
+        lora_alpha: LoRA alpha
+        lora_target_modules: Target modules for LoRA
+        kl_coeff: KL divergence coefficient for GRPO
+        clip_range: Policy ratio clipping range
+        early_stopping: Early stopping configuration
+        sanity_check_samples: Samples for sanity check mode (0=disabled)
+        logging_steps: Steps between logging
+        save_steps: Steps between checkpoint saves
+        val_check_interval: Steps between validation
+        seed: Random seed
+    """
+
+    model_id: str = "llava-hf/llava-1.5-7b-hf"
+    dataset_path: str = ""
+    val_dataset_path: str = ""
+    image_base_dir: str = "/outputs/image_base"
+    output_dir: str = "./outputs/grpo_self_reflection"
+    rollout: RolloutConfig = field(default_factory=RolloutConfig)
+    response_weights: ResponseRewardWeights = field(default_factory=ResponseRewardWeights)
+    feedback_weights: FeedbackRewardWeights = field(default_factory=FeedbackRewardWeights)
+    learning_rate: float = 1e-5
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 4
+    num_train_epochs: int = 1
+    max_samples: int = 0
+    use_peft: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_target_modules: list[str] = field(
+        default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
+    )
+    kl_coeff: float = 0.05
+    clip_range: float = 0.2
+    early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
+    sanity_check_samples: int = 0
+    logging_steps: int = 10
+    save_steps: int = 500
+    val_check_interval: int = 500
     seed: int = 42
 
     def to_dict(self) -> dict:

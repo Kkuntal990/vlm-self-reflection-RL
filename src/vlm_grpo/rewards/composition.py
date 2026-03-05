@@ -617,3 +617,222 @@ def get_refiner_reward_functions() -> list:
         refiner_no_regression_reward_fn,
         refiner_minimal_edit_reward_fn,
     ]
+
+
+# =============================================================================
+# Full Self-Reflection Trajectory Rewards (two separate breakdowns)
+# =============================================================================
+
+
+@dataclass
+class TrajectoryResponseRewardBreakdown:
+    """Reward breakdown for response quality (drives A1+A2 GRPO update).
+
+    Attributes:
+        total_reward: Weighted sum of response components
+        components: Dict mapping component name to raw reward value
+        weighted_components: Dict mapping component name to weighted value
+        a1_correct: Whether A1 is correct
+        a2_correct: Whether A2 is correct
+        a2_extracted: Normalized extracted A2 answer
+        a2_format_valid: Whether A2 format is valid
+    """
+
+    total_reward: float
+    components: dict[str, float]
+    weighted_components: dict[str, float]
+    a1_correct: bool
+    a2_correct: bool
+    a2_extracted: str
+    a2_format_valid: bool
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+@dataclass
+class TrajectoryFeedbackRewardBreakdown:
+    """Reward breakdown for feedback quality (drives F1 GRPO update).
+
+    Attributes:
+        total_reward: Weighted sum of feedback components
+        components: Dict mapping component name to raw reward value
+        weighted_components: Dict mapping component name to weighted value
+        feedback_format_valid: Whether feedback is substantive
+    """
+
+    total_reward: float
+    components: dict[str, float]
+    weighted_components: dict[str, float]
+    feedback_format_valid: bool
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+def compute_response_reward_breakdown(
+    a1_text: str,
+    a2_text: str,
+    ground_truth: str,
+    answer_type: str,
+    choices: str,
+    weights: Any,
+) -> TrajectoryResponseRewardBreakdown:
+    """Compute response reward for a single trajectory.
+
+    Evaluates answer quality: A1 correctness, A2 correctness,
+    no-regression, format, and minimal edit.
+
+    Args:
+        a1_text: Initial answer text
+        a2_text: Refined answer text
+        ground_truth: Ground truth answer
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open")
+        choices: MCQ choices string
+        weights: ResponseRewardWeights instance
+
+    Returns:
+        TrajectoryResponseRewardBreakdown with all component scores
+    """
+    # Determine A1 correctness at runtime
+    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    a1_correct = a1_result.is_correct
+
+    # Extract and validate A2
+    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
+    r_a2_format = _compute_refiner_format_reward(a2_extracted, a2_text, answer_type)
+    a2_format_valid = r_a2_format > 0
+
+    # A1 correctness reward
+    r_a1 = 1.0 if a1_correct else -1.0
+
+    # A2 correctness reward
+    r_a2 = compute_a2_correctness_reward(
+        a2_extracted=a2_extracted,
+        ground_truth=ground_truth,
+        answer_type=answer_type,
+        format_valid=a2_format_valid,
+    )
+
+    # No-regression reward
+    r_no_reg = compute_no_regression_reward(
+        a2_extracted=a2_extracted,
+        ground_truth=ground_truth,
+        answer_type=answer_type,
+        a1_is_correct=a1_correct,
+        format_valid=a2_format_valid,
+    )
+
+    # Minimal edit reward
+    r_edit = compute_minimal_edit_reward(
+        a1=a1_text,
+        a2_extracted=a2_extracted,
+        ground_truth=ground_truth,
+        answer_type=answer_type,
+        format_valid=a2_format_valid,
+    )
+
+    # Determine A2 correctness
+    a2_result = verify_answer(a2_extracted, ground_truth, answer_type)
+    a2_correct = a2_result.is_correct
+
+    components = {
+        "a1_correctness": r_a1,
+        "a2_correctness": r_a2,
+        "no_regression": r_no_reg,
+        "a2_format": r_a2_format,
+        "minimal_edit": r_edit,
+    }
+    weighted_components = {
+        "a1_correctness": r_a1 * weights.w_a1_correctness,
+        "a2_correctness": r_a2 * weights.w_a2_correctness,
+        "no_regression": r_no_reg * weights.w_no_regression,
+        "a2_format": r_a2_format * weights.w_a2_format,
+        "minimal_edit": r_edit * weights.w_minimal_edit,
+    }
+    total_reward = sum(weighted_components.values())
+
+    return TrajectoryResponseRewardBreakdown(
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+        a1_correct=a1_correct,
+        a2_correct=a2_correct,
+        a2_extracted=a2_extracted,
+        a2_format_valid=a2_format_valid,
+    )
+
+
+def compute_feedback_reward_breakdown(
+    feedback_text: str,
+    a1_text: str,
+    a2_text: str,
+    ground_truth: str,
+    answer_type: str,
+    choices: str,
+    weights: Any,
+) -> TrajectoryFeedbackRewardBreakdown:
+    """Compute feedback reward for a single trajectory.
+
+    Evaluates feedback quality: downstream-aware (did F1 help A2?),
+    calibration (does F1 correctly assess A1?), and format.
+
+    Args:
+        feedback_text: Feedback text from the critic
+        a1_text: Initial answer text
+        a2_text: Refined answer text
+        ground_truth: Ground truth answer
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open")
+        choices: MCQ choices string
+        weights: FeedbackRewardWeights instance
+
+    Returns:
+        TrajectoryFeedbackRewardBreakdown with all component scores
+    """
+    # Determine A1 correctness
+    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    a1_correct = a1_result.is_correct
+
+    # Extract A2 for downstream evaluation
+    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
+
+    # Feedback format reward
+    r_format = compute_critic_format_reward(feedback_text)
+    format_valid = r_format > 0
+
+    # Downstream-aware reward (did feedback lead to correct A2?)
+    r_downstream = compute_downstream_aware_reward(
+        feedback_text=feedback_text,
+        a2_extracted=a2_extracted,
+        ground_truth=ground_truth,
+        answer_type=answer_type,
+        a1=a1_text,
+        a1_is_correct=a1_correct,
+    )
+
+    # Calibration reward (does feedback correctly assess A1?)
+    r_calibration = compute_feedback_calibration_reward(
+        feedback_text=feedback_text,
+        a1_is_correct=a1_correct,
+    )
+
+    components = {
+        "downstream": r_downstream,
+        "calibration": r_calibration,
+        "format": r_format,
+    }
+    weighted_components = {
+        "downstream": r_downstream * weights.w_downstream,
+        "calibration": r_calibration * weights.w_calibration,
+        "format": r_format * weights.w_format,
+    }
+    total_reward = sum(weighted_components.values())
+
+    return TrajectoryFeedbackRewardBreakdown(
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+        feedback_format_valid=format_valid,
+    )

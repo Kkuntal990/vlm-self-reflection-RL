@@ -183,9 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_format", type=float, default=0.5, help="Weight for R_format")
     parser.add_argument("--w_rw", type=float, default=2.0, help="Weight for R_no_regression")
     parser.add_argument("--w_edit", type=float, default=0.3, help="Weight for R_minimal_edit")
-    parser.add_argument(
-        "--w_fb", type=float, default=0.5, help="Weight for R_feedback_calibration"
-    )
+    parser.add_argument("--w_fb", type=float, default=0.5, help="Weight for R_feedback_calibration")
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=10, help="Steps between logging")
@@ -384,7 +382,9 @@ def _run_sanity_check(dataset, reward_weights: "RewardWeights") -> None:
             logger.info(f"    Total: {breakdown.total_reward:+.2f}")
             logger.info(f"    Components: {breakdown.components}")
             logger.info(f"    Weighted:   {breakdown.weighted_components}")
-            logger.info(f"    Format OK: {breakdown.format_valid} | Parse OK: {breakdown.parse_success}")
+            logger.info(
+                f"    Format OK: {breakdown.format_valid} | Parse OK: {breakdown.parse_success}"
+            )
             logger.info(f"    Extracted: '{breakdown.final_answer_extracted}'")
 
         logger.info("")

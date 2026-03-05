@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Tests for feedback reward functions."""
 
-
 from vlm_grpo.rewards.feedback import (
     compute_downstream_aware_reward,
     compute_feedback_calibration_reward,
@@ -68,9 +67,7 @@ class TestFeedbackCalibrationReward:
         assert r > 0
 
     def test_should_be_changed(self) -> None:
-        r = compute_feedback_calibration_reward(
-            "The answer should be revised.", a1_is_correct=True
-        )
+        r = compute_feedback_calibration_reward("The answer should be revised.", a1_is_correct=True)
         assert r < 0
 
     def test_soft_doubt_a1_correct(self) -> None:
@@ -101,8 +98,11 @@ class TestDownstreamAwareReward:
         """Good feedback: A1 correct → A2 correct (RR) → +1.0."""
         r = compute_downstream_aware_reward(
             feedback_text="The answer is correct.",
-            a2_extracted="A", ground_truth="A", answer_type="mcq",
-            a1="A", a1_is_correct=True,
+            a2_extracted="A",
+            ground_truth="A",
+            answer_type="mcq",
+            a1="A",
+            a1_is_correct=True,
         )
         assert r == 1.0
 
@@ -110,8 +110,11 @@ class TestDownstreamAwareReward:
         """Bad feedback: A1 correct → A2 wrong (RW) → -2.0."""
         r = compute_downstream_aware_reward(
             feedback_text="The answer is wrong, it should be B.",
-            a2_extracted="B", ground_truth="A", answer_type="mcq",
-            a1="A", a1_is_correct=True,
+            a2_extracted="B",
+            ground_truth="A",
+            answer_type="mcq",
+            a1="A",
+            a1_is_correct=True,
         )
         assert r == -2.0
 
@@ -120,8 +123,11 @@ class TestDownstreamAwareReward:
         """Great feedback: A1 wrong → A2 correct (WR) → +3.0."""
         r = compute_downstream_aware_reward(
             feedback_text="The answer is incorrect, it should be A.",
-            a2_extracted="A", ground_truth="A", answer_type="mcq",
-            a1="B", a1_is_correct=False,
+            a2_extracted="A",
+            ground_truth="A",
+            answer_type="mcq",
+            a1="B",
+            a1_is_correct=False,
         )
         assert r == 3.0
 
@@ -129,8 +135,11 @@ class TestDownstreamAwareReward:
         """Failed feedback: A1 wrong → A2 wrong (WW) → -1.0."""
         r = compute_downstream_aware_reward(
             feedback_text="The answer might need some adjustment.",
-            a2_extracted="C", ground_truth="A", answer_type="mcq",
-            a1="B", a1_is_correct=False,
+            a2_extracted="C",
+            ground_truth="A",
+            answer_type="mcq",
+            a1="B",
+            a1_is_correct=False,
         )
         assert r == -1.0
 
@@ -138,8 +147,11 @@ class TestDownstreamAwareReward:
     def test_empty_feedback(self) -> None:
         r = compute_downstream_aware_reward(
             feedback_text="",
-            a2_extracted="A", ground_truth="A", answer_type="mcq",
-            a1="A", a1_is_correct=True,
+            a2_extracted="A",
+            ground_truth="A",
+            answer_type="mcq",
+            a1="A",
+            a1_is_correct=True,
         )
         assert r == 0.0
 
@@ -147,23 +159,32 @@ class TestDownstreamAwareReward:
         """Open-ended synonym match → CORRECT → RR → +1.0."""
         r = compute_downstream_aware_reward(
             feedback_text="Some feedback.",
-            a2_extracted="automobile", ground_truth="car", answer_type="open",
-            a1="car", a1_is_correct=True,
+            a2_extracted="automobile",
+            ground_truth="car",
+            answer_type="open",
+            a1="car",
+            a1_is_correct=True,
         )
         assert r == 1.0
 
     def test_yesno_wr(self) -> None:
         r = compute_downstream_aware_reward(
             feedback_text="The answer should be Yes.",
-            a2_extracted="Yes", ground_truth="Yes", answer_type="yesno",
-            a1="No", a1_is_correct=False,
+            a2_extracted="Yes",
+            ground_truth="Yes",
+            answer_type="yesno",
+            a1="No",
+            a1_is_correct=False,
         )
         assert r == 3.0
 
     def test_numeric_rr(self) -> None:
         r = compute_downstream_aware_reward(
             feedback_text="The calculation is correct.",
-            a2_extracted="3.14", ground_truth="3.14", answer_type="numeric",
-            a1="3.14", a1_is_correct=True,
+            a2_extracted="3.14",
+            ground_truth="3.14",
+            answer_type="numeric",
+            a1="3.14",
+            a1_is_correct=True,
         )
         assert r == 1.0

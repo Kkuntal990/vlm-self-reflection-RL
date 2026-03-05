@@ -181,16 +181,18 @@ def process_inference_results(
 
             if is_correct is True:
                 correct += 1
-                correct_samples.append({
-                    "sample_index": sample.get("sample_index", i),
-                    "image_path": image_path,
-                    "question": question,
-                    "ground_truth": gt,
-                    "answer1": answer1,
-                    "answer_type": answer_type,
-                    "choices": choices,
-                    "dataset_name": dataset_name,
-                })
+                correct_samples.append(
+                    {
+                        "sample_index": sample.get("sample_index", i),
+                        "image_path": image_path,
+                        "question": question,
+                        "ground_truth": gt,
+                        "answer1": answer1,
+                        "answer_type": answer_type,
+                        "choices": choices,
+                        "dataset_name": dataset_name,
+                    }
+                )
 
     logger.info(
         f"Processed {total} samples: {correct} correct ({correct / max(total, 1):.1%}), "

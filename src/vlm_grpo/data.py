@@ -263,9 +263,7 @@ def _grpo_transform(batch: dict) -> dict:
                 result[key] = json.loads(val)
         elif key == "images":
             if isinstance(val, list):
-                result[key] = [
-                    [load_image_safe(p) for p in json.loads(v)] for v in val
-                ]
+                result[key] = [[load_image_safe(p) for p in json.loads(v)] for v in val]
             else:
                 result[key] = [load_image_safe(p) for p in json.loads(val)]
         else:
@@ -328,7 +326,7 @@ def _parse_messages_format(sample: dict) -> dict:
     images = sample.get("images", [])
     dataset_name = "unknown"
     if images:
-        parts = images[0].replace(f"/outputs/image_base/", "").split("/")
+        parts = images[0].replace("/outputs/image_base/", "").split("/")
         if parts:
             dataset_name = parts[0]
 
@@ -533,9 +531,7 @@ def load_refiner_dataset(
             continue
 
         question = question.replace("<image>", "").strip()
-        prompt = build_refiner_prompt(
-            question, answer1, feedback1, answer_type, choices_str
-        )
+        prompt = build_refiner_prompt(question, answer1, feedback1, answer_type, choices_str)
 
         records["prompt"].append(prompt)
         records["images"].append([image])
@@ -554,6 +550,77 @@ def load_refiner_dataset(
     logger.info(f"Created refiner dataset with {len(dataset)} samples")
 
     return dataset
+
+
+def load_self_reflection_dataset(
+    dataset_path: str,
+    image_base_dir: str = "/outputs/image_base",
+    max_samples: int = 0,
+) -> list[dict]:
+    """Load dataset for full self-reflection GRPO training.
+
+    Returns raw dicts (not HF Dataset) since the custom training loop
+    handles batching. Each dict has the fields needed for rollout.
+
+    Supports both flat JSONL and messages-format JSONL.
+
+    Args:
+        dataset_path: Path to JSONL dataset
+        image_base_dir: Base directory for resolving relative image paths
+        max_samples: Maximum samples to load (0 = all)
+
+    Returns:
+        List of dicts with keys: question, image_path, ground_truth,
+        answer_type, choices, dataset_name, sample_index
+    """
+    logger.info(f"Loading self-reflection dataset from {dataset_path}")
+
+    raw_samples = _load_jsonl(dataset_path, max_samples)
+    logger.info(f"Loaded {len(raw_samples)} raw samples")
+
+    processed = []
+    skipped = 0
+
+    for i, sample in enumerate(raw_samples):
+        # Extract fields (handle both flat and messages format)
+        if "messages" in sample and "question" not in sample:
+            fields = _parse_messages_format(sample)
+        else:
+            fields = {
+                "question": sample.get("question", ""),
+                "ground_truth": sample.get("ground_truth", ""),
+                "answer_type": sample.get("answer_type", "open"),
+                "choices": sample.get("choices", ""),
+                "dataset_name": sample.get("dataset_name", "unknown"),
+            }
+
+        # Resolve image path
+        image_path = _resolve_image_path(sample, image_base_dir)
+
+        if not os.path.isfile(image_path):
+            logger.warning(f"Image not found: {image_path}")
+            skipped += 1
+            continue
+
+        question = fields["question"].replace("<image>", "").strip()
+
+        processed.append(
+            {
+                "question": question,
+                "image_path": image_path,
+                "ground_truth": fields["ground_truth"],
+                "answer_type": fields["answer_type"],
+                "choices": fields["choices"],
+                "dataset_name": fields["dataset_name"],
+                "sample_index": i,
+            }
+        )
+
+    if skipped > 0:
+        logger.warning(f"Skipped {skipped} samples due to missing images")
+
+    logger.info(f"Prepared {len(processed)} samples for self-reflection training")
+    return processed
 
 
 def _load_jsonl(path: str, max_samples: int = 0) -> list[dict]:

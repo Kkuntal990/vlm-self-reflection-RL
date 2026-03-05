@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Tests for rollout data structures and metrics computation."""
 
-
 from vlm_grpo.config import RolloutConfig
 from vlm_grpo.rewards.composition import CriticRewardBreakdown
 from vlm_grpo.rollout import (
@@ -167,15 +166,19 @@ class TestComputeRolloutMetrics:
         """All RR transitions."""
         results = [
             CriticRolloutResult(
-                sample_index=0, question="Q", image_path="/img.jpg",
-                ground_truth="A", answer1="A", answer_type="mcq",
-                choices="", dataset_name="test", a1_is_correct=True,
+                sample_index=0,
+                question="Q",
+                image_path="/img.jpg",
+                ground_truth="A",
+                answer1="A",
+                answer_type="mcq",
+                choices="",
+                dataset_name="test",
+                a1_is_correct=True,
                 feedbacks=["good"] * 4,
                 answer2s=["A"] * 4,
                 rewards=[1.0] * 4,
-                reward_breakdowns=[
-                    self._make_breakdown(1.0, True) for _ in range(4)
-                ],
+                reward_breakdowns=[self._make_breakdown(1.0, True) for _ in range(4)],
             )
         ]
         metrics = compute_rollout_metrics(results)
@@ -185,14 +188,20 @@ class TestComputeRolloutMetrics:
     def test_mixed_transitions(self) -> None:
         """Mix of RR and RW."""
         breakdowns = [
-            self._make_breakdown(1.0, True),   # RR
+            self._make_breakdown(1.0, True),  # RR
             self._make_breakdown(-2.0, False),  # RW
         ]
         results = [
             CriticRolloutResult(
-                sample_index=0, question="Q", image_path="/img.jpg",
-                ground_truth="A", answer1="A", answer_type="mcq",
-                choices="", dataset_name="test", a1_is_correct=True,
+                sample_index=0,
+                question="Q",
+                image_path="/img.jpg",
+                ground_truth="A",
+                answer1="A",
+                answer_type="mcq",
+                choices="",
+                dataset_name="test",
+                a1_is_correct=True,
                 feedbacks=["good", "bad"],
                 answer2s=["A", "B"],
                 rewards=[1.0, -2.0],
@@ -210,9 +219,15 @@ class TestComputeRolloutMetrics:
         ]
         results = [
             CriticRolloutResult(
-                sample_index=0, question="Q", image_path="/img.jpg",
-                ground_truth="A", answer1="A", answer_type="mcq",
-                choices="", dataset_name="test", a1_is_correct=True,
+                sample_index=0,
+                question="Q",
+                image_path="/img.jpg",
+                ground_truth="A",
+                answer1="A",
+                answer_type="mcq",
+                choices="",
+                dataset_name="test",
+                a1_is_correct=True,
                 feedbacks=["good", ""],
                 answer2s=["A", "B"],
                 rewards=[1.0, -1.0],

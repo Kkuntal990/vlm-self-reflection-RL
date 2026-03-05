@@ -69,9 +69,7 @@ def _get_parsed(
         return _parse_cache[cache_key]
 
     trajectory = parse_trajectory(completion_text)
-    extracted = extract_answer_from_text(
-        trajectory.final_answer, answer_type, choices
-    )
+    extracted = extract_answer_from_text(trajectory.final_answer, answer_type, choices)
     fmt_valid = compute_format_reward(trajectory, extracted, answer_type) > 0
 
     result = (trajectory, extracted, fmt_valid)
@@ -116,8 +114,8 @@ def format_reward_fn(
     rewards = []
     for i, comp in enumerate(completions):
         text = _extract_text(comp)
-        a_type = (answer_type[i] if answer_type else "open")
-        ch = (choices[i] if choices else "")
+        a_type = answer_type[i] if answer_type else "open"
+        ch = choices[i] if choices else ""
 
         trajectory, extracted, _ = _get_parsed(text, a_type, ch)
         reward = compute_format_reward(trajectory, extracted, a_type)
@@ -150,9 +148,9 @@ def correctness_reward_fn(
     rewards = []
     for i, comp in enumerate(completions):
         text = _extract_text(comp)
-        gt = (ground_truth[i] if ground_truth else "")
-        a_type = (answer_type[i] if answer_type else "open")
-        ch = (choices[i] if choices else "")
+        gt = ground_truth[i] if ground_truth else ""
+        a_type = answer_type[i] if answer_type else "open"
+        ch = choices[i] if choices else ""
 
         _, extracted, fmt_valid = _get_parsed(text, a_type, ch)
         reward = compute_final_correct_reward(extracted, gt, a_type, fmt_valid)
@@ -185,9 +183,9 @@ def no_regression_reward_fn(
     rewards = []
     for i, comp in enumerate(completions):
         text = _extract_text(comp)
-        gt = (ground_truth[i] if ground_truth else "")
-        a_type = (answer_type[i] if answer_type else "open")
-        ch = (choices[i] if choices else "")
+        gt = ground_truth[i] if ground_truth else ""
+        a_type = answer_type[i] if answer_type else "open"
+        ch = choices[i] if choices else ""
 
         _, extracted, fmt_valid = _get_parsed(text, a_type, ch)
         reward = compute_no_regression_reward(extracted, gt, a_type, fmt_valid)
@@ -220,10 +218,10 @@ def minimal_edit_reward_fn(
     rewards = []
     for i, comp in enumerate(completions):
         text = _extract_text(comp)
-        gt = (ground_truth[i] if ground_truth else "")
-        a1 = (answer1[i] if answer1 else "")
-        a_type = (answer_type[i] if answer_type else "open")
-        ch = (choices[i] if choices else "")
+        gt = ground_truth[i] if ground_truth else ""
+        a1 = answer1[i] if answer1 else ""
+        a_type = answer_type[i] if answer_type else "open"
+        ch = choices[i] if choices else ""
 
         _, extracted, fmt_valid = _get_parsed(text, a_type, ch)
         reward = compute_minimal_edit_reward(extracted, gt, a1, a_type, fmt_valid)
@@ -255,8 +253,8 @@ def feedback_calibration_reward_fn(
     rewards = []
     for i, comp in enumerate(completions):
         text = _extract_text(comp)
-        a_type = (answer_type[i] if answer_type else "open")
-        ch = (choices[i] if choices else "")
+        a_type = answer_type[i] if answer_type else "open"
+        ch = choices[i] if choices else ""
 
         trajectory, _, _ = _get_parsed(text, a_type, ch)
         reward = compute_feedback_calibration_reward(trajectory.feedback)

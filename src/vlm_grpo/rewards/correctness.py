@@ -92,8 +92,8 @@ def compute_downstream_improvement_reward(
 
     if a1_is_correct:
         if a2_correct:
-            return 1.0   # RR: maintained correctness
-        return -2.0      # RW: regression
+            return 1.0  # RR: maintained correctness
+        return -2.0  # RW: regression
     if a2_correct:
-        return 2.0       # WR: fixed the error
-    return -0.5          # WW: failed to fix
+        return 2.0  # WR: fixed the error
+    return -0.5  # WW: failed to fix
