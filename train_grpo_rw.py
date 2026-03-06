@@ -35,10 +35,8 @@ Reference:
 """
 
 import argparse
-import json
 import logging
 import sys
-from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -370,9 +368,9 @@ def _run_sanity_check(dataset, reward_weights: "RewardWeights") -> None:
         # Synthetic completions
         test_cases = {
             "perfect_rr": f"FEEDBACK:\nThe answer is correct and well-supported by the image.\nFINAL_ANSWER:\n{a1}",
-            "rw_flip": f"FEEDBACK:\nThe answer is incorrect, should be changed.\nFINAL_ANSWER:\nZZZ_WRONG",
+            "rw_flip": "FEEDBACK:\nThe answer is incorrect, should be changed.\nFINAL_ANSWER:\nZZZ_WRONG",
             "malformed": "This is just some text without markers.",
-            "feedback_only": f"FEEDBACK:\nLooks good.\n",
+            "feedback_only": "FEEDBACK:\nLooks good.\n",
             "answer_only": f"FINAL_ANSWER:\n{a1}",
         }
 

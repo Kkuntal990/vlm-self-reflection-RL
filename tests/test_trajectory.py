@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Tests for trajectory parsing and answer extraction."""
 
-import pytest
 
 from vlm_grpo.trajectory import (
     detect_hedging,
@@ -9,7 +8,6 @@ from vlm_grpo.trajectory import (
     extract_completion_text,
     parse_trajectory,
 )
-
 
 # =============================================================================
 # parse_trajectory tests

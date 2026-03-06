@@ -154,6 +154,7 @@ class RolloutConfig:
     k_samples: int = 4
     max_completion_length: int = 512
     temperature: float = 0.7
+    feedback_temperature: float = 0.9
     top_p: float = 0.9
     a2_temperature: float = 0.0
     batch_size: int = 8
@@ -438,6 +439,8 @@ class SelfReflectionConfig:
     )
     kl_coeff: float = 0.05
     clip_range: float = 0.2
+    num_inner_epochs: int = 4
+    debug: bool = False
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     sanity_check_samples: int = 0
     logging_steps: int = 10

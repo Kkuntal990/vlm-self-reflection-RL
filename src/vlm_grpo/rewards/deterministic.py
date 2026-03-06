@@ -18,7 +18,6 @@ import re
 from vlm_grpo.trajectory import (
     ParsedTrajectory,
     detect_hedging,
-    extract_answer_from_text,
 )
 from vlm_grpo.utils import normalized_edit_distance
 

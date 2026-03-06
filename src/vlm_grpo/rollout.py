@@ -310,6 +310,10 @@ class RolloutEngine:
             messages, tokenize=False, add_generation_prompt=True
         )
 
+        # Re-inject <image> if template stripped it from non-user roles
+        if image is not None and "<image>" not in text:
+            text = "<image>\n" + text
+
         if image is not None:
             inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
         else:
@@ -524,6 +528,12 @@ def _generate_completions(
     """
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
+    # apply_chat_template may strip <image> from non-user roles (e.g., the
+    # critic prompt puts <image> in assistant content).  Re-inject the token
+    # so the processor can map it to the provided PIL image.
+    if image is not None and "<image>" not in text:
+        text = "<image>\n" + text
+
     if image is not None:
         inputs = processor(text=text, images=image, return_tensors="pt").to(device)
     else:
@@ -617,6 +627,7 @@ def generate_self_reflection_rollout(
             )
 
             # Step 2: For each A1, generate F1
+            fb_temp = config.feedback_temperature
             feedbacks = []
             for a1 in answer1s:
                 critic_prompt = build_critic_prompt(question, a1)
@@ -627,7 +638,7 @@ def generate_self_reflection_rollout(
                     image,
                     device,
                     max_new_tokens=config.max_completion_length,
-                    temperature=config.temperature,
+                    temperature=fb_temp,
                     top_p=config.top_p,
                     k=1,
                 )

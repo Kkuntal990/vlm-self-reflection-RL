@@ -91,7 +91,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--k_samples", type=int, default=4, help="Trajectories per sample")
     parser.add_argument("--max_completion_length", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.7, help="A1/F1 sampling temperature")
+    parser.add_argument("--temperature", type=float, default=0.7, help="A1 sampling temperature")
+    parser.add_argument(
+        "--feedback_temperature", type=float, default=0.9, help="F1 sampling temperature"
+    )
     parser.add_argument(
         "--a2_temperature", type=float, default=0.0, help="A2 temperature (0=greedy)"
     )
@@ -101,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--kl_coeff", type=float, default=0.05)
     parser.add_argument("--clip_range", type=float, default=0.2)
+    parser.add_argument(
+        "--num_inner_epochs",
+        type=int,
+        default=4,
+        help="Inner optimization epochs per rollout batch (mu in GRPO)",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     # LoRA
@@ -124,6 +133,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--val_check_interval", type=int, default=500)
+
+    # Debug
+    parser.add_argument(
+        "--debug", action="store_true", help="Print generated trajectories and reward breakdowns"
+    )
 
     # Sanity check
     parser.add_argument(
@@ -169,6 +183,7 @@ def main() -> None:
         k_samples=args.k_samples,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
+        feedback_temperature=args.feedback_temperature,
         a2_temperature=args.a2_temperature,
         batch_size=args.per_device_train_batch_size,
     )
@@ -191,6 +206,8 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         kl_coeff=args.kl_coeff,
         clip_range=args.clip_range,
+        num_inner_epochs=args.num_inner_epochs,
+        debug=args.debug,
         sanity_check_samples=args.sanity_check_samples,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
@@ -230,10 +247,10 @@ def main() -> None:
 
     from copy import deepcopy
 
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers import AutoModelForVision2Seq, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.model_id)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
         torch_dtype="auto",
         device_map="auto",

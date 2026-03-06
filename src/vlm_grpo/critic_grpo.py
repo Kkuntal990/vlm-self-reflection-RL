@@ -408,6 +408,10 @@ class CriticGRPOTrainer:
             messages, tokenize=False, add_generation_prompt=False
         )
 
+        # Re-inject <image> if template stripped it from non-user roles
+        if image is not None and "<image>" not in text:
+            text = "<image>\n" + text
+
         if image is not None:
             inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
         else:
@@ -542,10 +546,7 @@ def build_critic_prompt_with_completion(
         {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
         {
             "role": "assistant",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": question},
-            ],
+            "content": f"<image>\n{question}",
         },
         {"role": "user", "content": answer1},
         {"role": "assistant", "content": completion},
@@ -660,14 +661,13 @@ class SelfReflectionGRPOTrainer:
         config = self.config
         batch_size = config.rollout.batch_size
         num_epochs = config.num_train_epochs
-        grad_acc_steps = config.gradient_accumulation_steps
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        total_steps = (math.ceil(len(train_dataset) / batch_size) * num_epochs) // grad_acc_steps
-        logger.info(f"Starting self-reflection GRPO training: {total_steps} optimization steps")
+        total_steps = math.ceil(len(train_dataset) / batch_size) * num_epochs
+        logger.info(f"Starting self-reflection GRPO training: {total_steps} rollout steps")
         logger.info(f"  Epochs: {num_epochs}, Batch size: {batch_size}")
-        logger.info(f"  Gradient accumulation: {grad_acc_steps}")
+        logger.info(f"  Inner optimization epochs per step: {config.num_inner_epochs}")
         logger.info(f"  Dataset size: {len(train_dataset)}")
         logger.info("  Two-reward design: response (A1+A2) + feedback (F1)")
 
@@ -746,9 +746,11 @@ class SelfReflectionGRPOTrainer:
         1. ROLLOUT: Generate K (A1, F1, A2) trajectories per sample
         2. REWARD: Compute response rewards and feedback rewards separately
         3. ADVANTAGE: Group-relative normalization for each reward type
-        4. LOG-PROB: Compute log_prob(A1)+log_prob(A2) and log_prob(F1)
-        5. LOSS: Two clipped policy gradient losses + shared KL
-        6. BACKWARD + STEP
+        4. OLD/REF LOG-PROBS: Compute once (frozen)
+        5. INNER EPOCHS: Recompute log_probs mu times, each time
+           computing clipped loss, backward, and optimizer step.
+           After each step the model weights change so ratio diverges
+           from 1.0 and the clipping mechanism activates.
 
         Args:
             batch: List of sample dicts for this batch
@@ -771,7 +773,7 @@ class SelfReflectionGRPOTrainer:
 
         self.model.train()
 
-        # Step 1: Rollout
+        # Step 1: Rollout (generates A1->F1->A2, computes rewards)
         rollout_results = generate_self_reflection_rollout(
             model=self.model,
             processor=self.processor,
@@ -783,15 +785,10 @@ class SelfReflectionGRPOTrainer:
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
 
-        # Collect per-trajectory data
+        # Step 2: Collect trajectory data (prompts, images, rewards)
+        trajectory_data = []
         all_resp_rewards = []
         all_fb_rewards = []
-        all_resp_log_probs = []  # log_prob(A1) + log_prob(A2)
-        all_fb_log_probs = []  # log_prob(F1)
-        all_resp_old_log_probs = []
-        all_fb_old_log_probs = []
-        all_resp_ref_log_probs = []
-        all_fb_ref_log_probs = []
 
         for result in rollout_results:
             k = len(result.answer1s)
@@ -801,6 +798,34 @@ class SelfReflectionGRPOTrainer:
             all_resp_rewards.extend(result.response_rewards)
             all_fb_rewards.extend(result.feedback_rewards)
 
+            # Debug: print generated trajectories and reward breakdowns
+            if self.config.debug:
+                logger.info("=" * 80)
+                logger.info(
+                    f"[DEBUG] Sample: question='{result.question[:80]}...' "
+                    f"GT={result.ground_truth} type={result.answer_type}"
+                )
+                for j in range(k):
+                    logger.info(f"  --- Trajectory {j + 1}/{k} ---")
+                    logger.info(f"  A1: {result.answer1s[j]}")
+                    logger.info(f"  F1: {result.feedbacks[j]}")
+                    logger.info(f"  A2: {result.answer2s[j]}")
+                    logger.info(
+                        f"  resp_reward={result.response_rewards[j]:.3f} "
+                        f"fb_reward={result.feedback_rewards[j]:.3f}"
+                    )
+                    if result.response_breakdowns:
+                        rb = result.response_breakdowns[j]
+                        logger.info(f"  resp_components: {rb.components}")
+                        logger.info(
+                            f"  a1_correct={rb.a1_correct} a2_correct={rb.a2_correct} "
+                            f"a2_extracted='{rb.a2_extracted}'"
+                        )
+                    if result.feedback_breakdowns:
+                        fb = result.feedback_breakdowns[j]
+                        logger.info(f"  fb_components: {fb.components}")
+                logger.info("=" * 80)
+
             image = None
             for s in batch:
                 if s.get("question", "").replace("<image>", "").strip() == result.question:
@@ -808,7 +833,6 @@ class SelfReflectionGRPOTrainer:
                     break
 
             for a1, f1, a2 in zip(result.answer1s, result.feedbacks, result.answer2s):
-                # Build prompts for log-prob computation
                 a1_prompt = build_initial_answer_prompt(result.question)
                 a1_full = build_prompt_with_completion(a1_prompt, a1)
 
@@ -818,35 +842,9 @@ class SelfReflectionGRPOTrainer:
                 a2_prompt = build_refiner_prompt(result.question, a1, f1)
                 a2_full = build_prompt_with_completion(a2_prompt, a2)
 
-                # Response log-prob = log_prob(A1) + log_prob(A2)
-                with torch.no_grad():
-                    old_a1_lp = self._compute_log_prob(a1_full, image, self.model)
-                    old_a2_lp = self._compute_log_prob(a2_full, image, self.model)
-                    old_resp_lp = old_a1_lp + old_a2_lp
-
-                a1_lp = self._compute_log_prob(a1_full, image, self.model)
-                a2_lp = self._compute_log_prob(a2_full, image, self.model)
-                resp_lp = a1_lp + a2_lp
-
-                with torch.no_grad():
-                    ref_a1_lp = self._compute_log_prob(a1_full, image, self.ref_model)
-                    ref_a2_lp = self._compute_log_prob(a2_full, image, self.ref_model)
-                    ref_resp_lp = ref_a1_lp + ref_a2_lp
-
-                all_resp_log_probs.append(resp_lp)
-                all_resp_old_log_probs.append(old_resp_lp)
-                all_resp_ref_log_probs.append(ref_resp_lp)
-
-                # Feedback log-prob = log_prob(F1)
-                with torch.no_grad():
-                    old_fb_lp = self._compute_log_prob(f1_full, image, self.model)
-                fb_lp = self._compute_log_prob(f1_full, image, self.model)
-                with torch.no_grad():
-                    ref_fb_lp = self._compute_log_prob(f1_full, image, self.ref_model)
-
-                all_fb_log_probs.append(fb_lp)
-                all_fb_old_log_probs.append(old_fb_lp)
-                all_fb_ref_log_probs.append(ref_fb_lp)
+                trajectory_data.append(
+                    {"a1_full": a1_full, "f1_full": f1_full, "a2_full": a2_full, "image": image}
+                )
 
         if not all_resp_rewards:
             self.global_step += 1
@@ -863,63 +861,98 @@ class SelfReflectionGRPOTrainer:
 
         k = self.config.rollout.k_samples
 
-        # Step 3: Group-relative advantages (separate for each reward)
+        # Step 3: Group-relative advantages (computed once, frozen)
         resp_rewards_t = torch.tensor(all_resp_rewards, device=self.device)
         fb_rewards_t = torch.tensor(all_fb_rewards, device=self.device)
         resp_advantages = self._compute_group_advantages(resp_rewards_t, k)
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k)
 
-        # Step 4: Stack log-probs
-        resp_lps = torch.stack(all_resp_log_probs)
-        resp_old_lps = torch.stack(all_resp_old_log_probs)
-        resp_ref_lps = torch.stack(all_resp_ref_log_probs)
+        # Step 4: Compute old_log_probs and ref_log_probs (once, frozen)
+        with torch.no_grad():
+            old_resp_lps_list = []
+            old_fb_lps_list = []
+            ref_resp_lps_list = []
+            ref_fb_lps_list = []
 
-        fb_lps = torch.stack(all_fb_log_probs)
-        fb_old_lps = torch.stack(all_fb_old_log_probs)
-        fb_ref_lps = torch.stack(all_fb_ref_log_probs)
+            for t in trajectory_data:
+                old_a1 = self._compute_log_prob(t["a1_full"], t["image"], self.model)
+                old_a2 = self._compute_log_prob(t["a2_full"], t["image"], self.model)
+                old_resp_lps_list.append(old_a1 + old_a2)
+                old_fb_lps_list.append(self._compute_log_prob(t["f1_full"], t["image"], self.model))
+
+                ref_a1 = self._compute_log_prob(t["a1_full"], t["image"], self.ref_model)
+                ref_a2 = self._compute_log_prob(t["a2_full"], t["image"], self.ref_model)
+                ref_resp_lps_list.append(ref_a1 + ref_a2)
+                ref_fb_lps_list.append(
+                    self._compute_log_prob(t["f1_full"], t["image"], self.ref_model)
+                )
+
+            old_resp_lps = torch.stack(old_resp_lps_list)
+            old_fb_lps = torch.stack(old_fb_lps_list)
+            ref_resp_lps = torch.stack(ref_resp_lps_list)
+            ref_fb_lps = torch.stack(ref_fb_lps_list)
 
         clip_range = self.config.clip_range
+        num_inner = self.config.num_inner_epochs
 
-        # Step 5a: Response GRPO loss
-        resp_ratio = torch.exp(resp_lps - resp_old_lps)
-        resp_surr1 = resp_ratio * resp_advantages
-        resp_surr2 = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range) * resp_advantages
-        response_loss = -torch.min(resp_surr1, resp_surr2).mean()
+        # Step 5: Inner optimization epochs
+        total_resp_loss = 0.0
+        total_fb_loss = 0.0
+        total_kl_loss = 0.0
 
-        # Step 5b: Feedback GRPO loss
-        fb_ratio = torch.exp(fb_lps - fb_old_lps)
-        fb_surr1 = fb_ratio * fb_advantages
-        fb_surr2 = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range) * fb_advantages
-        feedback_loss = -torch.min(fb_surr1, fb_surr2).mean()
+        for inner_epoch in range(num_inner):
+            # Recompute log-probs under current (evolving) weights
+            cur_resp_lps = []
+            cur_fb_lps = []
 
-        # Step 5c: Shared KL loss (average over all log-probs)
-        all_lps = torch.cat([resp_lps, fb_lps])
-        all_ref_lps = torch.cat([resp_ref_lps, fb_ref_lps])
-        kl = (all_lps - all_ref_lps).mean()
-        kl_loss = self.config.kl_coeff * kl
+            for t in trajectory_data:
+                a1_lp = self._compute_log_prob(t["a1_full"], t["image"], self.model)
+                a2_lp = self._compute_log_prob(t["a2_full"], t["image"], self.model)
+                cur_resp_lps.append(a1_lp + a2_lp)
+                cur_fb_lps.append(self._compute_log_prob(t["f1_full"], t["image"], self.model))
 
-        # Total loss
-        loss = response_loss + feedback_loss + kl_loss
+            resp_lps = torch.stack(cur_resp_lps)
+            fb_lps = torch.stack(cur_fb_lps)
 
-        # Step 6: Backward + step
-        loss.backward()
+            # Response GRPO loss
+            resp_ratio = torch.exp(resp_lps - old_resp_lps)
+            resp_surr1 = resp_ratio * resp_advantages
+            resp_surr2 = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range) * resp_advantages
+            response_loss = -torch.min(resp_surr1, resp_surr2).mean()
 
-        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-            import torch.nn.utils
+            # Feedback GRPO loss
+            fb_ratio = torch.exp(fb_lps - old_fb_lps)
+            fb_surr1 = fb_ratio * fb_advantages
+            fb_surr2 = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range) * fb_advantages
+            feedback_loss = -torch.min(fb_surr1, fb_surr2).mean()
+
+            # Shared KL loss
+            all_lps = torch.cat([resp_lps, fb_lps])
+            all_ref_lps = torch.cat([ref_resp_lps, ref_fb_lps])
+            kl = torch.clamp((all_lps - all_ref_lps).mean(), min=0.0)
+            kl_loss = self.config.kl_coeff * kl
+
+            loss = response_loss + feedback_loss + kl_loss
+            loss.backward()
 
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             self.optimizer.zero_grad()
-            if self.scheduler is not None:
-                self.scheduler.step()
+
+            total_resp_loss += response_loss.item()
+            total_fb_loss += feedback_loss.item()
+            total_kl_loss += kl_loss.item()
+
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         self.global_step += 1
 
         return SelfReflectionTrainStepResult(
-            loss=loss.item(),
-            response_loss=response_loss.item(),
-            feedback_loss=feedback_loss.item(),
-            kl_loss=kl_loss.item(),
+            loss=(total_resp_loss + total_fb_loss + total_kl_loss) / num_inner,
+            response_loss=total_resp_loss / num_inner,
+            feedback_loss=total_fb_loss / num_inner,
+            kl_loss=total_kl_loss / num_inner,
             response_reward_mean=resp_rewards_t.mean().item(),
             feedback_reward_mean=fb_rewards_t.mean().item(),
             rollout_metrics=rollout_metrics,
@@ -999,6 +1032,14 @@ class SelfReflectionGRPOTrainer:
         prompt_text = self.processor.apply_chat_template(
             prompt_messages, tokenize=False, add_generation_prompt=True
         )
+
+        # apply_chat_template may strip <image> from non-user roles (e.g.,
+        # critic prompt with <image> in assistant content).  Re-inject so the
+        # processor can map the token to the PIL image.
+        if image is not None and "<image>" not in full_text:
+            full_text = "<image>\n" + full_text
+        if image is not None and "<image>" not in prompt_text:
+            prompt_text = "<image>\n" + prompt_text
 
         if image is not None:
             full_inputs = self.processor(text=full_text, images=image, return_tensors="pt").to(

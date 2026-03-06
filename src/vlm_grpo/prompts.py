@@ -204,12 +204,14 @@ def build_critic_prompt(
 ) -> list[dict]:
     """Build role-flipped critic prompt for feedback generation.
 
-    Matches inference script Turn 1+ feedback step:
+    Matches the fire_feedback SFT training data format exactly:
         System: critic prompt
-        Assistant: [image] + question   (role-flipped!)
+        Assistant: "<image>\\n{question}"   (role-flipped, image as text token)
         User: answer1
 
-    The model generates feedback as the assistant.
+    The <image> token is embedded as a plain string in the assistant content,
+    matching the SFT training JSONL format. The processor replaces <image>
+    with image embeddings regardless of conversation role.
 
     Args:
         question: The visual question (cleaned, no <image> tag)
@@ -227,10 +229,7 @@ def build_critic_prompt(
         },
         {
             "role": "assistant",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": question},
-            ],
+            "content": f"<image>\n{question}",
         },
         {
             "role": "user",
