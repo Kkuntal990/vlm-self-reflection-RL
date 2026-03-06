@@ -543,11 +543,14 @@ def build_critic_prompt_with_completion(
     from vlm_grpo.prompts import CRITIC_SYSTEM_PROMPT
 
     messages = [
-        {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
         {
-            "role": "assistant",
-            "content": f"<image>\n{question}",
+            "role": "system",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": CRITIC_SYSTEM_PROMPT},
+            ],
         },
+        {"role": "assistant", "content": question},
         {"role": "user", "content": answer1},
         {"role": "assistant", "content": completion},
     ]

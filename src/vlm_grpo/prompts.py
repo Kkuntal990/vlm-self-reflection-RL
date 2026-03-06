@@ -204,14 +204,16 @@ def build_critic_prompt(
 ) -> list[dict]:
     """Build role-flipped critic prompt for feedback generation.
 
-    Matches the fire_feedback SFT training data format exactly:
-        System: critic prompt
-        Assistant: "<image>\\n{question}"   (role-flipped, image as text token)
+    Matches the inference script's image-hoisting approach for LLaVA:
+        System: [image] + critic prompt  (image hoisted here)
+        Assistant: question              (role-flipped, text only)
         User: answer1
 
-    The <image> token is embedded as a plain string in the assistant content,
-    matching the SFT training JSONL format. The processor replaces <image>
-    with image embeddings regardless of conversation role.
+    During SFT training the image was in assistant content as a plain
+    ``<image>`` text token.  At inference/generation time LLaVA's
+    ``apply_chat_template`` does not reliably preserve ``<image>`` in
+    non-user roles, so the inference script hoists images to the system
+    message.  We follow the same approach here.
 
     Args:
         question: The visual question (cleaned, no <image> tag)
@@ -225,11 +227,14 @@ def build_critic_prompt(
     messages = [
         {
             "role": "system",
-            "content": FEEDBACK_CRITIC_SYSTEM_PROMPT,
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": FEEDBACK_CRITIC_SYSTEM_PROMPT},
+            ],
         },
         {
             "role": "assistant",
-            "content": f"<image>\n{question}",
+            "content": question,
         },
         {
             "role": "user",
