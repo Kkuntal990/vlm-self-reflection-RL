@@ -27,6 +27,9 @@ _FINAL_ANSWER_PATTERN = re.compile(r"FINAL_ANSWER\s*:\s*\n?", re.IGNORECASE)
 # Answer extraction patterns
 _MCQ_LETTER_PATTERN = re.compile(r"[A-F]")
 _MCQ_STRICT_PATTERN = re.compile(r"^\s*\(?([A-F])\)?\s*$")
+_MCQ_OPTION_PATTERN = re.compile(r"\(?([A-F])\)")
+# Captures "(A) Yes" → letter="A", answer_text="Yes"
+_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(r"\(?([A-F])\)\s*(.*)", re.DOTALL)
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
@@ -236,6 +239,11 @@ def _extract_mcq_answer(text: str) -> str:
     if strict_match:
         return strict_match.group(1).upper()
 
+    # Try option pattern: "(A)" or "(B)" etc. — handles "(A) Yes", "(B) No"
+    option_match = _MCQ_OPTION_PATTERN.search(text)
+    if option_match:
+        return option_match.group(1).upper()
+
     # Find all MCQ letters in the text
     letters = _MCQ_LETTER_PATTERN.findall(text.upper())
     if not letters:
@@ -285,6 +293,33 @@ def _extract_numeric_answer(text: str) -> str:
     if not match:
         return ""
     return match.group(0)
+
+
+def extract_mcq_letter_and_text(text: str) -> tuple[str, str]:
+    """Extract both the option letter and the answer text from MCQ response.
+
+    For "(A) Yes" returns ("A", "Yes"). For "B" returns ("B", "").
+    Used by verify_answer to check GT against both the letter and text.
+
+    Args:
+        text: Raw answer text
+
+    Returns:
+        Tuple of (letter, answer_text). Either may be empty string.
+    """
+    text = text.strip()
+    if not text:
+        return ("", "")
+
+    match = _MCQ_LETTER_AND_TEXT_PATTERN.search(text)
+    if match:
+        letter = match.group(1).upper()
+        answer_text = match.group(2).strip()
+        return (letter, answer_text)
+
+    # Fall back to just extracting the letter
+    letter = _extract_mcq_answer(text)
+    return (letter, "")
 
 
 def detect_hedging(text: str) -> bool:

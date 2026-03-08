@@ -34,7 +34,7 @@ from typing import Any
 import numpy as np
 
 from vlm_grpo.rewards.deterministic import match_answer
-from vlm_grpo.trajectory import extract_answer_from_text
+from vlm_grpo.trajectory import extract_answer_from_text, extract_mcq_letter_and_text
 from vlm_grpo.utils import normalized_edit_distance
 
 logging.basicConfig(
@@ -258,6 +258,17 @@ def verify_answer(
     # Deterministic types: delegate to match_answer
     if is_deterministic:
         result = match_answer(extracted, ground_truth, answer_type, tolerance)
+
+        # For MCQ: GT may be the answer text (e.g., "No") rather than the
+        # option letter (e.g., "B").  Check the answer text portion too.
+        if result is not True and answer_type == "mcq":
+            _letter, answer_text = extract_mcq_letter_and_text(raw_text)
+            if answer_text:
+                gt_norm = ground_truth.strip().lower()
+                at_norm = answer_text.strip().lower()
+                if gt_norm == at_norm:
+                    result = True
+
         verdict = CORRECT if result is True else WRONG
         return MatchResult(
             answer_type=answer_type,

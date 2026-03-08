@@ -245,14 +245,28 @@ def main() -> None:
     # Load model + ref model
     logger.info(f"Loading model: {args.model_id}")
 
-    from copy import deepcopy
-
+    import torch
     from transformers import AutoModelForVision2Seq, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.model_id)
+
+    # Load reference model first (base weights, no LoRA, frozen)
+    logger.info("Loading reference model (frozen base)...")
+    ref_model = AutoModelForVision2Seq.from_pretrained(
+        args.model_id,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad = False
+    logger.info("Reference model loaded and frozen")
+
+    # Load policy model
+    logger.info("Loading policy model...")
     model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
-        torch_dtype="auto",
+        torch_dtype=torch.float16,
         device_map="auto",
     )
 
@@ -269,13 +283,6 @@ def main() -> None:
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
         logger.info(f"LoRA applied (r={args.lora_r}, alpha={args.lora_alpha})")
-
-    # Frozen reference model (copy before LoRA or use base)
-    ref_model = deepcopy(model)
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
-    logger.info("Reference model frozen")
 
     # Create trainer
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer

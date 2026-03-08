@@ -141,7 +141,7 @@ def build_reflection_prompt(
     messages = [
         {
             "role": "system",
-            "content": REFLECTION_SYSTEM_PROMPT,
+            "content": [{"type": "text", "text": REFLECTION_SYSTEM_PROMPT}],
         },
         {
             "role": "user",
@@ -152,11 +152,11 @@ def build_reflection_prompt(
         },
         {
             "role": "assistant",
-            "content": answer1,
+            "content": [{"type": "text", "text": answer1}],
         },
         {
             "role": "user",
-            "content": reflection_instruction,
+            "content": [{"type": "text", "text": reflection_instruction}],
         },
     ]
 
@@ -184,7 +184,7 @@ def build_initial_answer_prompt(question: str) -> list[dict]:
     return [
         {
             "role": "system",
-            "content": VL_ASSISTANT_SYSTEM_PROMPT,
+            "content": [{"type": "text", "text": VL_ASSISTANT_SYSTEM_PROMPT}],
         },
         {
             "role": "user",
@@ -234,11 +234,11 @@ def build_critic_prompt(
         },
         {
             "role": "assistant",
-            "content": question,
+            "content": [{"type": "text", "text": question}],
         },
         {
             "role": "user",
-            "content": answer1,
+            "content": [{"type": "text", "text": answer1}],
         },
     ]
 
@@ -275,7 +275,7 @@ def build_refiner_prompt(
     messages = [
         {
             "role": "system",
-            "content": VL_ASSISTANT_SYSTEM_PROMPT,
+            "content": [{"type": "text", "text": VL_ASSISTANT_SYSTEM_PROMPT}],
         },
         {
             "role": "user",
@@ -286,11 +286,11 @@ def build_refiner_prompt(
         },
         {
             "role": "assistant",
-            "content": answer1,
+            "content": [{"type": "text", "text": answer1}],
         },
         {
             "role": "user",
-            "content": feedback1,
+            "content": [{"type": "text", "text": feedback1}],
         },
     ]
 
@@ -312,4 +312,4 @@ def build_prompt_with_completion(
     Returns:
         Full message list with assistant completion appended
     """
-    return prompt_messages + [{"role": "assistant", "content": completion}]
+    return prompt_messages + [{"role": "assistant", "content": [{"type": "text", "text": completion}]}]

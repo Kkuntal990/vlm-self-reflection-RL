@@ -550,9 +550,9 @@ def build_critic_prompt_with_completion(
                 {"type": "text", "text": CRITIC_SYSTEM_PROMPT},
             ],
         },
-        {"role": "assistant", "content": question},
-        {"role": "user", "content": answer1},
-        {"role": "assistant", "content": completion},
+        {"role": "assistant", "content": [{"type": "text", "text": question}]},
+        {"role": "user", "content": [{"type": "text", "text": answer1}]},
+        {"role": "assistant", "content": [{"type": "text", "text": completion}]},
     ]
     return messages
 
@@ -871,13 +871,15 @@ class SelfReflectionGRPOTrainer:
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k)
 
         # Step 4: Compute old_log_probs and ref_log_probs (once, frozen)
+        n_traj = len(trajectory_data)
+        logger.info(f"  Computing old/ref log-probs for {n_traj} trajectories...")
         with torch.no_grad():
             old_resp_lps_list = []
             old_fb_lps_list = []
             ref_resp_lps_list = []
             ref_fb_lps_list = []
 
-            for t in trajectory_data:
+            for ti, t in enumerate(trajectory_data):
                 old_a1 = self._compute_log_prob(t["a1_full"], t["image"], self.model)
                 old_a2 = self._compute_log_prob(t["a2_full"], t["image"], self.model)
                 old_resp_lps_list.append(old_a1 + old_a2)
@@ -889,6 +891,7 @@ class SelfReflectionGRPOTrainer:
                 ref_fb_lps_list.append(
                     self._compute_log_prob(t["f1_full"], t["image"], self.ref_model)
                 )
+                logger.info(f"    old/ref log-prob {ti + 1}/{n_traj} done")
 
             old_resp_lps = torch.stack(old_resp_lps_list)
             old_fb_lps = torch.stack(old_fb_lps_list)
@@ -904,6 +907,7 @@ class SelfReflectionGRPOTrainer:
         total_kl_loss = 0.0
 
         for inner_epoch in range(num_inner):
+            logger.info(f"  Inner epoch {inner_epoch + 1}/{num_inner}...")
             # Recompute log-probs under current (evolving) weights
             cur_resp_lps = []
             cur_fb_lps = []
@@ -1031,7 +1035,7 @@ class SelfReflectionGRPOTrainer:
         full_text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
-        # Tokenize prompt only (to find where completion starts)
+        # Tokenize prompt text only (for computing prompt length — no image needed)
         prompt_text = self.processor.apply_chat_template(
             prompt_messages, tokenize=False, add_generation_prompt=True
         )
@@ -1048,14 +1052,12 @@ class SelfReflectionGRPOTrainer:
             full_inputs = self.processor(text=full_text, images=image, return_tensors="pt").to(
                 self.device
             )
-            prompt_inputs = self.processor(text=prompt_text, images=image, return_tensors="pt").to(
-                self.device
-            )
         else:
             full_inputs = self.processor(text=full_text, return_tensors="pt").to(self.device)
-            prompt_inputs = self.processor(text=prompt_text, return_tensors="pt").to(self.device)
 
-        prompt_len = prompt_inputs["input_ids"].shape[1]
+        # Get prompt length by tokenizing text only (skip expensive image processing)
+        prompt_ids = self.processor.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+        prompt_len = prompt_ids.shape[1]
 
         # Forward pass on full sequence
         outputs = model(**full_inputs)

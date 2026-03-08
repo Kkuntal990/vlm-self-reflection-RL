@@ -265,10 +265,10 @@ def compute_critic_reward_breakdown(
     r_format = compute_critic_format_reward(feedback_text)
     format_valid = r_format > 0
 
-    # Downstream-aware reward
+    # Downstream-aware reward (pass raw text for MCQ answer text matching)
     r_downstream = compute_downstream_aware_reward(
         feedback_text=feedback_text,
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         a1=answer1,
@@ -282,7 +282,7 @@ def compute_critic_reward_breakdown(
     )
 
     # Determine A2 correctness for logging
-    a2_result = verify_answer(a2_extracted, ground_truth, answer_type)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a2_correct = a2_result.is_correct
 
     # Compose weighted reward
@@ -347,9 +347,9 @@ def compute_refiner_reward_breakdown(
     r_format = _compute_refiner_format_reward(a2_extracted, a2_text, answer_type)
     format_valid = r_format > 0
 
-    # Correctness reward
+    # Correctness reward (pass raw text for MCQ answer text matching)
     r_correctness = compute_a2_correctness_reward(
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         format_valid=format_valid,
@@ -357,7 +357,7 @@ def compute_refiner_reward_breakdown(
 
     # No-regression reward
     r_no_regression = compute_no_regression_reward(
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         a1_is_correct=a1_is_correct,
@@ -367,14 +367,14 @@ def compute_refiner_reward_breakdown(
     # Minimal-edit reward
     r_minimal_edit = compute_minimal_edit_reward(
         a1=answer1,
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         format_valid=format_valid,
     )
 
     # Determine A2 correctness for logging
-    a2_result = verify_answer(a2_extracted, ground_truth, answer_type)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a2_correct = a2_result.is_correct
 
     # Compose weighted reward
@@ -708,9 +708,10 @@ def compute_response_reward_breakdown(
     # A1 correctness reward
     r_a1 = 1.0 if a1_correct else -1.0
 
-    # A2 correctness reward
+    # A2 correctness reward (pass raw text so verify_answer can extract both
+    # option letter and answer text for MCQ matching)
     r_a2 = compute_a2_correctness_reward(
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         format_valid=a2_format_valid,
@@ -718,7 +719,7 @@ def compute_response_reward_breakdown(
 
     # No-regression reward
     r_no_reg = compute_no_regression_reward(
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         a1_is_correct=a1_correct,
@@ -728,14 +729,14 @@ def compute_response_reward_breakdown(
     # Minimal edit reward
     r_edit = compute_minimal_edit_reward(
         a1=a1_text,
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         format_valid=a2_format_valid,
     )
 
     # Determine A2 correctness
-    a2_result = verify_answer(a2_extracted, ground_truth, answer_type)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a2_correct = a2_result.is_correct
 
     components = {
@@ -802,10 +803,10 @@ def compute_feedback_reward_breakdown(
     r_format = compute_critic_format_reward(feedback_text)
     format_valid = r_format > 0
 
-    # Downstream-aware reward (did feedback lead to correct A2?)
+    # Downstream-aware reward (pass raw text for MCQ answer text matching)
     r_downstream = compute_downstream_aware_reward(
         feedback_text=feedback_text,
-        a2_extracted=a2_extracted,
+        a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
         a1=a1_text,
