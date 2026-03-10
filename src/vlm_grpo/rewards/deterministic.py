@@ -369,6 +369,8 @@ def compute_feedback_calibration_reward(feedback: str) -> float:
 def _extract_letter(text: str) -> str:
     """Extract a single MCQ letter from text.
 
+    Handles formats: "A", "(A)", "A)", "A.", "A. 24", "(A) Yes"
+
     Args:
         text: Text possibly containing an MCQ letter
 
@@ -381,6 +383,10 @@ def _extract_letter(text: str) -> str:
         return text
     # With parentheses: (A), A)
     match = re.match(r"^\s*\(?([A-F])\)?\s*$", text)
+    if match:
+        return match.group(1)
+    # With dot: "A.", "A. 24", "B. 90°"
+    match = re.match(r"^\s*([A-F])\.\s*", text)
     if match:
         return match.group(1)
     return ""

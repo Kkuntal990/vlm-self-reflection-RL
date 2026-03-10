@@ -26,10 +26,13 @@ _FINAL_ANSWER_PATTERN = re.compile(r"FINAL_ANSWER\s*:\s*\n?", re.IGNORECASE)
 
 # Answer extraction patterns
 _MCQ_LETTER_PATTERN = re.compile(r"[A-F]")
-_MCQ_STRICT_PATTERN = re.compile(r"^\s*\(?([A-F])\)?\s*$")
-_MCQ_OPTION_PATTERN = re.compile(r"\(?([A-F])\)")
-# Captures "(A) Yes" → letter="A", answer_text="Yes"
-_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(r"\(?([A-F])\)\s*(.*)", re.DOTALL)
+_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(?([A-F])\)?|([A-F])\.)\s*$")
+# Matches "(A)", "(B)" or "A.", "B." at word boundary
+_MCQ_OPTION_PATTERN = re.compile(r"(?:\(?([A-F])\)|([A-F])\.)")
+# Captures "(A) Yes" or "A. Yes" → letter + answer_text
+_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(
+    r"(?:\(?([A-F])\)\s*|([A-F])\.\s*)(.*)", re.DOTALL
+)
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
@@ -234,15 +237,17 @@ def _extract_mcq_answer(text: str) -> str:
     Returns:
         Single uppercase letter (A-F) or empty string if extraction failed
     """
-    # Try strict match first (just the letter, optionally with parens)
+    # Try strict match first (just the letter: "A", "(A)", "A.")
     strict_match = _MCQ_STRICT_PATTERN.match(text)
     if strict_match:
-        return strict_match.group(1).upper()
+        letter = strict_match.group(1) or strict_match.group(2)
+        return letter.upper()
 
-    # Try option pattern: "(A)" or "(B)" etc. — handles "(A) Yes", "(B) No"
+    # Try option pattern: "(A)" / "(B)" or "A." / "B." — handles "(A) Yes", "B. 24"
     option_match = _MCQ_OPTION_PATTERN.search(text)
     if option_match:
-        return option_match.group(1).upper()
+        letter = option_match.group(1) or option_match.group(2)
+        return letter.upper()
 
     # Find all MCQ letters in the text
     letters = _MCQ_LETTER_PATTERN.findall(text.upper())
@@ -313,8 +318,8 @@ def extract_mcq_letter_and_text(text: str) -> tuple[str, str]:
 
     match = _MCQ_LETTER_AND_TEXT_PATTERN.search(text)
     if match:
-        letter = match.group(1).upper()
-        answer_text = match.group(2).strip()
+        letter = (match.group(1) or match.group(2)).upper()
+        answer_text = match.group(3).strip()
         return (letter, answer_text)
 
     # Fall back to just extracting the letter

@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Maximum training samples (0 = all)",
     )
+    parser.add_argument(
+        "--sample_indices",
+        type=str,
+        default="",
+        help="Comma-separated JSONL line indices to run (e.g. '0,5,12'). Overrides max_samples.",
+    )
 
     # Training
     parser.add_argument(
@@ -96,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         "--feedback_temperature", type=float, default=0.9, help="F1 sampling temperature"
     )
     parser.add_argument(
-        "--a2_temperature", type=float, default=0.0, help="A2 temperature (0=greedy)"
+        "--a2_temperature", type=float, default=0.3, help="A2 temperature (0=greedy)"
     )
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
@@ -221,12 +227,26 @@ def main() -> None:
     # Load dataset
     from vlm_grpo.data import load_self_reflection_dataset
 
+    # If specific indices requested, load enough lines to cover them
+    if args.sample_indices:
+        requested_indices = set(int(x.strip()) for x in args.sample_indices.split(","))
+        load_limit = max(requested_indices) + 1
+    else:
+        requested_indices = None
+        load_limit = args.sanity_check_samples or args.max_samples
+
     train_dataset = load_self_reflection_dataset(
         args.dataset_path,
         image_base_dir=args.image_base_dir,
-        max_samples=args.sanity_check_samples or args.max_samples,
+        max_samples=load_limit,
     )
-    logger.info(f"Training dataset: {len(train_dataset)} samples")
+
+    # Filter to requested indices
+    if requested_indices is not None:
+        train_dataset = [s for s in train_dataset if s["sample_index"] in requested_indices]
+        logger.info(f"Filtered to {len(train_dataset)} samples at indices: {sorted(requested_indices)}")
+    else:
+        logger.info(f"Training dataset: {len(train_dataset)} samples")
 
     val_dataset = None
     if args.val_dataset_path:
@@ -249,14 +269,14 @@ def main() -> None:
     from transformers import AutoModelForVision2Seq, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.model_id)
+    device = "cuda:0"
 
     # Load reference model first (base weights, no LoRA, frozen)
     logger.info("Loading reference model (frozen base)...")
     ref_model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
         torch_dtype=torch.float16,
-        device_map="auto",
-    )
+    ).to(device)
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False
@@ -267,8 +287,7 @@ def main() -> None:
     model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
         torch_dtype=torch.float16,
-        device_map="auto",
-    )
+    ).to(device)
 
     # Apply LoRA
     if not args.no_peft:

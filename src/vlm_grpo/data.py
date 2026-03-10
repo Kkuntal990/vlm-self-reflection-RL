@@ -179,7 +179,7 @@ def detect_answer_type(
     """Detect answer type from question and ground truth characteristics.
 
     Heuristic classification:
-    - MCQ: question contains choice patterns (A), (B), (C)...
+    - MCQ: question contains choice patterns (A)/(B) or A./B.
     - YesNo: ground truth is "Yes" or "No"
     - Numeric: ground truth is a number
     - Open: everything else
@@ -198,9 +198,10 @@ def detect_answer_type(
     if choices:
         return "mcq"
 
-    # Check for MCQ pattern in question
-    mcq_pattern = re.compile(r"\([A-F]\)\s*\w+", re.IGNORECASE)
-    if mcq_pattern.search(question):
+    # Check for MCQ pattern in question: "(A) text" or "A. text"
+    mcq_paren_pattern = re.compile(r"\([A-F]\)\s*\w+", re.IGNORECASE)
+    mcq_dot_pattern = re.compile(r"^[A-F]\.\s*.+", re.MULTILINE | re.IGNORECASE)
+    if mcq_paren_pattern.search(question) or mcq_dot_pattern.search(question):
         return "mcq"
 
     # Check for yes/no ground truth
@@ -219,6 +220,31 @@ def detect_answer_type(
         pass
 
     return "open"
+
+
+# Category → answer_type mapping for datasets with explicit category field
+_CATEGORY_TO_ANSWER_TYPE: dict[str, str] = {
+    "mcq": "mcq",
+    "yes_no": "yesno",
+    "counting": "counting",
+    "chart_reasoning": "open",
+    "descriptive_vqa": "open",
+}
+
+
+def _category_to_answer_type(category: str, fallback: str) -> str:
+    """Map dataset category to answer_type, falling back to heuristic.
+
+    Args:
+        category: Dataset category field (e.g. "mcq", "yes_no", "counting")
+        fallback: Fallback answer_type from heuristic detection
+
+    Returns:
+        Answer type string
+    """
+    if category and category in _CATEGORY_TO_ANSWER_TYPE:
+        return _CATEGORY_TO_ANSWER_TYPE[category]
+    return fallback
 
 
 def _normalize_prompt_content(prompt: list[dict]) -> list[dict]:
@@ -594,6 +620,11 @@ def load_self_reflection_dataset(
                 "dataset_name": sample.get("dataset_name", "unknown"),
             }
 
+        # Rule 1: Use category field from dataset when available
+        answer_type = _category_to_answer_type(
+            sample.get("category", ""), fields["answer_type"]
+        )
+
         # Resolve image path
         image_path = _resolve_image_path(sample, image_base_dir)
 
@@ -609,7 +640,7 @@ def load_self_reflection_dataset(
                 "question": question,
                 "image_path": image_path,
                 "ground_truth": fields["ground_truth"],
-                "answer_type": fields["answer_type"],
+                "answer_type": answer_type,
                 "choices": fields["choices"],
                 "dataset_name": fields["dataset_name"],
                 "sample_index": i,

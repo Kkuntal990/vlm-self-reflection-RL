@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
 """
-Optional LLM judge adapter for open-ended answer verification.
+LLM-as-judge for open-ended VQA answer equivalence.
 
-Provides an LLM-based judge for evaluating open-ended answers where
-deterministic matching is insufficient. Uses hash-based caching to
-avoid re-judging identical inputs.
+Uses Qwen2.5-3B-Instruct on GPU to determine if a predicted answer is
+semantically equivalent to a ground truth answer. Replaces embedding
+cosine similarity for more accurate semantic matching in the open-ended
+verification cascade.
 
-This module is a placeholder for the RW-first phase where MCQ/YesNo
-questions dominate. It can be activated later for open-ended evaluation.
+The model is lazy-loaded as a singleton and runs on GPU in float16.
+Results are cached via LRU cache to avoid redundant inference.
+
+Activation: Set environment variable VLM_USE_LLM_JUDGE=1 to enable.
+When disabled (default), the verifier falls back to embedding cosine sim.
 
 Usage:
-    from vlm_grpo.rewards.judge_llm import LLMJudgeAdapter
+    import os
+    os.environ["VLM_USE_LLM_JUDGE"] = "1"
 
-    judge = LLMJudgeAdapter(api_base="http://localhost:8000/v1")
-    score = judge.judge_open_ended(
-        question="What is the man doing?",
-        predicted="cooking pasta",
-        ground_truth="making pizza",
+    from vlm_grpo.rewards.judge_llm import llm_judge_score
+
+    score = llm_judge_score(
+        "The pepper is on the left side",
+        "The pepper is on the right of the image",
     )
+    assert score < 0.5  # Not equivalent
 """
 
-import hashlib
+import functools
 import logging
+import os
+import re
 import sys
-from typing import Optional
+from typing import Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,139 +40,137 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Judge prompt template
-_JUDGE_PROMPT = """You are evaluating whether a predicted answer is semantically equivalent to a ground truth answer for a visual question answering task.
+# Configurable via environment variables
+_JUDGE_MODEL_ID = os.environ.get("VLM_JUDGE_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
 
-Question: {question}
+# Singleton model and tokenizer
+_judge_model: Any = None
+_judge_tokenizer: Any = None
+
+_JUDGE_PROMPT = """You are an answer equivalence judge for visual question answering.
+
+Two answers should be considered equivalent if they express the same meaning even if wording is different.
+
+Examples of equivalent answers (score 10):
+- "3" and "three"
+- "There are three slices" and "3 slices"
+- "No" and "No, it is not."
+- "We are not going" and "We ain't going"
+- "a cat" and "a domestic cat sitting on the table"
+- "The brand is LG" and "LG"
+
+Examples of NOT equivalent answers (score 0):
+- "3" and "4" (different numbers)
+- "Yes" and "No" (opposite polarity)
+- "left" and "right" (opposite direction)
+- "dog" and "cat" (different entities)
+- "red" and "blue" (different attributes)
+- "The pepper is on the left" and "The pepper is on the right" (contradictory)
+
+Rate how equivalent the predicted answer is to the ground truth on a scale of 0-10:
+- 10: Identical or perfect paraphrase (same meaning, same facts)
+- 7-9: Mostly equivalent (same core answer, minor differences in detail or wording)
+- 4-6: Partially equivalent (some overlap but missing or different key information)
+- 1-3: Mostly wrong (different answer, different facts, contradictions)
+- 0: Completely wrong or unrelated
+
 Ground Truth: {ground_truth}
-Predicted: {predicted}
+Predicted Answer: {predicted}
 
-Is the predicted answer correct? Consider:
-- Semantic equivalence (different wording, same meaning)
-- Acceptable abbreviations or synonyms
-- Minor formatting differences are OK
+Respond with only a single integer from 0 to 10."""
 
-Respond with ONLY one of: CORRECT, INCORRECT, or UNCERTAIN"""
+# Pattern to extract the score from LLM response
+_SCORE_PATTERN = re.compile(r"\b(\d+)\b")
 
 
-class LLMJudgeAdapter:
-    """Adapter for using an LLM as judge for open-ended answers.
+def is_enabled() -> bool:
+    """Check if the LLM judge is enabled via environment variable.
 
-    Only used when answer_type == "open" and deterministic scoring
-    cannot resolve correctness.
-
-    Attributes:
-        model_id: HuggingFace model ID or API model name
-        api_base: Optional API base URL (for vLLM/TGI server)
-        cache: Hash-based cache for judge results
+    Returns:
+        True if VLM_USE_LLM_JUDGE=1 is set
     """
+    return os.environ.get("VLM_USE_LLM_JUDGE", "0") == "1"
 
-    def __init__(
-        self,
-        model_id: str = "Qwen/Qwen2.5-72B-Instruct",
-        api_base: Optional[str] = None,
-        max_cache_size: int = 10000,
-    ):
-        """Initialize the LLM judge.
 
-        Args:
-            model_id: Model to use for judging
-            api_base: Optional API base URL (for vLLM/TGI server)
-            max_cache_size: Maximum number of cached judgments
-        """
-        self.model_id = model_id
-        self.api_base = api_base
-        self.max_cache_size = max_cache_size
-        self._cache: dict[str, float] = {}
-        self._client = None
+def _get_judge_model() -> tuple[Any, Any]:
+    """Lazy-load the Qwen2.5-3B judge model and tokenizer on GPU.
 
-        logger.info(f"LLMJudgeAdapter initialized (model={model_id}, api_base={api_base})")
+    Returns:
+        Tuple of (model, tokenizer)
+    """
+    global _judge_model, _judge_tokenizer
+    if _judge_model is None:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    def _get_client(self):
-        """Lazy-load the OpenAI-compatible client."""
-        if self._client is not None:
-            return self._client
+        logger.info(f"Loading LLM judge model: {_JUDGE_MODEL_ID}")
+        _judge_tokenizer = AutoTokenizer.from_pretrained(
+            _JUDGE_MODEL_ID,
+            trust_remote_code=True,
+        )
+        _judge_model = AutoModelForCausalLM.from_pretrained(
+            _JUDGE_MODEL_ID,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        _judge_model.eval()
+        logger.info("LLM judge model loaded")
+    return _judge_model, _judge_tokenizer
 
-        # Lazy import to avoid loading heavy libraries until needed
-        from openai import OpenAI
 
-        if self.api_base:
-            self._client = OpenAI(base_url=self.api_base, api_key="dummy")
-        else:
-            self._client = OpenAI()
+@functools.lru_cache(maxsize=4096)
+def llm_judge_score(predicted: str, ground_truth: str) -> float:
+    """Score the equivalence of predicted answer vs ground truth using LLM.
 
-        return self._client
+    Uses Qwen2.5-3B-Instruct to produce a 0-10 score, normalized to [0, 1].
+    Results are cached via LRU cache (maxsize=4096).
 
-    def _cache_key(self, question: str, predicted: str, ground_truth: str) -> str:
-        """Generate cache key from inputs.
+    Args:
+        predicted: Predicted answer text
+        ground_truth: Ground truth answer text
 
-        Args:
-            question: Question text
-            predicted: Predicted answer
-            ground_truth: Ground truth answer
+    Returns:
+        Equivalence score in [0.0, 1.0] where 1.0 = perfect match
+    """
+    import torch
 
-        Returns:
-            Cache key string
-        """
-        content = f"{question}|{predicted}|{ground_truth}"
-        return hashlib.sha256(content.encode()).hexdigest()[:20]
+    model, tokenizer = _get_judge_model()
 
-    def judge_open_ended(
-        self,
-        question: str,
-        predicted: str,
-        ground_truth: str,
-    ) -> float:
-        """Judge whether an open-ended answer is correct.
+    prompt = _JUDGE_PROMPT.format(
+        ground_truth=ground_truth.strip(),
+        predicted=predicted.strip(),
+    )
 
-        Args:
-            question: The original question
-            predicted: Model's predicted answer
-            ground_truth: Ground truth answer
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
-        Returns:
-            1.0 if correct, -1.0 if incorrect, 0.0 if uncertain
-        """
-        # Check cache
-        key = self._cache_key(question, predicted, ground_truth)
-        if key in self._cache:
-            return self._cache[key]
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
-        # Quick exact match check
-        if predicted.strip().lower() == ground_truth.strip().lower():
-            self._cache[key] = 1.0
-            return 1.0
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=10,
+            do_sample=False,
+        )
 
-        try:
-            client = self._get_client()
-            prompt = _JUDGE_PROMPT.format(
-                question=question,
-                ground_truth=ground_truth,
-                predicted=predicted,
-            )
+    # Decode only the generated tokens (exclude the prompt)
+    generated = tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    ).strip()
 
-            response = client.chat.completions.create(
-                model=self.model_id,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=20,
-                temperature=0.0,
-            )
+    # Extract integer score from response
+    match = _SCORE_PATTERN.search(generated)
+    if match:
+        raw_score = int(match.group(1))
+        # Clamp to [0, 10] and normalize to [0, 1]
+        return min(max(raw_score, 0), 10) / 10.0
 
-            result_text = response.choices[0].message.content.strip().upper()
-
-            if "CORRECT" in result_text and "INCORRECT" not in result_text:
-                score = 1.0
-            elif "INCORRECT" in result_text:
-                score = -1.0
-            else:
-                score = 0.0
-
-        except Exception as e:
-            logger.warning(f"LLM judge failed: {e}")
-            score = 0.0
-
-        # Cache result
-        if len(self._cache) < self.max_cache_size:
-            self._cache[key] = score
-
-        return score
+    # If parsing fails, treat as uncertain → low score
+    logger.warning(f"LLM judge returned unparseable response: '{generated}'")
+    return 0.0

@@ -190,3 +190,58 @@ class TestOpenEndedEmbeddingStage:
     def test_unrelated_wrong(self) -> None:
         r = verify_answer("airplane", "cat", "open")
         assert r.verdict == WRONG
+
+
+# =============================================================================
+# Antonym contradiction detection
+# =============================================================================
+
+
+class TestAntonymContradiction:
+    """Tests for antonym contradiction detection in open-ended matching.
+
+    Sentences that differ only by an antonym pair (left/right, yes/no, etc.)
+    should be marked WRONG despite high surface similarity.
+    """
+
+    def test_left_right_contradiction(self) -> None:
+        """Descriptive VQA: 'left' vs 'right' must be WRONG."""
+        r = verify_answer(
+            "The pepper is on the left side of the image.",
+            "The pepper is on the right of the image.",
+            "open",
+        )
+        assert r.verdict == WRONG
+
+    def test_above_below_contradiction(self) -> None:
+        r = verify_answer(
+            "The cat is above the table.",
+            "The cat is below the table.",
+            "open",
+        )
+        assert r.verdict == WRONG
+
+    def test_top_bottom_contradiction(self) -> None:
+        r = verify_answer(
+            "The text is at the top of the image.",
+            "The text is at the bottom of the image.",
+            "open",
+        )
+        assert r.verdict == WRONG
+
+    def test_no_false_positive_on_elaboration(self) -> None:
+        """Adding extra words (not antonyms) should still match."""
+        r = verify_answer(
+            "The pepper is on the right side of the image.",
+            "The pepper is on the right of the image.",
+            "open",
+        )
+        assert r.verdict == CORRECT
+
+    def test_increase_decrease_contradiction(self) -> None:
+        r = verify_answer(
+            "The trend shows an increase over time.",
+            "The trend shows a decrease over time.",
+            "open",
+        )
+        assert r.verdict == WRONG
