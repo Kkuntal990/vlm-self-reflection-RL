@@ -160,10 +160,18 @@ def main() -> None:
     """Main training entry point."""
     args = parse_args()
 
+    from accelerate import Accelerator
+
     from vlm_grpo.utils import set_seed, setup_environment
 
     setup_environment()
     set_seed(args.seed)
+
+    accelerator = Accelerator()
+
+    # Suppress verbose logging on non-main processes
+    if not accelerator.is_main_process:
+        logging.getLogger().setLevel(logging.WARNING)
 
     # Build configs
     from vlm_grpo.config import (
@@ -257,9 +265,10 @@ def main() -> None:
         )
         logger.info(f"Validation dataset: {len(val_dataset)} samples")
 
-    # Sanity check mode
+    # Sanity check mode (main process only)
     if args.sanity_check_samples > 0:
-        _run_sanity_check(train_dataset, response_weights, feedback_weights)
+        if accelerator.is_main_process:
+            _run_sanity_check(train_dataset, response_weights, feedback_weights)
         return
 
     # Load model + ref model
@@ -269,14 +278,13 @@ def main() -> None:
     from transformers import AutoModelForVision2Seq, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(args.model_id)
-    device = "cuda:0"
 
     # Load reference model first (base weights, no LoRA, frozen)
     logger.info("Loading reference model (frozen base)...")
     ref_model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
         torch_dtype=torch.float16,
-    ).to(device)
+    ).to(accelerator.device)
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False
@@ -287,7 +295,7 @@ def main() -> None:
     model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
         torch_dtype=torch.float16,
-    ).to(device)
+    ).to(accelerator.device)
 
     # Apply LoRA
     if not args.no_peft:
@@ -303,6 +311,27 @@ def main() -> None:
         model.print_trainable_parameters()
         logger.info(f"LoRA applied (r={args.lora_r}, alpha={args.lora_alpha})")
 
+    # Create optimizer and prepare for distributed training
+    from torch.optim import AdamW
+
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
+    model, optimizer = accelerator.prepare(model, optimizer)
+    logger.info(
+        f"Distributed training: {accelerator.num_processes} processes, "
+        f"device={accelerator.device}"
+    )
+
+    # Shard training dataset across processes (drop remainder for even distribution)
+    n = len(train_dataset)
+    per_process = n // accelerator.num_processes
+    start = accelerator.process_index * per_process
+    end = start + per_process
+    train_dataset = train_dataset[start:end]
+    logger.info(
+        f"Process {accelerator.process_index}: samples {start}-{end} "
+        f"({len(train_dataset)} samples)"
+    )
+
     # Create trainer
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
 
@@ -311,6 +340,8 @@ def main() -> None:
         ref_model=ref_model,
         processor=processor,
         config=config,
+        optimizer=optimizer,
+        accelerator=accelerator,
     )
 
     # Train

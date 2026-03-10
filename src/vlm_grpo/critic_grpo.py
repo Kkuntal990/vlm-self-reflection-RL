@@ -611,6 +611,7 @@ class SelfReflectionGRPOTrainer:
         config: Any,
         optimizer: Optional[Any] = None,
         scheduler: Optional[Any] = None,
+        accelerator: Optional[Any] = None,
     ) -> None:
         """Initialize the self-reflection GRPO trainer.
 
@@ -623,6 +624,7 @@ class SelfReflectionGRPOTrainer:
             config: SelfReflectionConfig
             optimizer: Optional pre-configured optimizer
             scheduler: Optional learning rate scheduler
+            accelerator: Optional HuggingFace Accelerator for distributed training
         """
         from torch.optim import AdamW
 
@@ -630,7 +632,12 @@ class SelfReflectionGRPOTrainer:
         self.ref_model = ref_model
         self.processor = processor
         self.config = config
-        self.device = next(model.parameters()).device
+        self.accelerator = accelerator
+
+        if accelerator is not None:
+            self.device = accelerator.device
+        else:
+            self.device = next(model.parameters()).device
 
         if optimizer is not None:
             self.optimizer = optimizer
@@ -666,6 +673,8 @@ class SelfReflectionGRPOTrainer:
         num_epochs = config.num_train_epochs
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        is_main = self.accelerator is None or self.accelerator.is_main_process
 
         total_steps = math.ceil(len(train_dataset) / batch_size) * num_epochs
         logger.info(f"Starting self-reflection GRPO training: {total_steps} rollout steps")
@@ -725,19 +734,21 @@ class SelfReflectionGRPOTrainer:
                         logger.info("Early stopping triggered!")
                         break
 
-                # Save checkpoint
+                # Save checkpoint (main process only)
                 if (
                     config.save_steps > 0
                     and self.global_step % config.save_steps == 0
                     and self.global_step > 0
+                    and is_main
                 ):
                     self._save_checkpoint(output_dir / f"checkpoint-{self.global_step}")
 
             avg_loss = epoch_loss / max(epoch_steps, 1)
             logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
 
-        # Final save
-        self._save_checkpoint(output_dir / "final")
+        # Final save (main process only)
+        if is_main:
+            self._save_checkpoint(output_dir / "final")
         logger.info(f"Training complete. Model saved to {output_dir / 'final'}")
 
         return all_metrics
@@ -777,8 +788,14 @@ class SelfReflectionGRPOTrainer:
         self.model.train()
 
         # Step 1: Rollout (generates A1->F1->A2, computes rewards)
+        # Use unwrapped model for generation (DDP wrapper lacks .generate())
+        gen_model = (
+            self.accelerator.unwrap_model(self.model)
+            if self.accelerator is not None
+            else self.model
+        )
         rollout_results = generate_self_reflection_rollout(
-            model=self.model,
+            model=gen_model,
             processor=self.processor,
             samples=batch,
             config=self.config.rollout,
@@ -871,6 +888,12 @@ class SelfReflectionGRPOTrainer:
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k)
 
         # Step 4: Compute old_log_probs and ref_log_probs (once, frozen)
+        # Use unwrapped model for no-grad passes (avoids DDP forward hooks)
+        unwrapped_model = (
+            self.accelerator.unwrap_model(self.model)
+            if self.accelerator is not None
+            else self.model
+        )
         n_traj = len(trajectory_data)
         logger.info(f"  Computing old/ref log-probs for {n_traj} trajectories...")
         with torch.no_grad():
@@ -880,10 +903,12 @@ class SelfReflectionGRPOTrainer:
             ref_fb_lps_list = []
 
             for ti, t in enumerate(trajectory_data):
-                old_a1 = self._compute_log_prob(t["a1_full"], t["image"], self.model)
-                old_a2 = self._compute_log_prob(t["a2_full"], t["image"], self.model)
+                old_a1 = self._compute_log_prob(t["a1_full"], t["image"], unwrapped_model)
+                old_a2 = self._compute_log_prob(t["a2_full"], t["image"], unwrapped_model)
                 old_resp_lps_list.append(old_a1 + old_a2)
-                old_fb_lps_list.append(self._compute_log_prob(t["f1_full"], t["image"], self.model))
+                old_fb_lps_list.append(
+                    self._compute_log_prob(t["f1_full"], t["image"], unwrapped_model)
+                )
 
                 ref_a1 = self._compute_log_prob(t["a1_full"], t["image"], self.ref_model)
                 ref_a2 = self._compute_log_prob(t["a2_full"], t["image"], self.ref_model)
@@ -940,9 +965,12 @@ class SelfReflectionGRPOTrainer:
             kl_loss = self.config.kl_coeff * kl
 
             loss = response_loss + feedback_loss + kl_loss
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            if self.accelerator is not None:
+                self.accelerator.backward(loss)
+                self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             self.optimizer.zero_grad()
 
@@ -990,9 +1018,14 @@ class SelfReflectionGRPOTrainer:
             if "image" not in sample:
                 sample["image"] = load_image_safe(sample["image_path"])
 
+        gen_model = (
+            self.accelerator.unwrap_model(self.model)
+            if self.accelerator is not None
+            else self.model
+        )
         with torch.no_grad():
             rollout_results = generate_self_reflection_rollout(
-                model=self.model,
+                model=gen_model,
                 processor=self.processor,
                 samples=val_dataset,
                 config=self.config.rollout,
@@ -1161,7 +1194,12 @@ class SelfReflectionGRPOTrainer:
             path: Directory to save to
         """
         path.mkdir(parents=True, exist_ok=True)
-        self.model.save_pretrained(path)
+        unwrapped = (
+            self.accelerator.unwrap_model(self.model)
+            if self.accelerator is not None
+            else self.model
+        )
+        unwrapped.save_pretrained(path)
         self.processor.save_pretrained(path)
 
         config_path = path / "training_config.json"
