@@ -173,11 +173,11 @@ spec:
 
         resources:
           limits:
-            nvidia.com/gpu: "2"
+            nvidia.com/a100: "2"
             memory: "96Gi"
             cpu: "4"
           requests:
-            nvidia.com/gpu: "2"
+            nvidia.com/a100: "2"
             memory: "96Gi"
             cpu: "4"
 
@@ -199,6 +199,9 @@ spec:
       - effect: PreferNoSchedule
         key: nvidia.com/gpu
         operator: Exists
+      - key: nautilus.io/issue
+        operator: Exists
+        effect: NoSchedule
 
       affinity:
         nodeAffinity:
