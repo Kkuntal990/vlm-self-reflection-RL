@@ -998,7 +998,10 @@ class SelfReflectionGRPOTrainer:
                 )
 
                 # Per-trajectory response GRPO loss
-                resp_ratio = torch.exp(resp_lp - old_resp_lps[ti])
+                # Clamp exponent to [-20, 20] to prevent inf/nan overflow when
+                # the model has drifted far from the old policy across inner epochs
+                resp_log_ratio = torch.clamp(resp_lp - old_resp_lps[ti], min=-20.0, max=20.0)
+                resp_ratio = torch.exp(resp_log_ratio)
                 resp_surr1 = resp_ratio * resp_advantages[ti]
                 resp_surr2 = (
                     torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
@@ -1007,7 +1010,8 @@ class SelfReflectionGRPOTrainer:
                 traj_resp_loss = -torch.min(resp_surr1, resp_surr2)
 
                 # Per-trajectory feedback GRPO loss
-                fb_ratio = torch.exp(fb_lp - old_fb_lps[ti])
+                fb_log_ratio = torch.clamp(fb_lp - old_fb_lps[ti], min=-20.0, max=20.0)
+                fb_ratio = torch.exp(fb_log_ratio)
                 fb_surr1 = fb_ratio * fb_advantages[ti]
                 fb_surr2 = (
                     torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
@@ -1045,7 +1049,21 @@ class SelfReflectionGRPOTrainer:
                 torch.nn.utils.clip_grad_norm_(
                     inner_model.parameters(), 1.0
                 )
-            self.optimizer.step()
+
+            # Skip optimizer step if any gradient contains NaN/inf to avoid
+            # corrupting model weights (which causes generate() to crash)
+            has_nan_grad = any(
+                param.grad is not None and not torch.isfinite(param.grad).all()
+                for param in inner_model.parameters()
+            )
+            if has_nan_grad:
+                logger.warning(
+                    f"  [inner epoch {inner_epoch + 1}] NaN/inf gradient detected — "
+                    "skipping optimizer step to preserve model weights"
+                )
+                self.optimizer.zero_grad()
+            else:
+                self.optimizer.step()
 
             total_resp_loss += epoch_resp_loss
             total_fb_loss += epoch_fb_loss
