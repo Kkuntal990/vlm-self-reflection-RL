@@ -798,6 +798,14 @@ class SelfReflectionGRPOTrainer:
             if self.accelerator is not None
             else self.model
         )
+
+        # Disable gradient checkpointing during generation — it forces
+        # use_cache=False which breaks autoregressive KV caching and
+        # produces garbage output.
+        had_grad_ckpt = gen_model.is_gradient_checkpointing
+        if had_grad_ckpt:
+            gen_model.gradient_checkpointing_disable()
+
         rollout_results = generate_self_reflection_rollout(
             model=gen_model,
             processor=self.processor,
@@ -808,6 +816,10 @@ class SelfReflectionGRPOTrainer:
             device=str(self.device),
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
+
+        # Re-enable gradient checkpointing for the training forward passes
+        if had_grad_ckpt:
+            gen_model.gradient_checkpointing_enable()
 
         # Step 2: Collect trajectory data (prompts, images, rewards)
         trajectory_data = []
@@ -963,14 +975,27 @@ class SelfReflectionGRPOTrainer:
             epoch_fb_loss = 0.0
             epoch_kl_loss = 0.0
 
-            for ti, t in enumerate(trajectory_data):
-                is_last = ti == n_traj_inner - 1
+            # Use unwrapped model for forward passes to avoid DDP hooks
+            # firing multiple times per backward. Gradients still flow to
+            # the underlying parameters. We manually all-reduce at the end.
+            inner_model = (
+                self.accelerator.unwrap_model(self.model)
+                if self.accelerator is not None
+                else self.model
+            )
 
+            for ti, t in enumerate(trajectory_data):
                 # Compute current log-probs (with grad) for this trajectory
-                a1_lp = self._compute_log_prob(t["a1_full"], t["image"], self.model)
-                a2_lp = self._compute_log_prob(t["a2_full"], t["image"], self.model)
+                a1_lp = self._compute_log_prob(
+                    t["a1_full"], t["image"], inner_model
+                )
+                a2_lp = self._compute_log_prob(
+                    t["a2_full"], t["image"], inner_model
+                )
                 resp_lp = a1_lp + a2_lp
-                fb_lp = self._compute_log_prob(t["f1_full"], t["image"], self.model)
+                fb_lp = self._compute_log_prob(
+                    t["f1_full"], t["image"], inner_model
+                )
 
                 # Per-trajectory response GRPO loss
                 resp_ratio = torch.exp(resp_lp - old_resp_lps[ti])
@@ -997,27 +1022,29 @@ class SelfReflectionGRPOTrainer:
                 )
                 traj_kl_loss = self.config.kl_coeff * traj_kl
 
-                # Scale by 1/n_traj to get mean, then backward to accumulate grads.
-                # Use no_sync for all but the last trajectory so DDP defers
-                # gradient all-reduce until the final backward().
-                traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
-                if self.accelerator is not None:
-                    if is_last:
-                        self.accelerator.backward(traj_loss)
-                    else:
-                        with self.accelerator.no_sync(self.model):
-                            self.accelerator.backward(traj_loss)
-                else:
-                    traj_loss.backward()
+                # Scale by 1/n_traj to get mean, then backward to accumulate
+                traj_loss = (
+                    traj_resp_loss + traj_fb_loss + traj_kl_loss
+                ) / n_traj_inner
+                traj_loss.backward()
 
                 epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
                 epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
                 epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
 
+            # Manually all-reduce gradients across DDP processes
             if self.accelerator is not None:
+                for param in inner_model.parameters():
+                    if param.grad is not None:
+                        torch.distributed.all_reduce(
+                            param.grad,
+                            op=torch.distributed.ReduceOp.AVG,
+                        )
                 self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    inner_model.parameters(), 1.0
+                )
             self.optimizer.step()
 
             total_resp_loss += epoch_resp_loss
@@ -1069,6 +1096,12 @@ class SelfReflectionGRPOTrainer:
             if self.accelerator is not None
             else self.model
         )
+
+        # Disable gradient checkpointing for generation (needs KV cache)
+        had_grad_ckpt = gen_model.is_gradient_checkpointing
+        if had_grad_ckpt:
+            gen_model.gradient_checkpointing_disable()
+
         with torch.no_grad():
             rollout_results = generate_self_reflection_rollout(
                 model=gen_model,
@@ -1079,6 +1112,9 @@ class SelfReflectionGRPOTrainer:
                 feedback_weights=self.config.feedback_weights,
                 device=str(self.device),
             )
+
+        if had_grad_ckpt:
+            gen_model.gradient_checkpointing_enable()
 
         metrics = compute_self_reflection_metrics(rollout_results)
         val_metrics = {f"val/{k.split('/')[-1]}": v for k, v in metrics.items()}
