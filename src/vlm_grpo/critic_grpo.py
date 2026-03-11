@@ -928,133 +928,174 @@ class SelfReflectionGRPOTrainer:
         resp_advantages = self._compute_group_advantages(resp_rewards_t, k)
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k)
 
-        # Step 4: Compute old_log_probs and ref_log_probs (once, frozen)
-        # Use unwrapped model for no-grad passes (avoids DDP forward hooks)
+        # Step 4: Pre-tokenize once, then compute old/ref log-probs in mini-batches.
+        #
+        # Pre-tokenization caches apply_chat_template strings and prompt/full
+        # token lengths so they are NOT recomputed on every inner epoch call.
+        # Mini-batching (inner_mini_bs) prevents OOM from large logits tensors
+        # (64 × 1000 × 32000 × 2 bytes ≈ 4 GB for a full-batch forward pass).
         unwrapped_model = (
             self.accelerator.unwrap_model(self.model)
             if self.accelerator is not None
             else self.model
         )
         n_traj = len(trajectory_data)
+        inner_mini_bs = self.config.inner_mini_batch_size
+        logger.info(f"  Pre-tokenizing {n_traj} trajectories (mini_bs={inner_mini_bs})...")
+
+        imgs = [t["image"] for t in trajectory_data]
+        a1_pretok = self._preprocess_trajectory_texts([t["a1_full"] for t in trajectory_data], imgs)
+        a2_pretok = self._preprocess_trajectory_texts([t["a2_full"] for t in trajectory_data], imgs)
+        f1_pretok = self._preprocess_trajectory_texts([t["f1_full"] for t in trajectory_data], imgs)
+
         logger.info(f"  Computing old/ref log-probs for {n_traj} trajectories...")
 
-        # Collect per-type inputs for batched forward passes.
-        # Each type (a1, a2, f1) is computed in one forward pass instead of N
-        # sequential calls — mirrors TRL's batched log-prob pattern.
-        a1_msgs = [t["a1_full"] for t in trajectory_data]
-        a2_msgs = [t["a2_full"] for t in trajectory_data]
-        f1_msgs = [t["f1_full"] for t in trajectory_data]
-        imgs = [t["image"] for t in trajectory_data]
+        old_a1_lps_list: list[Any] = []
+        old_a2_lps_list: list[Any] = []
+        old_fb_lps_list: list[Any] = []
+        ref_a1_lps_list: list[Any] = []
+        ref_a2_lps_list: list[Any] = []
+        ref_fb_lps_list: list[Any] = []
 
         with torch.no_grad():
-            old_a1_lps = self._compute_log_probs_batched(a1_msgs, imgs, unwrapped_model)
-            old_a2_lps = self._compute_log_probs_batched(a2_msgs, imgs, unwrapped_model)
-            old_fb_lps_list = self._compute_log_probs_batched(f1_msgs, imgs, unwrapped_model)
-            old_resp_lps_list = [a1 + a2 for a1, a2 in zip(old_a1_lps, old_a2_lps)]
+            for mb_s in range(0, n_traj, inner_mini_bs):
+                mb_e = min(mb_s + inner_mini_bs, n_traj)
+                old_a1_lps_list += self._forward_from_pretokenized(
+                    a1_pretok, unwrapped_model, mb_s, mb_e
+                )
+                old_a2_lps_list += self._forward_from_pretokenized(
+                    a2_pretok, unwrapped_model, mb_s, mb_e
+                )
+                old_fb_lps_list += self._forward_from_pretokenized(
+                    f1_pretok, unwrapped_model, mb_s, mb_e
+                )
 
-            # Ref log-probs: disable LoRA adapter to get base model output,
-            # or use a separate ref_model if provided
+            # Ref log-probs: disable LoRA adapter or use separate ref_model
             if self.ref_model is None:
                 unwrapped_model.disable_adapter_layers()
                 ref_m = unwrapped_model
             else:
                 ref_m = self.ref_model
 
-            ref_a1_lps = self._compute_log_probs_batched(a1_msgs, imgs, ref_m)
-            ref_a2_lps = self._compute_log_probs_batched(a2_msgs, imgs, ref_m)
-            ref_fb_lps_list = self._compute_log_probs_batched(f1_msgs, imgs, ref_m)
-            ref_resp_lps_list = [a1 + a2 for a1, a2 in zip(ref_a1_lps, ref_a2_lps)]
+            for mb_s in range(0, n_traj, inner_mini_bs):
+                mb_e = min(mb_s + inner_mini_bs, n_traj)
+                ref_a1_lps_list += self._forward_from_pretokenized(a1_pretok, ref_m, mb_s, mb_e)
+                ref_a2_lps_list += self._forward_from_pretokenized(a2_pretok, ref_m, mb_s, mb_e)
+                ref_fb_lps_list += self._forward_from_pretokenized(f1_pretok, ref_m, mb_s, mb_e)
 
             if self.ref_model is None:
                 unwrapped_model.enable_adapter_layers()
 
-            old_resp_lps = torch.stack(old_resp_lps_list)
+            old_resp_lps = torch.stack(
+                [a1 + a2 for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)]
+            )
             old_fb_lps = torch.stack(old_fb_lps_list)
-            ref_resp_lps = torch.stack(ref_resp_lps_list)
+            ref_resp_lps = torch.stack(
+                [a1 + a2 for a1, a2 in zip(ref_a1_lps_list, ref_a2_lps_list)]
+            )
             ref_fb_lps = torch.stack(ref_fb_lps_list)
 
-        # Free any cached activations before inner optimization
-        torch.cuda.empty_cache()
-        logger.info("  CUDA cache cleared before inner optimization")
+        # No explicit cache clear — PyTorch reuses memory automatically.
 
         clip_range = self.config.clip_range
         num_inner = self.config.num_inner_epochs
 
-        # Step 5: Inner optimization epochs
+        # Step 5: Inner optimization epochs — use pre-tokenized data to skip
+        # redundant apply_chat_template / tokenizer calls on every pass.
         total_resp_loss = 0.0
         total_fb_loss = 0.0
         total_kl_loss = 0.0
+        n_traj_inner = n_traj
 
         for inner_epoch in range(num_inner):
             self.optimizer.zero_grad()
-
-            # Accumulate gradients per-trajectory to avoid holding all
-            # computation graphs in memory simultaneously
-            n_traj_inner = len(trajectory_data)
             epoch_resp_loss = 0.0
             epoch_fb_loss = 0.0
             epoch_kl_loss = 0.0
 
-            # Use unwrapped model for forward passes to avoid DDP hooks
-            # firing multiple times per backward. Gradients still flow to
-            # the underlying parameters. We manually all-reduce at the end.
+            # Use unwrapped model to avoid DDP hooks firing per mini-batch.
+            # Gradients still flow to the underlying parameters; we
+            # manually all-reduce after all mini-batches.
             inner_model = (
                 self.accelerator.unwrap_model(self.model)
                 if self.accelerator is not None
                 else self.model
             )
 
-            for ti, t in enumerate(trajectory_data):
-                # Compute current log-probs (with grad) for this trajectory
-                a1_lp = self._compute_log_prob(
-                    t["a1_full"], t["image"], inner_model
+            # 3 batched forward passes per mini-batch (a1, a2, f1), reusing
+            # pre-tokenized strings so no chat-template overhead per pass.
+            for mb_start in range(0, n_traj_inner, inner_mini_bs):
+                mb_end = min(mb_start + inner_mini_bs, n_traj_inner)
+
+                mb_a1_lps = self._forward_from_pretokenized(
+                    a1_pretok, inner_model, mb_start, mb_end
                 )
-                a2_lp = self._compute_log_prob(
-                    t["a2_full"], t["image"], inner_model
+                mb_a2_lps = self._forward_from_pretokenized(
+                    a2_pretok, inner_model, mb_start, mb_end
                 )
-                resp_lp = a1_lp + a2_lp
-                fb_lp = self._compute_log_prob(
-                    t["f1_full"], t["image"], inner_model
+                mb_fb_lps = self._forward_from_pretokenized(
+                    f1_pretok, inner_model, mb_start, mb_end
                 )
 
-                # Per-trajectory response GRPO loss
-                # Clamp exponent to [-20, 20] to prevent inf/nan overflow when
-                # the model has drifted far from the old policy across inner epochs
-                resp_log_ratio = torch.clamp(resp_lp - old_resp_lps[ti], min=-20.0, max=20.0)
-                resp_ratio = torch.exp(resp_log_ratio)
-                resp_surr1 = resp_ratio * resp_advantages[ti]
-                resp_surr2 = (
-                    torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
-                    * resp_advantages[ti]
-                )
-                traj_resp_loss = -torch.min(resp_surr1, resp_surr2)
+                # Accumulate loss over mini-batch, backward once per mini-batch
+                mb_loss: Optional[Any] = None
+                for j in range(mb_end - mb_start):
+                    ti = mb_start + j
+                    resp_lp = mb_a1_lps[j] + mb_a2_lps[j]
+                    fb_lp = mb_fb_lps[j]
 
-                # Per-trajectory feedback GRPO loss
-                fb_log_ratio = torch.clamp(fb_lp - old_fb_lps[ti], min=-20.0, max=20.0)
-                fb_ratio = torch.exp(fb_log_ratio)
-                fb_surr1 = fb_ratio * fb_advantages[ti]
-                fb_surr2 = (
-                    torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
-                    * fb_advantages[ti]
-                )
-                traj_fb_loss = -torch.min(fb_surr1, fb_surr2)
+                    # Note: torch.clamp does NOT sanitize NaN (NaN passes through).
+                    # Apply nan_to_num on the difference before clamping so that
+                    # any NaN log-prob (fp16 + grad-ckpt edge case) becomes a
+                    # neutral 0.0 rather than propagating through exp().
+                    resp_ratio_raw = torch.nan_to_num(
+                        resp_lp - old_resp_lps[ti], nan=0.0, posinf=20.0, neginf=-20.0
+                    )
+                    fb_ratio_raw = torch.nan_to_num(
+                        fb_lp - old_fb_lps[ti], nan=0.0, posinf=20.0, neginf=-20.0
+                    )
+                    resp_kl_raw = torch.nan_to_num(
+                        ref_resp_lps[ti] - resp_lp, nan=0.0, posinf=20.0, neginf=-20.0
+                    )
+                    fb_kl_raw = torch.nan_to_num(
+                        ref_fb_lps[ti] - fb_lp, nan=0.0, posinf=20.0, neginf=-20.0
+                    )
 
-                # Per-trajectory KL loss
-                traj_kl = torch.clamp(
-                    (resp_lp - ref_resp_lps[ti] + fb_lp - ref_fb_lps[ti]) / 2.0,
-                    min=0.0,
-                )
-                traj_kl_loss = self.config.kl_coeff * traj_kl
+                    # Response GRPO loss: clamp ratio exponent to prevent overflow
+                    resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
+                    resp_ratio = torch.exp(resp_log_ratio)
+                    resp_surr1 = resp_ratio * resp_advantages[ti]
+                    resp_surr2 = (
+                        torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
+                        * resp_advantages[ti]
+                    )
+                    traj_resp_loss = -torch.min(resp_surr1, resp_surr2)
 
-                # Scale by 1/n_traj to get mean, then backward to accumulate
-                traj_loss = (
-                    traj_resp_loss + traj_fb_loss + traj_kl_loss
-                ) / n_traj_inner
-                traj_loss.backward()
+                    # Feedback GRPO loss
+                    fb_log_ratio = torch.clamp(fb_ratio_raw, min=-20.0, max=20.0)
+                    fb_ratio = torch.exp(fb_log_ratio)
+                    fb_surr1 = fb_ratio * fb_advantages[ti]
+                    fb_surr2 = (
+                        torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range) * fb_advantages[ti]
+                    )
+                    traj_fb_loss = -torch.min(fb_surr1, fb_surr2)
 
-                epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
-                epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
-                epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
+                    # KL loss (TRL approximation): always ≥ 0, exponent clamped
+                    resp_kl_delta = torch.clamp(resp_kl_raw, min=-20.0, max=20.0)
+                    resp_kl = torch.exp(resp_kl_delta) - resp_kl_delta - 1
+                    fb_kl_delta = torch.clamp(fb_kl_raw, min=-20.0, max=20.0)
+                    fb_kl = torch.exp(fb_kl_delta) - fb_kl_delta - 1
+                    traj_kl_loss = self.config.kl_coeff * (resp_kl + fb_kl) / 2.0
+
+                    traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
+                    mb_loss = traj_loss if mb_loss is None else mb_loss + traj_loss
+
+                    epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
+                    epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
+                    epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
+
+                if mb_loss is not None:
+                    mb_loss.backward()
 
             # Manually all-reduce gradients across DDP processes
             if self.accelerator is not None and torch.distributed.is_initialized():
@@ -1066,9 +1107,7 @@ class SelfReflectionGRPOTrainer:
                         )
                 self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
             else:
-                torch.nn.utils.clip_grad_norm_(
-                    inner_model.parameters(), 1.0
-                )
+                torch.nn.utils.clip_grad_norm_(inner_model.parameters(), 1.0)
 
             # Skip optimizer step if any gradient contains NaN/inf to avoid
             # corrupting model weights (which causes generate() to crash)
@@ -1185,6 +1224,7 @@ class SelfReflectionGRPOTrainer:
         Returns:
             Scalar tensor of total log probability over completion tokens
         """
+        import torch
         import torch.nn.functional as F
 
         # Build prompt-only messages (all except last assistant turn)
@@ -1228,14 +1268,144 @@ class SelfReflectionGRPOTrainer:
         shift_logits = logits[:, prompt_len - 1 : -1, :]
         shift_labels = full_inputs["input_ids"][:, prompt_len:]
 
+        # Guard against inf/nan logits from fp16 + gradient checkpointing overflow
+        shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
         # Compute per-token log probs
         log_probs = F.log_softmax(shift_logits, dim=-1)
         token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
 
-        # Sum over completion tokens
-        total_log_prob = token_log_probs.sum()
+        if token_log_probs.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
 
-        return total_log_prob
+        # Sum over completion tokens — gives true log P(sequence).
+        # KL overflow is already handled by the clamp(min=-20, max=20) in the
+        # training loop, so we don't need length-normalization here.
+        return token_log_probs.sum()
+
+    def _preprocess_trajectory_texts(
+        self,
+        messages_list: list[list[dict]],
+        images: list[Any],
+    ) -> dict:
+        """Pre-compute chat-template strings and token lengths for a trajectory batch.
+
+        Called once before the inner optimization loop so that
+        apply_chat_template + per-sequence tokenizer calls are not repeated on
+        every inner epoch mini-batch forward pass.
+
+        Args:
+            messages_list: N full message lists (prompt + assistant completion)
+            images: N PIL Images (one per sequence, may be None)
+
+        Returns:
+            dict with keys:
+                full_texts: list[str] of N full chat-template strings
+                prompt_lens: list[int] of N prompt token counts
+                full_lens: list[int] of N full sequence token counts
+                images: the same images list (stored for convenience)
+        """
+        has_image = any(img is not None for img in images)
+        full_texts: list[str] = []
+        prompt_lens: list[int] = []
+        for messages in messages_list:
+            prompt_messages = messages[:-1]
+            full_text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            prompt_text = self.processor.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True
+            )
+            if has_image and "<image>" not in full_text:
+                full_text = "<image>\n" + full_text
+            if has_image and "<image>" not in prompt_text:
+                prompt_text = "<image>\n" + prompt_text
+            full_texts.append(full_text)
+            prompt_lens.append(
+                self.processor.tokenizer(prompt_text, return_tensors="pt")["input_ids"].shape[1]
+            )
+        full_lens = [
+            self.processor.tokenizer(ft, return_tensors="pt")["input_ids"].shape[1]
+            for ft in full_texts
+        ]
+        return {
+            "full_texts": full_texts,
+            "prompt_lens": prompt_lens,
+            "full_lens": full_lens,
+            "images": images,
+        }
+
+    def _forward_from_pretokenized(
+        self,
+        pretok: dict,
+        model: Any,
+        mb_start: int = 0,
+        mb_end: Optional[int] = None,
+    ) -> list[Any]:
+        """Batched forward pass using pre-computed text strings and lengths.
+
+        Skips apply_chat_template and per-sequence tokenizer overhead.
+        Passes use_cache=False to prevent KV cache allocation during training.
+
+        Args:
+            pretok: Output of _preprocess_trajectory_texts
+            model: Model to run forward pass on
+            mb_start: Start index for mini-batch slice (default 0)
+            mb_end: End index for mini-batch slice (default: all)
+
+        Returns:
+            List of scalar log-prob tensors for the mini-batch slice
+        """
+        import torch
+        import torch.nn.functional as F
+
+        if mb_end is None:
+            mb_end = len(pretok["full_texts"])
+
+        full_texts = pretok["full_texts"][mb_start:mb_end]
+        prompt_lens = pretok["prompt_lens"][mb_start:mb_end]
+        full_lens = pretok["full_lens"][mb_start:mb_end]
+        imgs = pretok["images"][mb_start:mb_end]
+        n = len(full_texts)
+        has_image = any(img is not None for img in imgs)
+
+        orig_padding_side = self.processor.tokenizer.padding_side
+        self.processor.tokenizer.padding_side = "left"
+        try:
+            if has_image:
+                batch_inputs = self.processor(
+                    text=full_texts,
+                    images=imgs,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+            else:
+                batch_inputs = self.processor(
+                    text=full_texts,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+        finally:
+            self.processor.tokenizer.padding_side = orig_padding_side
+
+        outputs = model(**batch_inputs, use_cache=False)
+        logits = outputs.logits  # (n, padded_seq_len, vocab_size)
+
+        total_len = batch_inputs["input_ids"].shape[1]
+        log_probs_list = []
+        for i in range(n):
+            pad_len = total_len - full_lens[i]
+            real_prompt_start = pad_len + prompt_lens[i]
+            shift_logits = logits[i, real_prompt_start - 1 : -1, :]
+            shift_labels = batch_inputs["input_ids"][i, real_prompt_start:]
+            shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            lp = F.log_softmax(shift_logits, dim=-1)
+            token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            log_probs_list.append(
+                token_lp.sum() if token_lp.numel() > 0 else torch.tensor(0.0, device=self.device)
+            )
+
+        return log_probs_list
 
     def _compute_log_probs_batched(
         self,
@@ -1280,9 +1450,7 @@ class SelfReflectionGRPOTrainer:
                 prompt_text = "<image>\n" + prompt_text
             full_texts.append(full_text)
             prompt_lens.append(
-                self.processor.tokenizer(prompt_text, return_tensors="pt")[
-                    "input_ids"
-                ].shape[1]
+                self.processor.tokenizer(prompt_text, return_tensors="pt")["input_ids"].shape[1]
             )
 
         # Full sequence lengths (unpadded) to compute left-pad offsets later
@@ -1311,7 +1479,7 @@ class SelfReflectionGRPOTrainer:
         finally:
             self.processor.tokenizer.padding_side = orig_padding_side
 
-        outputs = model(**batch_inputs)
+        outputs = model(**batch_inputs, use_cache=False)
         logits = outputs.logits  # (n, padded_seq_len, vocab_size)
 
         total_len = batch_inputs["input_ids"].shape[1]
@@ -1321,9 +1489,12 @@ class SelfReflectionGRPOTrainer:
             real_prompt_start = pad_len + prompt_lens[i]
             shift_logits = logits[i, real_prompt_start - 1 : -1, :]
             shift_labels = batch_inputs["input_ids"][i, real_prompt_start:]
+            shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
             lp = F.log_softmax(shift_logits, dim=-1)
             token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            log_probs_list.append(token_lp.sum())
+            log_probs_list.append(
+                token_lp.sum() if token_lp.numel() > 0 else torch.tensor(0.0, device=self.device)
+            )
 
         return log_probs_list
 

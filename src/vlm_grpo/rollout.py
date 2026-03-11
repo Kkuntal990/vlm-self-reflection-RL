@@ -557,6 +557,10 @@ def _generate_completions(
     batched_inputs = {
         key: val.expand(k, *val.shape[1:]).contiguous() for key, val in inputs.items()
     }
+    logger.info(
+        f"[generate A1] batch={batched_inputs['input_ids'].shape[0]} "
+        f"seq_len={batched_inputs['input_ids'].shape[1]}"
+    )
     outputs = model.generate(
         **batched_inputs,
         max_new_tokens=max_new_tokens,
@@ -574,7 +578,7 @@ def _generate_batch_completions(
     model: Any,
     processor: Any,
     messages_list: list[list[dict]],
-    image: Any,
+    images: list[Any],
     device: str,
     max_new_tokens: int,
     temperature: float,
@@ -582,29 +586,30 @@ def _generate_batch_completions(
 ) -> list[str]:
     """Generate one completion per message sequence, batched in one generate call.
 
-    Used for F1 and A2 steps where each of the K trajectories has a different
-    prompt (different A1 in context) but shares the same image. Mirrors the
-    TRL pattern of batching all sequences together instead of looping.
+    Supports different images per sequence, enabling full cross-sample batching
+    (e.g. all N*K trajectories in one call). Mirrors TRL's repeat_interleave
+    pattern where the entire rollout batch is generated in one shot.
 
     Args:
         model: HuggingFace model with generate() method
         processor: Tokenizer/processor for the model
-        messages_list: K different message sequences, one per trajectory
-        image: Shared PIL Image (or None) for all sequences
+        messages_list: N message sequences, one per trajectory
+        images: N PIL Images (or Nones), one per sequence
         device: Device string
         max_new_tokens: Maximum tokens per generation
         temperature: Sampling temperature
         top_p: Top-p sampling
 
     Returns:
-        List of K text completions, one per input sequence
+        List of N text completions, one per input sequence
     """
-    k = len(messages_list)
+    n = len(messages_list)
     texts = [
         processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         for msgs in messages_list
     ]
-    if image is not None:
+    has_image = any(img is not None for img in images)
+    if has_image:
         texts = ["<image>\n" + t if "<image>" not in t else t for t in texts]
 
     # Left-pad for batched autoregressive generation so real tokens sit at
@@ -612,10 +617,10 @@ def _generate_batch_completions(
     orig_padding_side = processor.tokenizer.padding_side
     processor.tokenizer.padding_side = "left"
     try:
-        if image is not None:
+        if has_image:
             inputs = processor(
                 text=texts,
-                images=[image] * k,
+                images=images,
                 return_tensors="pt",
                 padding=True,
             ).to(device)
@@ -629,6 +634,10 @@ def _generate_batch_completions(
         do_sample = temperature > 0
         prompt_len = inputs["input_ids"].shape[1]  # same for all after left-padding
 
+        logger.info(
+            f"[generate batch] batch={inputs['input_ids'].shape[0]} "
+            f"seq_len={inputs['input_ids'].shape[1]}"
+        )
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -641,7 +650,7 @@ def _generate_batch_completions(
 
     return [
         processor.decode(outputs[i][prompt_len:], skip_special_tokens=True).strip()
-        for i in range(k)
+        for i in range(n)
     ]
 
 
@@ -677,92 +686,125 @@ def generate_self_reflection_rollout(
     """
     import torch
 
-    results = []
+    n = len(samples)
     k = config.k_samples
+    gen_batch = config.batch_size  # chunk size to avoid OOM on very large batches
 
-    for i, sample in enumerate(samples):
-        question = sample.get("question", "").replace("<image>", "").strip()
-        image_path = sample.get("image_path", "")
-        ground_truth = sample.get("ground_truth", "")
-        answer_type = sample.get("answer_type", "open")
-        choices_str = sample.get("choices", "")
-        dataset_name = sample.get("dataset_name", "unknown")
-        sample_index = sample.get("sample_index", i)
-        image = sample.get("image")
+    # Pre-extract per-sample fields
+    questions = [s.get("question", "").replace("<image>", "").strip() for s in samples]
+    images = [s.get("image") for s in samples]
+    ground_truths = [s.get("ground_truth", "") for s in samples]
+    answer_types = [s.get("answer_type", "open") for s in samples]
+    choices_list = [s.get("choices", "") for s in samples]
+    dataset_names = [s.get("dataset_name", "unknown") for s in samples]
+    sample_indices = [s.get("sample_index", i) for i, s in enumerate(samples)]
 
-        result = SelfReflectionRolloutResult(
-            sample_index=sample_index,
-            question=question,
-            image_path=image_path,
-            ground_truth=ground_truth,
-            answer_type=answer_type,
-            choices=choices_str,
-            dataset_name=dataset_name,
-        )
+    # Flat lists of all N*K trajectories, grouped repeat_interleave style:
+    # [s0_t0, s0_t1, ..., s0_t(k-1), s1_t0, ..., s(n-1)_t(k-1)]
+    all_a1s: list[str] = []
+    all_f1s: list[str] = []
+    all_a2s: list[str] = []
 
-        with torch.no_grad():
-            # Step 1: Generate K initial answers (A1)
-            a1_prompt = build_initial_answer_prompt(question)
-            answer1s = _generate_completions(
+    with torch.no_grad():
+        # Process in generation chunks to bound peak VRAM usage.
+        # Each chunk generates gen_batch*k sequences per call.
+        for chunk_start in range(0, n, gen_batch):
+            chunk_end = min(chunk_start + gen_batch, n)
+            chunk_qs = questions[chunk_start:chunk_end]
+            chunk_imgs = images[chunk_start:chunk_end]
+            chunk_size = chunk_end - chunk_start
+
+            # Step 1: Generate K A1s for every sample in the chunk.
+            # repeat_interleave: [q0]*k + [q1]*k + ... → chunk_size*k prompts
+            a1_prompts = [build_initial_answer_prompt(q) for q in chunk_qs for _ in range(k)]
+            imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
+
+            chunk_a1s = _generate_batch_completions(
                 model,
                 processor,
-                a1_prompt,
-                image,
+                a1_prompts,
+                imgs_expanded,
                 device,
                 max_new_tokens=config.max_completion_length,
                 temperature=config.temperature,
                 top_p=config.top_p,
-                k=k,
             )
+            all_a1s.extend(chunk_a1s)
 
-            # Step 2: Generate all K F1s in one batched call (K different prompts,
-            # same image) — mirrors TRL's repeat_interleave pattern.
-            fb_temp = config.feedback_temperature
-            critic_prompts = [build_critic_prompt(question, a1) for a1 in answer1s]
-            feedbacks = _generate_batch_completions(
+            # Step 2: Generate F1 for each trajectory.
+            f1_prompts = [
+                build_critic_prompt(chunk_qs[i], chunk_a1s[i * k + j])
+                for i in range(chunk_size)
+                for j in range(k)
+            ]
+            chunk_f1s = _generate_batch_completions(
                 model,
                 processor,
-                critic_prompts,
-                image,
+                f1_prompts,
+                imgs_expanded,
                 device,
                 max_new_tokens=config.max_completion_length,
-                temperature=fb_temp,
+                temperature=config.feedback_temperature,
                 top_p=config.top_p,
             )
+            all_f1s.extend(chunk_f1s)
 
-            # Step 3: Generate all K A2s in one batched call.
-            refiner_prompts = [
-                build_refiner_prompt(question, a1, f1)
-                for a1, f1 in zip(answer1s, feedbacks)
+            # Step 3: Generate A2 for each trajectory.
+            a2_prompts = [
+                build_refiner_prompt(chunk_qs[i], chunk_a1s[i * k + j], chunk_f1s[i * k + j])
+                for i in range(chunk_size)
+                for j in range(k)
             ]
-            answer2s = _generate_batch_completions(
+            chunk_a2s = _generate_batch_completions(
                 model,
                 processor,
-                refiner_prompts,
-                image,
+                a2_prompts,
+                imgs_expanded,
                 device,
                 max_new_tokens=config.max_completion_length,
                 temperature=config.a2_temperature,
                 top_p=config.top_p,
             )
+            all_a2s.extend(chunk_a2s)
 
-        # Step 4: Compute two separate rewards per trajectory
+            logger.info(
+                f"Self-reflection rollout: {chunk_end}/{n} samples (gen_batch={chunk_size}, k={k})"
+            )
+
+    # Step 4: Compute rewards and assemble results, one per sample.
+    results = []
+    for i in range(n):
+        traj_slice = slice(i * k, (i + 1) * k)
+        answer1s = all_a1s[traj_slice]
+        feedbacks = all_f1s[traj_slice]
+        answer2s = all_a2s[traj_slice]
+
+        result = SelfReflectionRolloutResult(
+            sample_index=sample_indices[i],
+            question=questions[i],
+            image_path=samples[i].get("image_path", ""),
+            ground_truth=ground_truths[i],
+            answer_type=answer_types[i],
+            choices=choices_list[i],
+            dataset_name=dataset_names[i],
+        )
+
         for a1, f1, a2 in zip(answer1s, feedbacks, answer2s):
             resp_bd = compute_response_reward_breakdown(
                 a1_text=a1,
                 a2_text=a2,
-                ground_truth=ground_truth,
-                answer_type=answer_type,
-                choices=choices_str,
+                ground_truth=ground_truths[i],
+                answer_type=answer_types[i],
+                choices=choices_list[i],
                 weights=response_weights,
             )
             fb_bd = compute_feedback_reward_breakdown(
                 feedback_text=f1,
                 a1_text=a1,
                 a2_text=a2,
-                ground_truth=ground_truth,
-                answer_type=answer_type,
-                choices=choices_str,
+                ground_truth=ground_truths[i],
+                answer_type=answer_types[i],
+                choices=choices_list[i],
                 weights=feedback_weights,
             )
             result.response_rewards.append(resp_bd.total_reward)
@@ -770,13 +812,10 @@ def generate_self_reflection_rollout(
             result.response_breakdowns.append(resp_bd)
             result.feedback_breakdowns.append(fb_bd)
 
-        result.answer1s = answer1s
-        result.feedbacks = feedbacks
-        result.answer2s = answer2s
+        result.answer1s = list(answer1s)
+        result.feedbacks = list(feedbacks)
+        result.answer2s = list(answer2s)
         results.append(result)
-
-        if (i + 1) % config.batch_size == 0 or (i + 1) == len(samples):
-            logger.info(f"Self-reflection rollout: {i + 1}/{len(samples)} samples")
 
     return results
 

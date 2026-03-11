@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """
-Dataset loading and preprocessing for GRPO RW training.
+Dataset loading and preprocessing for self-reflection GRPO training.
 
-Loads precomputed Answer1-correct JSONL files and converts them to
-TRL's GRPOTrainer-compatible HuggingFace Dataset format with vision support.
-
-Dataset columns required by TRL:
-- prompt: list[dict] (conversational messages for VLM)
-- images: list[PIL.Image] (image inputs)
-Additional columns passed as kwargs to reward functions:
-- ground_truth, answer1, answer_type, choices, dataset_name
+Provides dataset loaders for the multi-turn self-reflection flow
+(A1 → F1 → A2) and supporting utilities for image loading and
+answer type detection.
 
 Usage:
-    from vlm_grpo.data import load_grpo_dataset
+    from vlm_grpo.data import load_self_reflection_dataset
 
-    dataset = load_grpo_dataset(
-        dataset_path="/outputs/grpo_data/answer1_correct_train.jsonl",
+    samples = load_self_reflection_dataset(
+        dataset_path="/outputs/fire_preprocessed_v3/dataset.jsonl",
         image_base_dir="/outputs/image_base",
-        max_samples=100,
     )
 """
 
@@ -31,8 +25,6 @@ from typing import Optional
 from datasets import Dataset
 from PIL import Image
 
-from vlm_grpo.prompts import build_reflection_prompt
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -42,103 +34,6 @@ logger = logging.getLogger(__name__)
 
 # Maximum image dimension (resize larger images to save memory)
 MAX_IMAGE_DIM = 1024
-
-
-def load_grpo_dataset(
-    dataset_path: str,
-    image_base_dir: str = "/outputs/image_base",
-    max_samples: int = 0,
-) -> Dataset:
-    """Load JSONL and convert to HF Dataset for GRPOTrainer.
-
-    Supports two JSONL formats:
-    1. Flat format: image_path, question, ground_truth, answer1, answer_type,
-       choices, dataset_name
-    2. Messages format: messages (list of role/content dicts), images (list of paths)
-
-    Prompts and image paths are stored as JSON strings for Arrow compatibility,
-    then deserialized lazily via set_transform.
-
-    Args:
-        dataset_path: Path to JSONL dataset
-        image_base_dir: Base directory for resolving relative image paths
-        max_samples: Maximum samples to load (0 = all)
-
-    Returns:
-        HuggingFace Dataset with columns: prompt, images, ground_truth,
-        answer1, answer_type, choices, dataset_name
-    """
-    logger.info(f"Loading dataset from {dataset_path}")
-
-    raw_samples = _load_jsonl(dataset_path, max_samples)
-    logger.info(f"Loaded {len(raw_samples)} raw samples")
-
-    # All values stored as Arrow-safe strings
-    records = {
-        "prompt": [],
-        "images": [],
-        "ground_truth": [],
-        "answer1": [],
-        "answer_type": [],
-        "choices": [],
-        "dataset_name": [],
-    }
-
-    skipped = 0
-    for i, sample in enumerate(raw_samples):
-        # Extract fields (handle both flat and messages format)
-        if "messages" in sample and "question" not in sample:
-            fields = _parse_messages_format(sample)
-        else:
-            fields = {
-                "question": sample.get("question", ""),
-                "ground_truth": sample.get("ground_truth", ""),
-                "answer1": sample.get("answer1", ""),
-                "answer_type": sample.get("answer_type", "open"),
-                "choices": sample.get("choices", ""),
-                "dataset_name": sample.get("dataset_name", "unknown"),
-            }
-
-        # Resolve image path
-        image_path = _resolve_image_path(sample, image_base_dir)
-
-        # Verify image exists
-        if not os.path.isfile(image_path):
-            logger.warning(f"Image not found: {image_path}")
-            skipped += 1
-            continue
-
-        # Clean question (remove <image> placeholder)
-        question = fields["question"].replace("<image>", "").strip()
-
-        # Build prompt messages
-        prompt = build_reflection_prompt(
-            question, fields["answer1"], fields["answer_type"], fields["choices"]
-        )
-
-        # Normalize all content to list format so TRL's
-        # prepare_multimodal_messages doesn't add extra image placeholders
-        prompt = _normalize_prompt_content(prompt)
-
-        # Store as JSON strings for Arrow compatibility
-        records["prompt"].append(json.dumps(prompt))
-        records["images"].append(json.dumps([image_path]))
-        records["ground_truth"].append(fields["ground_truth"])
-        records["answer1"].append(fields["answer1"])
-        records["answer_type"].append(fields["answer_type"])
-        records["choices"].append(fields["choices"])
-        records["dataset_name"].append(fields["dataset_name"])
-
-    if skipped > 0:
-        logger.warning(f"Skipped {skipped} samples due to missing/invalid images")
-
-    dataset = Dataset.from_dict(records)
-    logger.info(f"Created dataset with {len(dataset)} samples")
-
-    # Lazy transform: deserialize prompts and load images on access
-    dataset.set_transform(_grpo_transform)
-
-    return dataset
 
 
 def load_image_safe(image_path: str) -> Optional[Image.Image]:
@@ -245,56 +140,6 @@ def _category_to_answer_type(category: str, fallback: str) -> str:
     if category and category in _CATEGORY_TO_ANSWER_TYPE:
         return _CATEGORY_TO_ANSWER_TYPE[category]
     return fallback
-
-
-def _normalize_prompt_content(prompt: list[dict]) -> list[dict]:
-    """Normalize all message content to list-of-dicts format.
-
-    TRL's prepare_multimodal_messages checks if content is a string to
-    decide whether to insert image placeholders. If some messages have
-    list content (already structured) and others have string content,
-    it incorrectly adds extra image placeholders. Normalizing all content
-    to list format prevents this.
-
-    Args:
-        prompt: List of message dicts with role/content
-
-    Returns:
-        Prompt with all content fields as list-of-dicts
-    """
-    for msg in prompt:
-        if isinstance(msg["content"], str):
-            msg["content"] = [{"type": "text", "text": msg["content"]}]
-    return prompt
-
-
-def _grpo_transform(batch: dict) -> dict:
-    """Lazy transform to deserialize prompts and load images on access.
-
-    Applied via Dataset.set_transform so prompts (mixed-type dicts) and
-    images (PIL objects) are never serialized to Arrow.
-
-    Args:
-        batch: Dict of column values (single item or batch)
-
-    Returns:
-        Transformed dict with deserialized prompt and loaded images
-    """
-    result = {}
-    for key, val in batch.items():
-        if key == "prompt":
-            if isinstance(val, list):
-                result[key] = [json.loads(v) for v in val]
-            else:
-                result[key] = json.loads(val)
-        elif key == "images":
-            if isinstance(val, list):
-                result[key] = [[load_image_safe(p) for p in json.loads(v)] for v in val]
-            else:
-                result[key] = [load_image_safe(p) for p in json.loads(val)]
-        else:
-            result[key] = val
-    return result
 
 
 def _resolve_image_path(sample: dict, image_base_dir: str) -> str:
@@ -621,9 +466,7 @@ def load_self_reflection_dataset(
             }
 
         # Rule 1: Use category field from dataset when available
-        answer_type = _category_to_answer_type(
-            sample.get("category", ""), fields["answer_type"]
-        )
+        answer_type = _category_to_answer_type(sample.get("category", ""), fields["answer_type"])
 
         # Resolve image path
         image_path = _resolve_image_path(sample, image_base_dir)

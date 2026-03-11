@@ -1,102 +1,11 @@
 #!/usr/bin/env python3
-"""Tests for trajectory parsing and answer extraction."""
-
+"""Tests for answer extraction, normalization, and hedging detection."""
 
 from vlm_grpo.trajectory import (
     detect_hedging,
     extract_answer_from_text,
     extract_completion_text,
-    parse_trajectory,
 )
-
-# =============================================================================
-# parse_trajectory tests
-# =============================================================================
-
-
-class TestParseTrajectory:
-    """Tests for parse_trajectory()."""
-
-    def test_valid_both_markers(self) -> None:
-        """Both FEEDBACK: and FINAL_ANSWER: present."""
-        text = "FEEDBACK:\nThe answer looks correct.\nFINAL_ANSWER:\nA"
-        result = parse_trajectory(text)
-        assert result.parse_success is True
-        assert result.has_feedback_marker is True
-        assert result.has_final_answer_marker is True
-        assert result.feedback == "The answer looks correct."
-        assert result.final_answer == "A"
-
-    def test_valid_multiline_feedback(self) -> None:
-        """Feedback spans multiple lines."""
-        text = "FEEDBACK:\nLine one.\nLine two.\nLine three.\nFINAL_ANSWER:\nB"
-        result = parse_trajectory(text)
-        assert result.parse_success is True
-        assert "Line one." in result.feedback
-        assert "Line three." in result.feedback
-        assert result.final_answer == "B"
-
-    def test_missing_feedback_marker(self) -> None:
-        """Only FINAL_ANSWER marker present."""
-        text = "Some random text\nFINAL_ANSWER:\nC"
-        result = parse_trajectory(text)
-        assert result.parse_success is False
-        assert result.has_feedback_marker is False
-        assert result.has_final_answer_marker is True
-        assert result.final_answer == "C"
-
-    def test_missing_final_answer_marker(self) -> None:
-        """Only FEEDBACK marker present."""
-        text = "FEEDBACK:\nThe answer is wrong."
-        result = parse_trajectory(text)
-        assert result.parse_success is False
-        assert result.has_feedback_marker is True
-        assert result.has_final_answer_marker is False
-        assert result.feedback == "The answer is wrong."
-
-    def test_no_markers(self) -> None:
-        """No markers at all."""
-        text = "Just some random text without any markers."
-        result = parse_trajectory(text)
-        assert result.parse_success is False
-        assert result.has_feedback_marker is False
-        assert result.has_final_answer_marker is False
-        assert result.feedback == ""
-        assert result.final_answer == ""
-
-    def test_empty_string(self) -> None:
-        """Empty completion."""
-        result = parse_trajectory("")
-        assert result.parse_success is False
-
-    def test_case_insensitive_markers(self) -> None:
-        """Markers should be case-insensitive."""
-        text = "feedback:\nLooks good.\nfinal_answer:\nD"
-        result = parse_trajectory(text)
-        assert result.parse_success is True
-        assert result.feedback == "Looks good."
-        assert result.final_answer == "D"
-
-    def test_extra_whitespace(self) -> None:
-        """Whitespace around markers."""
-        text = "FEEDBACK :  \n  Correct.  \n  FINAL_ANSWER :  \n  A  "
-        result = parse_trajectory(text)
-        assert result.parse_success is True
-        assert result.feedback == "Correct."
-        assert result.final_answer == "A"
-
-    def test_multiple_final_answer_uses_last(self) -> None:
-        """Multiple FINAL_ANSWER markers - use last one."""
-        text = "FEEDBACK:\nWait.\nFINAL_ANSWER:\nA\nFINAL_ANSWER:\nB"
-        result = parse_trajectory(text)
-        assert result.parse_success is True
-        assert result.final_answer == "B"
-
-    def test_raw_completion_preserved(self) -> None:
-        """Raw completion is preserved."""
-        text = "FEEDBACK:\nOK\nFINAL_ANSWER:\nA"
-        result = parse_trajectory(text)
-        assert result.raw_completion == text
 
 
 # =============================================================================
@@ -113,10 +22,9 @@ class TestExtractCompletionText:
 
     def test_conversational_format(self) -> None:
         """TRL conversational format."""
-        completion = [{"role": "assistant", "content": "FEEDBACK:\nOK\nFINAL_ANSWER:\nA"}]
+        completion = [{"role": "assistant", "content": "The answer is A"}]
         result = extract_completion_text(completion)
-        assert "FEEDBACK:" in result
-        assert "FINAL_ANSWER:" in result
+        assert result == "The answer is A"
 
     def test_structured_content(self) -> None:
         """Structured content with text items."""
@@ -124,14 +32,14 @@ class TestExtractCompletionText:
             {
                 "role": "assistant",
                 "content": [
-                    {"type": "text", "text": "FEEDBACK: OK"},
-                    {"type": "text", "text": "FINAL_ANSWER: A"},
+                    {"type": "text", "text": "Part one"},
+                    {"type": "text", "text": "Part two"},
                 ],
             }
         ]
         result = extract_completion_text(completion)
-        assert "FEEDBACK" in result
-        assert "FINAL_ANSWER" in result
+        assert "Part one" in result
+        assert "Part two" in result
 
     def test_empty_list(self) -> None:
         """Empty list returns empty string."""

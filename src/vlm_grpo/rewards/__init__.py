@@ -1,1 +1,1 @@
-"""Reward functions for GRPO RW training."""
+"""Reward functions for self-reflection GRPO training."""

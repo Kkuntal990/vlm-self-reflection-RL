@@ -258,8 +258,8 @@ class TestRefinerTRLFunctions:
             choices=["", "", ""],
         )
         assert len(rewards) == 3
-        assert rewards[0] == 1.0  # Valid MCQ
-        assert rewards[1] == 1.0  # Valid MCQ
+        assert rewards[0] == 0.0  # Valid MCQ (penalty-only: 0.0 = compliant)
+        assert rewards[1] == 0.0  # Valid MCQ (penalty-only: 0.0 = compliant)
         assert rewards[2] == -1.0  # Empty
 
     def test_correctness_reward_fn(self) -> None:

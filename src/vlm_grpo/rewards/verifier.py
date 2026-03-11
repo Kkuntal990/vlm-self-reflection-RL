@@ -61,9 +61,7 @@ _WORD_TO_NUM: dict[str, int] = {
     "nineteen": 19,
     "twenty": 20,
 }
-_WORD_NUM_PATTERN = re.compile(
-    r"\b(" + "|".join(_WORD_TO_NUM.keys()) + r")\b", re.IGNORECASE
-)
+_WORD_NUM_PATTERN = re.compile(r"\b(" + "|".join(_WORD_TO_NUM.keys()) + r")\b", re.IGNORECASE)
 _NUMBER_IN_TEXT_PATTERN = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 
 # Pattern for yes/no at start of sentence (Rule 4)
@@ -457,6 +455,30 @@ def _verify_yesno(
     # Both have yes/no at start → compare verdicts
     if pred_verdict and gt_verdict:
         verdict = CORRECT if pred_verdict == gt_verdict else WRONG
+
+        # When verdicts agree, a bare polarity match is not enough — the
+        # model may hallucinate the wrong objects (e.g. pred="Yes, bottles"
+        # vs GT="Yes, breads").  Ask the LLM judge to check semantic
+        # equivalence of the *full* answers.  If the judge is disabled,
+        # fall back to the open-ended cascade (token-F1 + embeddings).
+        if verdict == CORRECT:
+            try:
+                from vlm_grpo.rewards.judge_llm import is_enabled, llm_judge_score
+
+                if is_enabled():
+                    score = llm_judge_score(raw_text.strip(), ground_truth)
+                    verdict = CORRECT if score >= 0.7 else WRONG
+                    return MatchResult(
+                        answer_type="yesno",
+                        parse_ok=True,
+                        verdict=verdict,
+                        extracted=pred_verdict.capitalize(),
+                        score=score,
+                    )
+            except Exception as e:
+                logger.warning(f"LLM judge failed in yesno path, using open-ended: {e}")
+                return _verify_open_ended(raw_text, raw_text.strip(), ground_truth, "yesno")
+
         return MatchResult(
             answer_type="yesno",
             parse_ok=True,
@@ -486,6 +508,26 @@ def _verify_yesno(
         p = pred_anywhere.group(1).lower()
         g = gt_anywhere.group(1).lower()
         verdict = CORRECT if p == g else WRONG
+
+        # Same LLM-judge guard as above.
+        if verdict == CORRECT:
+            try:
+                from vlm_grpo.rewards.judge_llm import is_enabled, llm_judge_score
+
+                if is_enabled():
+                    score = llm_judge_score(raw_text.strip(), ground_truth)
+                    verdict = CORRECT if score >= 0.7 else WRONG
+                    return MatchResult(
+                        answer_type="yesno",
+                        parse_ok=True,
+                        verdict=verdict,
+                        extracted=p.capitalize(),
+                        score=score,
+                    )
+            except Exception as e:
+                logger.warning(f"LLM judge failed in yesno broad path, using open-ended: {e}")
+                return _verify_open_ended(raw_text, raw_text.strip(), ground_truth, "yesno")
+
         return MatchResult(
             answer_type="yesno",
             parse_ok=True,

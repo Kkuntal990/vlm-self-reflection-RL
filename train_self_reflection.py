@@ -106,6 +106,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
+    parser.add_argument(
+        "--rollout_batch_size",
+        type=int,
+        default=None,
+        help="Samples per rollout step. Defaults to per_device_train_batch_size if not set.",
+    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--kl_coeff", type=float, default=0.05)
@@ -199,7 +205,7 @@ def main() -> None:
         temperature=args.temperature,
         feedback_temperature=args.feedback_temperature,
         a2_temperature=args.a2_temperature,
-        batch_size=args.per_device_train_batch_size,
+        batch_size=args.rollout_batch_size or args.per_device_train_batch_size,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -252,7 +258,9 @@ def main() -> None:
     # Filter to requested indices
     if requested_indices is not None:
         train_dataset = [s for s in train_dataset if s["sample_index"] in requested_indices]
-        logger.info(f"Filtered to {len(train_dataset)} samples at indices: {sorted(requested_indices)}")
+        logger.info(
+            f"Filtered to {len(train_dataset)} samples at indices: {sorted(requested_indices)}"
+        )
     else:
         logger.info(f"Training dataset: {len(train_dataset)} samples")
 
@@ -283,7 +291,7 @@ def main() -> None:
     logger.info("Loading policy model...")
     model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
     ).to(accelerator.device)
 
     # Enable gradient checkpointing to reduce activation memory
@@ -310,8 +318,7 @@ def main() -> None:
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
     model, optimizer = accelerator.prepare(model, optimizer)
     logger.info(
-        f"Distributed training: {accelerator.num_processes} processes, "
-        f"device={accelerator.device}"
+        f"Distributed training: {accelerator.num_processes} processes, device={accelerator.device}"
     )
 
     # Shard training dataset across processes (drop remainder for even distribution)
@@ -321,8 +328,7 @@ def main() -> None:
     end = start + per_process
     train_dataset = train_dataset[start:end]
     logger.info(
-        f"Process {accelerator.process_index}: samples {start}-{end} "
-        f"({len(train_dataset)} samples)"
+        f"Process {accelerator.process_index}: samples {start}-{end} ({len(train_dataset)} samples)"
     )
 
     # Create trainer

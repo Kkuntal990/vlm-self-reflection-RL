@@ -1,12 +1,12 @@
-# VLM GRPO RW Training Pipeline
+# VLM Self-Reflection GRPO Training Pipeline
 
 ## Overview
 
-GRPO training pipeline for reducing RW flips (Right-to-Wrong transitions) in VLM self-reflection, using TRL's GRPOTrainer with custom reward functions.
+Multi-turn GRPO training pipeline for VLM self-reflection, using a custom SelfReflectionGRPOTrainer with two-reward design.
 
 **Model**: LLaVA-1.5 SFT checkpoint (from FIRE behavior cloning)
-**Framework**: TRL GRPOTrainer + vLLM colocate
-**Approach**: Single-turn GRPO where model generates FEEDBACK + FINAL_ANSWER in one completion
+**Framework**: Custom GRPO trainer + vLLM
+**Approach**: Multi-turn A1 → F1 → A2 flow with separate response and feedback rewards
 
 ## How to Run
 
@@ -22,9 +22,9 @@ uv sync --extra dev  # for testing
 ### Linting
 
 ```bash
-ruff format src/ tests/ train_grpo_rw.py scripts/
-ruff check src/ tests/ train_grpo_rw.py scripts/
-ruff check src/ tests/ train_grpo_rw.py scripts/ --fix
+ruff format src/ tests/ train_self_reflection.py scripts/
+ruff check src/ tests/ train_self_reflection.py scripts/
+ruff check src/ tests/ train_self_reflection.py scripts/ --fix
 ```
 
 ### Tests
@@ -36,16 +36,11 @@ uv run pytest tests/ -v
 ### Training
 
 ```bash
-# Sanity check (no GPU needed for reward logic)
-uv run python train_grpo_rw.py \
-    --dataset_path /outputs/grpo_data/answer1_correct_train.jsonl \
-    --sanity_check_samples 50
-
-# Full training (4 GPUs)
-accelerate launch --num_processes=4 train_grpo_rw.py \
-    --model_id /outputs/llava-1.5-sft-checkpoint \
-    --dataset_path /outputs/grpo_data/answer1_correct_train.jsonl \
-    --output_dir /outputs/grpo_rw_v1
+# Full training (2 GPUs)
+accelerate launch --num_processes=2 train_self_reflection.py \
+    --model_id /outputs/llava-7b-fire-full-sft-checkpoint \
+    --dataset_path /outputs/fire_preprocessed_v3/dataset.jsonl \
+    --output_dir /outputs/grpo_self_reflection_v1
 ```
 
 ## MUST Follow
@@ -61,12 +56,17 @@ accelerate launch --num_processes=4 train_grpo_rw.py \
 ## MUST NOT Change
 
 1. **Lazy Imports in Model Classes**: Do NOT move imports from `__init__` methods to module level in model wrapper classes.
-2. **Reward function signatures**: Must match TRL's expected `reward_fn(completions, **kwargs) -> list[float]`.
 
 ## Key Files
 
-- `train_grpo_rw.py` - Main training entry point
-- `src/vlm_grpo/rewards/rw_reward.py` - Reward functions for TRL
-- `src/vlm_grpo/trajectory.py` - Parse FEEDBACK/FINAL_ANSWER markers
-- `src/vlm_grpo/rewards/deterministic.py` - MCQ/YesNo/numeric scoring
-- `src/vlm_grpo/data.py` - Dataset loading for TRL GRPOTrainer
+- `train_self_reflection.py` - Main training entry point
+- `src/vlm_grpo/critic_grpo.py` - SelfReflectionGRPOTrainer
+- `src/vlm_grpo/rewards/composition.py` - Response + feedback reward composition
+- `src/vlm_grpo/rewards/correctness.py` - A2 correctness reward
+- `src/vlm_grpo/rewards/feedback.py` - Feedback calibration + downstream reward
+- `src/vlm_grpo/rewards/stability.py` - No-regression + minimal edit rewards
+- `src/vlm_grpo/rewards/verifier.py` - Deterministic answer verification
+- `src/vlm_grpo/rewards/deterministic.py` - MCQ/YesNo/numeric answer matching
+- `src/vlm_grpo/trajectory.py` - Answer extraction and normalization
+- `src/vlm_grpo/prompts.py` - Prompt builders (A1, critic, refiner)
+- `src/vlm_grpo/data.py` - Dataset loading

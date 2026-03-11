@@ -44,9 +44,9 @@ from vlm_grpo.rewards.stability import (
 )
 from vlm_grpo.rewards.verifier import verify_answer
 from vlm_grpo.trajectory import (
-    detect_hedging,
     extract_answer_from_text,
     extract_completion_text,
+    normalize_answer,
 )
 
 logging.basicConfig(
@@ -340,12 +340,12 @@ def compute_refiner_reward_breakdown(
     Returns:
         RefinerRewardBreakdown with all component scores
     """
-    # Extract normalized A2 answer
-    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
+    # Format reward (normalize-first, penalty-only)
+    r_format = _compute_refiner_format_reward(a2_text, answer_type)
+    format_valid = r_format >= 0
 
-    # Format reward (A2 should be a valid answer)
-    r_format = _compute_refiner_format_reward(a2_extracted, a2_text, answer_type)
-    format_valid = r_format > 0
+    # Extract A2 for correctness (liberal extraction, separate from format)
+    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
 
     # Correctness reward (pass raw text for MCQ answer text matching)
     r_correctness = compute_a2_correctness_reward(
@@ -424,29 +424,60 @@ def _extract_a2_text(completion: Any) -> str:
 
 
 def _compute_refiner_format_reward(
-    a2_extracted: str,
     a2_text: str,
     answer_type: str,
 ) -> float:
-    """R_format for refiner: validate A2 format.
+    """R_format for refiner: normalize-first, penalty-only format check.
 
-    Checks that A2 is non-empty and appropriate for the answer type.
+    Pipeline:
+        1. normalize_answer(a2_text) → strip, lowercase, remove trailing
+           punctuation, unwrap parens
+        2. Type-specific format check on normalized answer:
+           - MCQ: single letter a-f
+           - YesNo: "yes" or "no"
+           - Numeric: parseable number (int, float, fraction, percentage)
+           - Open: any non-empty text
+
+    Penalty-only: 0.0 when compliant, -1.0 when not.
+    Does NOT use liberal extraction — "The answer is B" fails MCQ format.
 
     Args:
-        a2_extracted: Normalized extracted A2 answer
-        a2_text: Raw A2 text
+        a2_text: Raw A2 text from the refiner
         answer_type: Expected answer type
 
     Returns:
-        +1.0 if valid, -1.0 if invalid
+        0.0 if format-compliant, -1.0 if not
     """
-    if not a2_text.strip():
+    normalized = normalize_answer(a2_text)
+
+    if not normalized:
         return -1.0
-    if not a2_extracted:
-        return -1.0
-    if answer_type == "yesno" and detect_hedging(a2_text):
-        return -1.0
-    return 1.0
+
+    if answer_type == "mcq":
+        if len(normalized) != 1 or normalized not in "abcdef":
+            return -1.0
+    elif answer_type == "yesno":
+        if normalized not in ("yes", "no"):
+            return -1.0
+    elif answer_type == "numeric":
+        num_text = normalized.replace(",", "")
+        if "/" in num_text:
+            parts = num_text.split("/")
+            if len(parts) != 2:
+                return -1.0
+            try:
+                float(parts[0])
+                float(parts[1])
+            except ValueError:
+                return -1.0
+        else:
+            num_text = num_text.rstrip("%")
+            try:
+                float(num_text)
+            except ValueError:
+                return -1.0
+
+    return 0.0
 
 
 def refiner_format_reward_fn(
@@ -469,10 +500,8 @@ def refiner_format_reward_fn(
     rewards = []
     for i, comp in enumerate(completions):
         at = answer_type[i] if answer_type else "open"
-        ch = choices[i] if choices else ""
         a2_text = _extract_a2_text(comp)
-        a2_extracted = extract_answer_from_text(a2_text, at, ch)
-        r = _compute_refiner_format_reward(a2_extracted, a2_text, at)
+        r = _compute_refiner_format_reward(a2_text, at)
         rewards.append(r)
     return rewards
 
@@ -500,14 +529,12 @@ def refiner_correctness_reward_fn(
     for i, comp in enumerate(completions):
         gt = ground_truth[i] if ground_truth else ""
         at = answer_type[i] if answer_type else "open"
-        ch = choices[i] if choices else ""
 
         a2_text = _extract_a2_text(comp)
-        a2_extracted = extract_answer_from_text(a2_text, at, ch)
-        format_valid = bool(a2_extracted)
+        format_valid = _compute_refiner_format_reward(a2_text, at) >= 0
 
         r = compute_a2_correctness_reward(
-            a2_extracted=a2_extracted,
+            a2_extracted=a2_text,
             ground_truth=gt,
             answer_type=at,
             format_valid=format_valid,
@@ -541,15 +568,13 @@ def refiner_no_regression_reward_fn(
     for i, comp in enumerate(completions):
         gt = ground_truth[i] if ground_truth else ""
         at = answer_type[i] if answer_type else "open"
-        ch = choices[i] if choices else ""
         a1_correct = a1_is_correct[i] if a1_is_correct else True
 
         a2_text = _extract_a2_text(comp)
-        a2_extracted = extract_answer_from_text(a2_text, at, ch)
-        format_valid = bool(a2_extracted)
+        format_valid = _compute_refiner_format_reward(a2_text, at) >= 0
 
         r = compute_no_regression_reward(
-            a2_extracted=a2_extracted,
+            a2_extracted=a2_text,
             ground_truth=gt,
             answer_type=at,
             a1_is_correct=a1_correct,
@@ -585,15 +610,13 @@ def refiner_minimal_edit_reward_fn(
         gt = ground_truth[i] if ground_truth else ""
         a1 = answer1[i] if answer1 else ""
         at = answer_type[i] if answer_type else "open"
-        ch = choices[i] if choices else ""
 
         a2_text = _extract_a2_text(comp)
-        a2_extracted = extract_answer_from_text(a2_text, at, ch)
-        format_valid = bool(a2_extracted)
+        format_valid = _compute_refiner_format_reward(a2_text, at) >= 0
 
         r = compute_minimal_edit_reward(
             a1=a1,
-            a2_extracted=a2_extracted,
+            a2_extracted=a2_text,
             ground_truth=gt,
             answer_type=at,
             format_valid=format_valid,
@@ -700,10 +723,12 @@ def compute_response_reward_breakdown(
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
 
-    # Extract and validate A2
+    # Format reward (normalize-first, penalty-only)
+    r_a2_format = _compute_refiner_format_reward(a2_text, answer_type)
+    a2_format_valid = r_a2_format >= 0
+
+    # Extract A2 for correctness (liberal extraction, separate from format)
     a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
-    r_a2_format = _compute_refiner_format_reward(a2_extracted, a2_text, answer_type)
-    a2_format_valid = r_a2_format > 0
 
     # A1 correctness reward
     r_a1 = 1.0 if a1_correct else -1.0
@@ -795,9 +820,6 @@ def compute_feedback_reward_breakdown(
     # Determine A1 correctness
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
-
-    # Extract A2 for downstream evaluation
-    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
 
     # Feedback format reward
     r_format = compute_critic_format_reward(feedback_text)

@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
 """
-Parse GRPO completion trajectories with FEEDBACK/FINAL_ANSWER markers.
+Answer extraction and normalization for VLM completions.
 
-This module handles extraction of structured output from model completions,
-including answer normalization and anti-reward-hacking validation.
+Handles extraction of answers from model completions, answer normalization,
+and anti-reward-hacking validation.
 
 Usage:
-    from vlm_grpo.trajectory import parse_trajectory, extract_answer_from_text
-
-    traj = parse_trajectory("FEEDBACK:\\nLooks correct.\\nFINAL_ANSWER:\\nA")
-    assert traj.parse_success
-    assert traj.feedback == "Looks correct."
-    assert traj.final_answer == "A"
+    from vlm_grpo.trajectory import extract_answer_from_text, normalize_answer
 
     answer = extract_answer_from_text("(A) Yes", "mcq")
     assert answer == "A"
+
+    normalized = normalize_answer("(A)")
+    assert normalized == "a"
 """
 
 import re
-from dataclasses import asdict, dataclass
-
-# Marker patterns (case-insensitive, with optional whitespace)
-_FEEDBACK_PATTERN = re.compile(r"FEEDBACK\s*:\s*\n?", re.IGNORECASE)
-_FINAL_ANSWER_PATTERN = re.compile(r"FINAL_ANSWER\s*:\s*\n?", re.IGNORECASE)
 
 # Answer extraction patterns
 _MCQ_LETTER_PATTERN = re.compile(r"[A-F]")
-_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(?([A-F])\)?|([A-F])\.)\s*$")
+_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-F])\)|([A-F])\.)\s*$")
 # Matches "(A)", "(B)" or "A.", "B." at word boundary
-_MCQ_OPTION_PATTERN = re.compile(r"(?:\(?([A-F])\)|([A-F])\.)")
+_MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-F])\)|([A-F])\.)")
 # Captures "(A) Yes" or "A. Yes" → letter + answer_text
-_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(
-    r"(?:\(?([A-F])\)\s*|([A-F])\.\s*)(.*)", re.DOTALL
-)
+_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(r"(?:\(([A-F])\)\s*|([A-F])\.\s*)(.*)", re.DOTALL)
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
@@ -55,96 +46,6 @@ _HEDGING_PATTERNS = [
         r"\bunlikely\b",
     ]
 ]
-
-
-@dataclass
-class ParsedTrajectory:
-    """A parsed completion trajectory.
-
-    Attributes:
-        feedback: Extracted feedback text (stripped)
-        final_answer: Extracted final answer text (stripped)
-        raw_completion: Original completion text
-        has_feedback_marker: Whether FEEDBACK: marker was found
-        has_final_answer_marker: Whether FINAL_ANSWER: marker was found
-        parse_success: Whether both markers were found and parsed
-    """
-
-    feedback: str
-    final_answer: str
-    raw_completion: str
-    has_feedback_marker: bool
-    has_final_answer_marker: bool
-    parse_success: bool
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
-
-
-def parse_trajectory(completion: str) -> ParsedTrajectory:
-    """Parse a completion string to extract FEEDBACK and FINAL_ANSWER.
-
-    Handles various edge cases:
-    - Missing markers (returns empty strings, parse_success=False)
-    - Extra whitespace around markers
-    - Multiple FINAL_ANSWER markers (uses last one)
-    - FEEDBACK without FINAL_ANSWER and vice versa
-
-    Args:
-        completion: Raw completion text from the model
-
-    Returns:
-        ParsedTrajectory with extracted components
-    """
-    feedback = ""
-    final_answer = ""
-    has_feedback = False
-    has_final_answer = False
-
-    # Find all marker positions
-    feedback_matches = list(_FEEDBACK_PATTERN.finditer(completion))
-    final_answer_matches = list(_FINAL_ANSWER_PATTERN.finditer(completion))
-
-    has_feedback = len(feedback_matches) > 0
-    has_final_answer = len(final_answer_matches) > 0
-
-    if has_feedback and has_final_answer:
-        # Use first FEEDBACK marker and last FINAL_ANSWER marker
-        fb_match = feedback_matches[0]
-        fa_match = final_answer_matches[-1]
-
-        fb_start = fb_match.end()
-        fa_start = fa_match.end()
-
-        # Feedback is between FEEDBACK: and FINAL_ANSWER:
-        if fb_start < fa_match.start():
-            feedback = completion[fb_start : fa_match.start()].strip()
-        else:
-            # FINAL_ANSWER comes before FEEDBACK (malformed but handle gracefully)
-            feedback = completion[fb_start:].strip()
-
-        # Final answer is everything after the last FINAL_ANSWER:
-        final_answer = completion[fa_start:].strip()
-
-    elif has_feedback and not has_final_answer:
-        fb_match = feedback_matches[0]
-        feedback = completion[fb_match.end() :].strip()
-
-    elif has_final_answer and not has_feedback:
-        fa_match = final_answer_matches[-1]
-        final_answer = completion[fa_match.end() :].strip()
-
-    parse_success = has_feedback and has_final_answer
-
-    return ParsedTrajectory(
-        feedback=feedback,
-        final_answer=final_answer,
-        raw_completion=completion,
-        has_feedback_marker=has_feedback,
-        has_final_answer_marker=has_final_answer,
-        parse_success=parse_success,
-    )
 
 
 def extract_completion_text(completion: list[dict] | str) -> str:
@@ -191,12 +92,53 @@ def extract_completion_text(completion: list[dict] | str) -> str:
     return str(completion)
 
 
+def normalize_answer(text: str) -> str:
+    """Minimal surface-level normalization of raw answer text.
+
+    Only cleans surface noise — does NOT search for answers within text.
+
+    Normalization steps:
+        1. Strip leading/trailing whitespace
+        2. Lowercase
+        3. Remove trailing punctuation (. , ; :)
+        4. Strip wrapping parentheses: "(a)" -> "a"
+        5. Strip trailing parenthesis: "a)" -> "a"
+
+    Does NOT do:
+        - Search for letters/numbers within prose ("the answer is b" stays as-is)
+        - Convert number words ("three" stays "three")
+        - Remove filler phrases
+
+    Args:
+        text: Raw answer text
+
+    Returns:
+        Surface-cleaned lowercase text
+    """
+    text = text.strip()
+    text = text.lower()
+    # Remove trailing punctuation
+    text = text.rstrip(".,;:")
+    text = text.strip()
+    # Unwrap parentheses: "(a)" -> "a", "a)" -> "a"
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    elif text.endswith(")"):
+        text = text[:-1].strip()
+    return text
+
+
 def extract_answer_from_text(
     text: str,
     answer_type: str,
     choices: str = "",
 ) -> str:
-    """Extract a normalized answer from text given the expected type.
+    """Liberal extraction of answer from text for correctness scoring.
+
+    Searches within text to find an answer — used by correctness reward,
+    NOT by format reward. This intentionally recovers answers from prose
+    like "The answer is B" so correctness can still be evaluated even
+    when format is wrong.
 
     For MCQ: extracts single letter (A-F), rejects multiple different letters.
     For YesNo: extracts "Yes" or "No", rejects hedging.

@@ -440,6 +440,7 @@ class SelfReflectionConfig:
     kl_coeff: float = 0.05
     clip_range: float = 0.2
     num_inner_epochs: int = 4
+    inner_mini_batch_size: int = 8
     debug: bool = False
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     sanity_check_samples: int = 0
