@@ -61,9 +61,8 @@ spec:
             --w_fb_format ${W_FB_FORMAT:-0.5} \
             --logging_steps ${LOGGING_STEPS:-10} \
             --save_steps ${SAVE_STEPS:-500} \
-            --seed ${SEED:-42} \
-            --debug
-
+            --seed ${SEED:-42} 
+            
           echo "=== Training complete ==="
 
         env:

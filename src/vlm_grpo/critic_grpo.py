@@ -692,9 +692,11 @@ class SelfReflectionGRPOTrainer:
         all_metrics = {}
         should_stop = False
 
+        total_samples = len(train_dataset) * num_epochs
         pbar = tqdm(
-            total=total_steps,
+            total=total_samples,
             desc="Training",
+            unit="sample",
             disable=not is_main,
             dynamic_ncols=True,
         )
@@ -729,7 +731,7 @@ class SelfReflectionGRPOTrainer:
                     fb_r=f"{step_result.feedback_reward_mean:.3f}",
                     rw_rate=f"{rw_rate:.3f}",
                 )
-                pbar.update(1)
+                pbar.update(len(batch))
 
                 if self.global_step % config.logging_steps == 0:
                     logger.info(
@@ -966,8 +968,6 @@ class SelfReflectionGRPOTrainer:
                 if self.ref_model is None:
                     unwrapped_model.enable_adapter_layers()
 
-                logger.info(f"    old/ref log-prob {ti + 1}/{n_traj} done")
-
             old_resp_lps = torch.stack(old_resp_lps_list)
             old_fb_lps = torch.stack(old_fb_lps_list)
             ref_resp_lps = torch.stack(ref_resp_lps_list)
@@ -986,7 +986,6 @@ class SelfReflectionGRPOTrainer:
         total_kl_loss = 0.0
 
         for inner_epoch in range(num_inner):
-            logger.info(f"  Inner epoch {inner_epoch + 1}/{num_inner}...")
             self.optimizer.zero_grad()
 
             # Accumulate gradients per-trajectory to avoid holding all
@@ -1089,6 +1088,12 @@ class SelfReflectionGRPOTrainer:
             total_resp_loss += epoch_resp_loss
             total_fb_loss += epoch_fb_loss
             total_kl_loss += epoch_kl_loss
+
+        logger.info(
+            f"  Inner epochs done: resp_loss={total_resp_loss / num_inner:.4f}, "
+            f"fb_loss={total_fb_loss / num_inner:.4f}, "
+            f"kl_loss={total_kl_loss / num_inner:.4f}"
+        )
 
         if self.scheduler is not None:
             self.scheduler.step()
