@@ -964,6 +964,8 @@ class SelfReflectionGRPOTrainer:
             epoch_kl_loss = 0.0
 
             for ti, t in enumerate(trajectory_data):
+                is_last = ti == n_traj_inner - 1
+
                 # Compute current log-probs (with grad) for this trajectory
                 a1_lp = self._compute_log_prob(t["a1_full"], t["image"], self.model)
                 a2_lp = self._compute_log_prob(t["a2_full"], t["image"], self.model)
@@ -995,10 +997,16 @@ class SelfReflectionGRPOTrainer:
                 )
                 traj_kl_loss = self.config.kl_coeff * traj_kl
 
-                # Scale by 1/n_traj to get mean, then backward to accumulate grads
+                # Scale by 1/n_traj to get mean, then backward to accumulate grads.
+                # Use no_sync for all but the last trajectory so DDP defers
+                # gradient all-reduce until the final backward().
                 traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
                 if self.accelerator is not None:
-                    self.accelerator.backward(traj_loss)
+                    if is_last:
+                        self.accelerator.backward(traj_loss)
+                    else:
+                        with self.accelerator.no_sync(self.model):
+                            self.accelerator.backward(traj_loss)
                 else:
                     traj_loss.backward()
 
