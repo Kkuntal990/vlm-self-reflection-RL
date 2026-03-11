@@ -279,23 +279,16 @@ def main() -> None:
 
     processor = AutoProcessor.from_pretrained(args.model_id)
 
-    # Load reference model first (base weights, no LoRA, frozen)
-    logger.info("Loading reference model (frozen base)...")
-    ref_model = AutoModelForVision2Seq.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.float16,
-    ).to(accelerator.device)
-    ref_model.eval()
-    for param in ref_model.parameters():
-        param.requires_grad = False
-    logger.info("Reference model loaded and frozen")
-
-    # Load policy model
+    # Load policy model (ref model not needed — PEFT adapter disable gives base weights)
     logger.info("Loading policy model...")
     model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
         torch_dtype=torch.float16,
     ).to(accelerator.device)
+
+    # Enable gradient checkpointing to reduce activation memory
+    model.gradient_checkpointing_enable()
+    logger.info("Gradient checkpointing enabled on policy model")
 
     # Apply LoRA
     if not args.no_peft:
@@ -337,7 +330,7 @@ def main() -> None:
 
     trainer = SelfReflectionGRPOTrainer(
         model=model,
-        ref_model=ref_model,
+        ref_model=None,
         processor=processor,
         config=config,
         optimizer=optimizer,

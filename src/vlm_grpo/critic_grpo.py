@@ -606,7 +606,7 @@ class SelfReflectionGRPOTrainer:
     def __init__(
         self,
         model: Any,
-        ref_model: Any,
+        ref_model: Optional[Any],
         processor: Any,
         config: Any,
         optimizer: Optional[Any] = None,
@@ -617,9 +617,13 @@ class SelfReflectionGRPOTrainer:
 
         Uses lazy imports for heavy ML libraries.
 
+        If ref_model is None and the policy model is a PEFT model, ref
+        log-probs are computed by disabling the LoRA adapter (zero GPU
+        overhead). A separate ref_model is only needed for non-PEFT runs.
+
         Args:
             model: The policy model (with LoRA adapter)
-            ref_model: Frozen reference model for KL regularization
+            ref_model: Frozen reference model for KL, or None to use adapter disable
             processor: Tokenizer/processor for the model
             config: SelfReflectionConfig
             optimizer: Optional pre-configured optimizer
@@ -910,18 +914,35 @@ class SelfReflectionGRPOTrainer:
                     self._compute_log_prob(t["f1_full"], t["image"], unwrapped_model)
                 )
 
-                ref_a1 = self._compute_log_prob(t["a1_full"], t["image"], self.ref_model)
-                ref_a2 = self._compute_log_prob(t["a2_full"], t["image"], self.ref_model)
+                # Ref log-probs: disable LoRA adapter to get base model output,
+                # or use a separate ref_model if provided
+                if self.ref_model is None:
+                    # PEFT model: disable adapter to get base (ref) weights
+                    unwrapped_model.disable_adapter_layers()
+                    ref_m = unwrapped_model
+                else:
+                    ref_m = self.ref_model
+
+                ref_a1 = self._compute_log_prob(t["a1_full"], t["image"], ref_m)
+                ref_a2 = self._compute_log_prob(t["a2_full"], t["image"], ref_m)
                 ref_resp_lps_list.append(ref_a1 + ref_a2)
                 ref_fb_lps_list.append(
-                    self._compute_log_prob(t["f1_full"], t["image"], self.ref_model)
+                    self._compute_log_prob(t["f1_full"], t["image"], ref_m)
                 )
+
+                if self.ref_model is None:
+                    unwrapped_model.enable_adapter_layers()
+
                 logger.info(f"    old/ref log-prob {ti + 1}/{n_traj} done")
 
             old_resp_lps = torch.stack(old_resp_lps_list)
             old_fb_lps = torch.stack(old_fb_lps_list)
             ref_resp_lps = torch.stack(ref_resp_lps_list)
             ref_fb_lps = torch.stack(ref_fb_lps_list)
+
+        # Free any cached activations before inner optimization
+        torch.cuda.empty_cache()
+        logger.info("  CUDA cache cleared before inner optimization")
 
         clip_range = self.config.clip_range
         num_inner = self.config.num_inner_epochs
@@ -933,50 +954,67 @@ class SelfReflectionGRPOTrainer:
 
         for inner_epoch in range(num_inner):
             logger.info(f"  Inner epoch {inner_epoch + 1}/{num_inner}...")
-            # Recompute log-probs under current (evolving) weights
-            cur_resp_lps = []
-            cur_fb_lps = []
-
-            for t in trajectory_data:
-                a1_lp = self._compute_log_prob(t["a1_full"], t["image"], self.model)
-                a2_lp = self._compute_log_prob(t["a2_full"], t["image"], self.model)
-                cur_resp_lps.append(a1_lp + a2_lp)
-                cur_fb_lps.append(self._compute_log_prob(t["f1_full"], t["image"], self.model))
-
-            resp_lps = torch.stack(cur_resp_lps)
-            fb_lps = torch.stack(cur_fb_lps)
-
-            # Response GRPO loss
-            resp_ratio = torch.exp(resp_lps - old_resp_lps)
-            resp_surr1 = resp_ratio * resp_advantages
-            resp_surr2 = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range) * resp_advantages
-            response_loss = -torch.min(resp_surr1, resp_surr2).mean()
-
-            # Feedback GRPO loss
-            fb_ratio = torch.exp(fb_lps - old_fb_lps)
-            fb_surr1 = fb_ratio * fb_advantages
-            fb_surr2 = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range) * fb_advantages
-            feedback_loss = -torch.min(fb_surr1, fb_surr2).mean()
-
-            # Shared KL loss
-            all_lps = torch.cat([resp_lps, fb_lps])
-            all_ref_lps = torch.cat([ref_resp_lps, ref_fb_lps])
-            kl = torch.clamp((all_lps - all_ref_lps).mean(), min=0.0)
-            kl_loss = self.config.kl_coeff * kl
-
-            loss = response_loss + feedback_loss + kl_loss
-            if self.accelerator is not None:
-                self.accelerator.backward(loss)
-                self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
             self.optimizer.zero_grad()
 
-            total_resp_loss += response_loss.item()
-            total_fb_loss += feedback_loss.item()
-            total_kl_loss += kl_loss.item()
+            # Accumulate gradients per-trajectory to avoid holding all
+            # computation graphs in memory simultaneously
+            n_traj_inner = len(trajectory_data)
+            epoch_resp_loss = 0.0
+            epoch_fb_loss = 0.0
+            epoch_kl_loss = 0.0
+
+            for ti, t in enumerate(trajectory_data):
+                # Compute current log-probs (with grad) for this trajectory
+                a1_lp = self._compute_log_prob(t["a1_full"], t["image"], self.model)
+                a2_lp = self._compute_log_prob(t["a2_full"], t["image"], self.model)
+                resp_lp = a1_lp + a2_lp
+                fb_lp = self._compute_log_prob(t["f1_full"], t["image"], self.model)
+
+                # Per-trajectory response GRPO loss
+                resp_ratio = torch.exp(resp_lp - old_resp_lps[ti])
+                resp_surr1 = resp_ratio * resp_advantages[ti]
+                resp_surr2 = (
+                    torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
+                    * resp_advantages[ti]
+                )
+                traj_resp_loss = -torch.min(resp_surr1, resp_surr2)
+
+                # Per-trajectory feedback GRPO loss
+                fb_ratio = torch.exp(fb_lp - old_fb_lps[ti])
+                fb_surr1 = fb_ratio * fb_advantages[ti]
+                fb_surr2 = (
+                    torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
+                    * fb_advantages[ti]
+                )
+                traj_fb_loss = -torch.min(fb_surr1, fb_surr2)
+
+                # Per-trajectory KL loss
+                traj_kl = torch.clamp(
+                    (resp_lp - ref_resp_lps[ti] + fb_lp - ref_fb_lps[ti]) / 2.0,
+                    min=0.0,
+                )
+                traj_kl_loss = self.config.kl_coeff * traj_kl
+
+                # Scale by 1/n_traj to get mean, then backward to accumulate grads
+                traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
+                if self.accelerator is not None:
+                    self.accelerator.backward(traj_loss)
+                else:
+                    traj_loss.backward()
+
+                epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
+                epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
+                epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
+
+            if self.accelerator is not None:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+
+            total_resp_loss += epoch_resp_loss
+            total_fb_loss += epoch_fb_loss
+            total_kl_loss += epoch_kl_loss
 
         if self.scheduler is not None:
             self.scheduler.step()
