@@ -540,8 +540,9 @@ def _generate_completions(
         inputs = processor(text=text, return_tensors="pt").to(device)
 
     do_sample = temperature > 0
-    completions = []
-    for _ in range(k):
+    prompt_len = inputs["input_ids"].shape[1]
+
+    if k == 1:
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -549,11 +550,99 @@ def _generate_completions(
             top_p=top_p if do_sample else None,
             do_sample=do_sample,
         )
-        generated_ids = outputs[0][inputs["input_ids"].shape[1] :]
-        text_out = processor.decode(generated_ids, skip_special_tokens=True)
-        completions.append(text_out.strip())
+        return [processor.decode(outputs[0][prompt_len:], skip_special_tokens=True).strip()]
 
-    return completions
+    # TRL-style: expand the single prompt k times along the batch dim so all
+    # k completions are generated in one parallel model.generate() call.
+    batched_inputs = {
+        key: val.expand(k, *val.shape[1:]).contiguous() for key, val in inputs.items()
+    }
+    outputs = model.generate(
+        **batched_inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature if do_sample else None,
+        top_p=top_p if do_sample else None,
+        do_sample=do_sample,
+    )
+    return [
+        processor.decode(outputs[i][prompt_len:], skip_special_tokens=True).strip()
+        for i in range(k)
+    ]
+
+
+def _generate_batch_completions(
+    model: Any,
+    processor: Any,
+    messages_list: list[list[dict]],
+    image: Any,
+    device: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+) -> list[str]:
+    """Generate one completion per message sequence, batched in one generate call.
+
+    Used for F1 and A2 steps where each of the K trajectories has a different
+    prompt (different A1 in context) but shares the same image. Mirrors the
+    TRL pattern of batching all sequences together instead of looping.
+
+    Args:
+        model: HuggingFace model with generate() method
+        processor: Tokenizer/processor for the model
+        messages_list: K different message sequences, one per trajectory
+        image: Shared PIL Image (or None) for all sequences
+        device: Device string
+        max_new_tokens: Maximum tokens per generation
+        temperature: Sampling temperature
+        top_p: Top-p sampling
+
+    Returns:
+        List of K text completions, one per input sequence
+    """
+    k = len(messages_list)
+    texts = [
+        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        for msgs in messages_list
+    ]
+    if image is not None:
+        texts = ["<image>\n" + t if "<image>" not in t else t for t in texts]
+
+    # Left-pad for batched autoregressive generation so real tokens sit at
+    # the right edge and generation continues from the correct position.
+    orig_padding_side = processor.tokenizer.padding_side
+    processor.tokenizer.padding_side = "left"
+    try:
+        if image is not None:
+            inputs = processor(
+                text=texts,
+                images=[image] * k,
+                return_tensors="pt",
+                padding=True,
+            ).to(device)
+        else:
+            inputs = processor(
+                text=texts,
+                return_tensors="pt",
+                padding=True,
+            ).to(device)
+
+        do_sample = temperature > 0
+        prompt_len = inputs["input_ids"].shape[1]  # same for all after left-padding
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            do_sample=do_sample,
+        )
+    finally:
+        processor.tokenizer.padding_side = orig_padding_side
+
+    return [
+        processor.decode(outputs[i][prompt_len:], skip_special_tokens=True).strip()
+        for i in range(k)
+    ]
 
 
 def generate_self_reflection_rollout(
@@ -626,41 +715,36 @@ def generate_self_reflection_rollout(
                 k=k,
             )
 
-            # Step 2: For each A1, generate F1
+            # Step 2: Generate all K F1s in one batched call (K different prompts,
+            # same image) — mirrors TRL's repeat_interleave pattern.
             fb_temp = config.feedback_temperature
-            feedbacks = []
-            for a1 in answer1s:
-                critic_prompt = build_critic_prompt(question, a1)
-                f1_list = _generate_completions(
-                    model,
-                    processor,
-                    critic_prompt,
-                    image,
-                    device,
-                    max_new_tokens=config.max_completion_length,
-                    temperature=fb_temp,
-                    top_p=config.top_p,
-                    k=1,
-                )
-                feedbacks.append(f1_list[0])
+            critic_prompts = [build_critic_prompt(question, a1) for a1 in answer1s]
+            feedbacks = _generate_batch_completions(
+                model,
+                processor,
+                critic_prompts,
+                image,
+                device,
+                max_new_tokens=config.max_completion_length,
+                temperature=fb_temp,
+                top_p=config.top_p,
+            )
 
-            # Step 3: For each (A1, F1), generate A2 (greedy)
-            answer2s = []
-            for a1, f1 in zip(answer1s, feedbacks):
-                refiner_prompt = build_refiner_prompt(question, a1, f1)
-                a2_temp = config.a2_temperature
-                a2_list = _generate_completions(
-                    model,
-                    processor,
-                    refiner_prompt,
-                    image,
-                    device,
-                    max_new_tokens=config.max_completion_length,
-                    temperature=a2_temp,
-                    top_p=config.top_p,
-                    k=1,
-                )
-                answer2s.append(a2_list[0])
+            # Step 3: Generate all K A2s in one batched call.
+            refiner_prompts = [
+                build_refiner_prompt(question, a1, f1)
+                for a1, f1 in zip(answer1s, feedbacks)
+            ]
+            answer2s = _generate_batch_completions(
+                model,
+                processor,
+                refiner_prompts,
+                image,
+                device,
+                max_new_tokens=config.max_completion_length,
+                temperature=config.a2_temperature,
+                top_p=config.top_p,
+            )
 
         # Step 4: Compute two separate rewards per trajectory
         for a1, f1, a2 in zip(answer1s, feedbacks, answer2s):

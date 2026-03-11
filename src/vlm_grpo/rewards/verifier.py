@@ -88,6 +88,25 @@ _TOKEN_F1_THRESHOLD: float = 0.85
 _ANLS_THRESHOLD: float = 0.7
 _COSINE_SIM_THRESHOLD: float = 0.80
 
+# Common color words. If both answers mention a color and the colors differ,
+# treat the answer as contradictory before any fuzzy semantic matching.
+_COLOR_WORDS: frozenset[str] = frozenset(
+    {
+        "black",
+        "blue",
+        "brown",
+        "gray",
+        "green",
+        "grey",
+        "orange",
+        "pink",
+        "purple",
+        "red",
+        "white",
+        "yellow",
+    }
+)
+
 # Antonym pairs for contradiction detection in open-ended matching.
 # If pred and GT differ by tokens in one of these pairs, the answer is
 # considered WRONG regardless of surface-level similarity scores.
@@ -631,6 +650,34 @@ def _has_antonym_contradiction(pred: str, gt: str) -> bool:
     return False
 
 
+def _has_color_conflict(pred: str, gt: str) -> bool:
+    """Check if pred and GT mention different colors.
+
+    This catches common VQA failures like "red" vs "pink" that can look
+    superficially similar under edit-distance scoring because the surrounding
+    sentence is nearly identical.
+    """
+    pred_colors = _tokenize(pred) & _COLOR_WORDS
+    gt_colors = _tokenize(gt) & _COLOR_WORDS
+    if not pred_colors or not gt_colors:
+        return False
+    return pred_colors != gt_colors
+
+
+def _is_atomic_anls_candidate(pred: str, gt: str) -> bool:
+    """Whether ANLS is appropriate for this answer pair.
+
+    ANLS is useful for OCR-style typos on short atomic answers ("colur" vs
+    "color"), but it is too permissive for sentence-level VQA answers where a
+    single wrong token can still yield a high string-similarity score.
+    """
+    pred_norm = _normalize_text(pred)
+    gt_norm = _normalize_text(gt)
+    if not pred_norm or not gt_norm:
+        return False
+    return len(pred_norm.split()) == 1 and len(gt_norm.split()) == 1
+
+
 def _verify_open_ended(
     raw_text: str,
     extracted: str,
@@ -640,12 +687,12 @@ def _verify_open_ended(
     """Run the open-ended verification cascade.
 
     Stages (in order, first match wins):
-    0. Antonym contradiction check → WRONG if critical words are opposites
+    0. Deterministic contradiction checks → WRONG for antonym/color conflicts
     1. Exact match (case-insensitive)
     2. Substring containment
     3. Token-set F1 >= 0.85
-    4. ANLS >= 0.7
-    5. LLM judge (Qwen2.5-7B) → CORRECT/WRONG
+    4. ANLS >= 0.7 for atomic answers only
+    5. LLM judge (Qwen2.5-3B) → CORRECT/WRONG
     6. Otherwise → WRONG
 
     Args:
@@ -660,10 +707,18 @@ def _verify_open_ended(
     pred = extracted.strip().lower()
     gt = ground_truth.strip().lower()
 
-    # Stage 0: Antonym contradiction check
+    # Stage 0: Deterministic contradiction checks
     # If the differing tokens form an antonym pair (left/right, yes/no, etc.),
     # the answer is semantically opposite regardless of surface similarity.
     if _has_antonym_contradiction(extracted, ground_truth):
+        return MatchResult(
+            answer_type=answer_type,
+            parse_ok=True,
+            verdict=WRONG,
+            extracted=extracted,
+            score=None,
+        )
+    if _has_color_conflict(extracted, ground_truth):
         return MatchResult(
             answer_type=answer_type,
             parse_ok=True,
@@ -704,15 +759,20 @@ def _verify_open_ended(
         )
 
     # Stage 4: ANLS (1.0 - normalized_edit_distance)
-    anls = 1.0 - normalized_edit_distance(pred, gt)
-    if anls >= _ANLS_THRESHOLD:
-        return MatchResult(
-            answer_type=answer_type,
-            parse_ok=True,
-            verdict=CORRECT,
-            extracted=extracted,
-            score=anls,
-        )
+    # Restrict to short atomic answers. On sentence-level outputs ANLS is too
+    # forgiving and can accept wrong answers that differ in the key noun/adjective.
+    if _is_atomic_anls_candidate(pred, gt):
+        anls = 1.0 - normalized_edit_distance(pred, gt)
+        if anls >= _ANLS_THRESHOLD:
+            return MatchResult(
+                answer_type=answer_type,
+                parse_ok=True,
+                verdict=CORRECT,
+                extracted=extracted,
+                score=anls,
+            )
+    else:
+        anls = None
 
     # Stage 5: LLM judge (Qwen2.5-3B-Instruct) or embedding fallback
     # LLM judge is enabled via VLM_USE_LLM_JUDGE=1 environment variable.
@@ -749,5 +809,5 @@ def _verify_open_ended(
         parse_ok=True,
         verdict=WRONG,
         extracted=extracted,
-        score=cos_sim,
+        score=cos_sim if "cos_sim" in locals() else anls,
     )

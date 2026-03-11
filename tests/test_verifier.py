@@ -166,6 +166,14 @@ class TestOpenEndedDeterministicStages:
         r = verify_answer("colur", "color", "open")
         assert r.verdict == CORRECT
 
+    def test_sentence_level_color_conflict_is_wrong(self) -> None:
+        r = verify_answer(
+            "The little girl's dress is red.",
+            "The little girl's dress is pink.",
+            "open",
+        )
+        assert r.verdict == WRONG
+
 
 # =============================================================================
 # Open-ended verification (embedding stage)
@@ -189,6 +197,10 @@ class TestOpenEndedEmbeddingStage:
 
     def test_unrelated_wrong(self) -> None:
         r = verify_answer("airplane", "cat", "open")
+        assert r.verdict == WRONG
+
+    def test_short_phrase_mismatch_does_not_pass_via_anls(self) -> None:
+        r = verify_answer("Types of Plants", "Types of Leaflets", "open")
         assert r.verdict == WRONG
 
 

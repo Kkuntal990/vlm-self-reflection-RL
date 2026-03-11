@@ -699,6 +699,8 @@ class SelfReflectionGRPOTrainer:
             unit="sample",
             disable=not is_main,
             dynamic_ncols=True,
+            file=sys.stdout,  # same stream as logger so it shows in k8s logs
+            mininterval=30.0,  # don't flood logs; print at most every 30s
         )
 
         for epoch in range(num_epochs):
@@ -935,38 +937,36 @@ class SelfReflectionGRPOTrainer:
         )
         n_traj = len(trajectory_data)
         logger.info(f"  Computing old/ref log-probs for {n_traj} trajectories...")
+
+        # Collect per-type inputs for batched forward passes.
+        # Each type (a1, a2, f1) is computed in one forward pass instead of N
+        # sequential calls — mirrors TRL's batched log-prob pattern.
+        a1_msgs = [t["a1_full"] for t in trajectory_data]
+        a2_msgs = [t["a2_full"] for t in trajectory_data]
+        f1_msgs = [t["f1_full"] for t in trajectory_data]
+        imgs = [t["image"] for t in trajectory_data]
+
         with torch.no_grad():
-            old_resp_lps_list = []
-            old_fb_lps_list = []
-            ref_resp_lps_list = []
-            ref_fb_lps_list = []
+            old_a1_lps = self._compute_log_probs_batched(a1_msgs, imgs, unwrapped_model)
+            old_a2_lps = self._compute_log_probs_batched(a2_msgs, imgs, unwrapped_model)
+            old_fb_lps_list = self._compute_log_probs_batched(f1_msgs, imgs, unwrapped_model)
+            old_resp_lps_list = [a1 + a2 for a1, a2 in zip(old_a1_lps, old_a2_lps)]
 
-            for ti, t in enumerate(trajectory_data):
-                old_a1 = self._compute_log_prob(t["a1_full"], t["image"], unwrapped_model)
-                old_a2 = self._compute_log_prob(t["a2_full"], t["image"], unwrapped_model)
-                old_resp_lps_list.append(old_a1 + old_a2)
-                old_fb_lps_list.append(
-                    self._compute_log_prob(t["f1_full"], t["image"], unwrapped_model)
-                )
+            # Ref log-probs: disable LoRA adapter to get base model output,
+            # or use a separate ref_model if provided
+            if self.ref_model is None:
+                unwrapped_model.disable_adapter_layers()
+                ref_m = unwrapped_model
+            else:
+                ref_m = self.ref_model
 
-                # Ref log-probs: disable LoRA adapter to get base model output,
-                # or use a separate ref_model if provided
-                if self.ref_model is None:
-                    # PEFT model: disable adapter to get base (ref) weights
-                    unwrapped_model.disable_adapter_layers()
-                    ref_m = unwrapped_model
-                else:
-                    ref_m = self.ref_model
+            ref_a1_lps = self._compute_log_probs_batched(a1_msgs, imgs, ref_m)
+            ref_a2_lps = self._compute_log_probs_batched(a2_msgs, imgs, ref_m)
+            ref_fb_lps_list = self._compute_log_probs_batched(f1_msgs, imgs, ref_m)
+            ref_resp_lps_list = [a1 + a2 for a1, a2 in zip(ref_a1_lps, ref_a2_lps)]
 
-                ref_a1 = self._compute_log_prob(t["a1_full"], t["image"], ref_m)
-                ref_a2 = self._compute_log_prob(t["a2_full"], t["image"], ref_m)
-                ref_resp_lps_list.append(ref_a1 + ref_a2)
-                ref_fb_lps_list.append(
-                    self._compute_log_prob(t["f1_full"], t["image"], ref_m)
-                )
-
-                if self.ref_model is None:
-                    unwrapped_model.enable_adapter_layers()
+            if self.ref_model is None:
+                unwrapped_model.enable_adapter_layers()
 
             old_resp_lps = torch.stack(old_resp_lps_list)
             old_fb_lps = torch.stack(old_fb_lps_list)
@@ -1236,6 +1236,96 @@ class SelfReflectionGRPOTrainer:
         total_log_prob = token_log_probs.sum()
 
         return total_log_prob
+
+    def _compute_log_probs_batched(
+        self,
+        messages_list: list[list[dict]],
+        images: list[Any],
+        model: Any,
+    ) -> list[Any]:
+        """Compute log probs for N sequences in one batched forward pass.
+
+        Sequences are left-padded to the same length. Per-sequence prompt
+        lengths are tracked so only completion tokens contribute to each
+        sequence's log prob sum. This replaces N sequential forward passes
+        with one batched call — the same efficiency pattern used by TRL.
+
+        Args:
+            messages_list: N full message lists (prompt + assistant completion)
+            images: N PIL Images (or Nones), one per sequence
+            model: The model to run the forward pass on
+
+        Returns:
+            List of N scalar tensors, each the total log prob over completion tokens
+        """
+        import torch
+        import torch.nn.functional as F
+
+        n = len(messages_list)
+        has_image = any(img is not None for img in images)
+
+        full_texts = []
+        prompt_lens = []
+        for messages in messages_list:
+            prompt_messages = messages[:-1]
+            full_text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            prompt_text = self.processor.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True
+            )
+            if has_image and "<image>" not in full_text:
+                full_text = "<image>\n" + full_text
+            if has_image and "<image>" not in prompt_text:
+                prompt_text = "<image>\n" + prompt_text
+            full_texts.append(full_text)
+            prompt_lens.append(
+                self.processor.tokenizer(prompt_text, return_tensors="pt")[
+                    "input_ids"
+                ].shape[1]
+            )
+
+        # Full sequence lengths (unpadded) to compute left-pad offsets later
+        full_lens = [
+            self.processor.tokenizer(ft, return_tensors="pt")["input_ids"].shape[1]
+            for ft in full_texts
+        ]
+
+        # Left-pad so sequences can be batched for one forward pass
+        orig_padding_side = self.processor.tokenizer.padding_side
+        self.processor.tokenizer.padding_side = "left"
+        try:
+            if has_image:
+                batch_inputs = self.processor(
+                    text=full_texts,
+                    images=images,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+            else:
+                batch_inputs = self.processor(
+                    text=full_texts,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+        finally:
+            self.processor.tokenizer.padding_side = orig_padding_side
+
+        outputs = model(**batch_inputs)
+        logits = outputs.logits  # (n, padded_seq_len, vocab_size)
+
+        total_len = batch_inputs["input_ids"].shape[1]
+        log_probs_list = []
+        for i in range(n):
+            pad_len = total_len - full_lens[i]
+            real_prompt_start = pad_len + prompt_lens[i]
+            shift_logits = logits[i, real_prompt_start - 1 : -1, :]
+            shift_labels = batch_inputs["input_ids"][i, real_prompt_start:]
+            lp = F.log_softmax(shift_logits, dim=-1)
+            token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            log_probs_list.append(token_lp.sum())
+
+        return log_probs_list
 
     def _compute_group_advantages(
         self,
