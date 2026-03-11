@@ -34,6 +34,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from tqdm import tqdm
+
 from vlm_grpo.config import (
     TwoTrajectoryConfig,
 )
@@ -690,6 +692,13 @@ class SelfReflectionGRPOTrainer:
         all_metrics = {}
         should_stop = False
 
+        pbar = tqdm(
+            total=total_steps,
+            desc="Training",
+            disable=not is_main,
+            dynamic_ncols=True,
+        )
+
         for epoch in range(num_epochs):
             if should_stop:
                 break
@@ -712,6 +721,16 @@ class SelfReflectionGRPOTrainer:
                 epoch_loss += step_result.loss
                 epoch_steps += 1
 
+                rw_rate = step_result.rollout_metrics.get("sr/rw_rate", 0)
+                pbar.set_postfix(
+                    epoch=f"{epoch + 1}/{num_epochs}",
+                    loss=f"{step_result.loss:.4f}",
+                    resp_r=f"{step_result.response_reward_mean:.3f}",
+                    fb_r=f"{step_result.feedback_reward_mean:.3f}",
+                    rw_rate=f"{rw_rate:.3f}",
+                )
+                pbar.update(1)
+
                 if self.global_step % config.logging_steps == 0:
                     logger.info(
                         f"Step {self.global_step}: loss={step_result.loss:.4f}, "
@@ -719,7 +738,7 @@ class SelfReflectionGRPOTrainer:
                         f"fb_loss={step_result.feedback_loss:.4f}, "
                         f"resp_reward={step_result.response_reward_mean:.3f}, "
                         f"fb_reward={step_result.feedback_reward_mean:.3f}, "
-                        f"rw_rate={step_result.rollout_metrics.get('sr/rw_rate', 0):.3f}"
+                        f"rw_rate={rw_rate:.3f}"
                     )
 
                 # Validate
@@ -749,6 +768,8 @@ class SelfReflectionGRPOTrainer:
 
             avg_loss = epoch_loss / max(epoch_steps, 1)
             logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
+
+        pbar.close()
 
         # Final save (main process only)
         if is_main:
