@@ -1033,7 +1033,7 @@ class SelfReflectionGRPOTrainer:
                 epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
 
             # Manually all-reduce gradients across DDP processes
-            if self.accelerator is not None:
+            if self.accelerator is not None and torch.distributed.is_initialized():
                 for param in inner_model.parameters():
                     if param.grad is not None:
                         torch.distributed.all_reduce(
