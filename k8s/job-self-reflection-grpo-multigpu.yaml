@@ -30,7 +30,7 @@ spec:
           uv pip install --system -e . 2>&1 | tail -3
 
           # Run training (multi-GPU via accelerate)
-          accelerate launch --num_processes=${NUM_GPUS:-4} train_self_reflection.py \
+          accelerate launch --num_processes=${NUM_GPUS:-2} train_self_reflection.py \
             --model_id "${MODEL_ID}" \
             --dataset_path "${DATASET_PATH}" \
             --val_dataset_path "${VAL_DATASET_PATH}" \
@@ -49,7 +49,7 @@ spec:
             --per_device_train_batch_size ${BATCH_SIZE:-1} \
             --gradient_accumulation_steps ${GRAD_ACC:-4} \
             --num_train_epochs ${EPOCHS:-1} \
-            --num_inner_epochs ${INNER_EPOCHS:-4} \
+            --num_inner_epochs ${INNER_EPOCHS:-2} \
             --kl_coeff ${KL_COEFF:-0.05} \
             --clip_range ${CLIP_RANGE:-0.2} \
             --lora_r ${LORA_R:-16} \
@@ -85,7 +85,7 @@ spec:
         - name: K_SAMPLES
           value: "4"
         - name: MAX_SAMPLES
-          value: "0"
+          value: "12000"
         - name: MAX_COMPLETION_LENGTH
           value: "512"
         - name: A1_MAX_COMPLETION
@@ -115,7 +115,7 @@ spec:
         - name: CLIP_RANGE
           value: "0.2"
         - name: NUM_GPUS
-          value: "2"
+          value: "4"
 
         # LoRA
         - name: LORA_R
@@ -145,7 +145,7 @@ spec:
 
         # Logging
         - name: LOGGING_STEPS
-          value: "10"
+          value: "1000"
         - name: SAVE_STEPS
           value: "500"
         - name: SEED
@@ -181,11 +181,11 @@ spec:
 
         resources:
           limits:
-            nvidia.com/a100: "2"
+            nvidia.com/a100: "4"
             memory: "96Gi"
             cpu: "8"
           requests:
-            nvidia.com/a100: "2"
+            nvidia.com/a100: "4"
             memory: "96Gi"
             cpu: "8"
 
