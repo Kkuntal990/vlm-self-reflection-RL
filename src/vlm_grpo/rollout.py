@@ -771,7 +771,22 @@ def generate_self_reflection_rollout(
                 f"Self-reflection rollout: {chunk_end}/{n} samples (gen_batch={chunk_size}, k={k})"
             )
 
-    # Step 4: Compute rewards and assemble results, one per sample.
+    # Step 4: Pre-warm the LLM judge cache with one batched generate() call
+    # covering all (a1, gt) and (a2, gt) pairs. Subsequent per-trajectory calls
+    # inside verify_answer() will hit the shared _score_cache dict (O(1) lookup)
+    # instead of running N individual generate() calls.
+    from vlm_grpo.rewards.judge_llm import is_enabled, llm_judge_score_batch
+
+    if is_enabled():
+        judge_pairs: list[tuple[str, str]] = []
+        for i in range(n):
+            gt = ground_truths[i]
+            for j in range(k):
+                judge_pairs.append((all_a1s[i * k + j], gt))
+                judge_pairs.append((all_a2s[i * k + j], gt))
+        llm_judge_score_batch(judge_pairs)
+
+    # Step 5: Compute rewards and assemble results, one per sample.
     results = []
     for i in range(n):
         traj_slice = slice(i * k, (i + 1) * k)

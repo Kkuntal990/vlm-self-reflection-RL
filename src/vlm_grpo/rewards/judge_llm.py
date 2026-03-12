@@ -8,7 +8,7 @@ cosine similarity for more accurate semantic matching in the open-ended
 verification cascade.
 
 The model is lazy-loaded as a singleton and runs on GPU in float16.
-Results are cached via LRU cache to avoid redundant inference.
+Results are cached in a module-level dict to avoid redundant inference.
 
 Activation: Set environment variable VLM_USE_LLM_JUDGE=1 to enable.
 When disabled (default), the verifier falls back to embedding cosine sim.
@@ -26,7 +26,6 @@ Usage:
     assert score < 0.5  # Not equivalent
 """
 
-import functools
 import logging
 import os
 import re
@@ -46,6 +45,9 @@ _JUDGE_MODEL_ID = os.environ.get("VLM_JUDGE_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct
 # Singleton model and tokenizer
 _judge_model: Any = None
 _judge_tokenizer: Any = None
+
+# Module-level cache shared by both llm_judge_score and llm_judge_score_batch
+_score_cache: dict[tuple[str, str], float] = {}
 
 _JUDGE_PROMPT = """You are an answer equivalence judge for visual question answering.
 
@@ -119,12 +121,27 @@ def _get_judge_model() -> tuple[Any, Any]:
     return _judge_model, _judge_tokenizer
 
 
-@functools.lru_cache(maxsize=4096)
+def _parse_score(generated: str) -> float:
+    """Parse integer score from model output and normalize to [0, 1].
+
+    Args:
+        generated: Raw model output string.
+
+    Returns:
+        Score in [0.0, 1.0], or 0.0 if unparseable.
+    """
+    match = _SCORE_PATTERN.search(generated)
+    if match:
+        return min(max(int(match.group(1)), 0), 10) / 10.0
+    logger.warning(f"LLM judge returned unparseable response: '{generated}'")
+    return 0.0
+
+
 def llm_judge_score(predicted: str, ground_truth: str) -> float:
     """Score the equivalence of predicted answer vs ground truth using LLM.
 
     Uses Qwen2.5-3B-Instruct to produce a 0-10 score, normalized to [0, 1].
-    Results are cached via LRU cache (maxsize=4096).
+    Results are cached in a module-level dict (maxsize unlimited).
 
     Args:
         predicted: Predicted answer text
@@ -135,11 +152,15 @@ def llm_judge_score(predicted: str, ground_truth: str) -> float:
     """
     import torch
 
+    key = (predicted.strip(), ground_truth.strip())
+    if key in _score_cache:
+        return _score_cache[key]
+
     model, tokenizer = _get_judge_model()
 
     prompt = _JUDGE_PROMPT.format(
-        ground_truth=ground_truth.strip(),
-        predicted=predicted.strip(),
+        ground_truth=key[1],
+        predicted=key[0],
     )
 
     messages = [{"role": "user", "content": prompt}]
@@ -158,19 +179,80 @@ def llm_judge_score(predicted: str, ground_truth: str) -> float:
             do_sample=False,
         )
 
-    # Decode only the generated tokens (exclude the prompt)
     generated = tokenizer.decode(
         outputs[0][inputs["input_ids"].shape[1] :],
         skip_special_tokens=True,
     ).strip()
 
-    # Extract integer score from response
-    match = _SCORE_PATTERN.search(generated)
-    if match:
-        raw_score = int(match.group(1))
-        # Clamp to [0, 10] and normalize to [0, 1]
-        return min(max(raw_score, 0), 10) / 10.0
+    score = _parse_score(generated)
+    _score_cache[key] = score
+    return score
 
-    # If parsing fails, treat as uncertain → low score
-    logger.warning(f"LLM judge returned unparseable response: '{generated}'")
-    return 0.0
+
+def llm_judge_score_batch(pairs: list[tuple[str, str]]) -> list[float]:
+    """Score a batch of (predicted, ground_truth) pairs in one generate() call.
+
+    Checks the module-level cache first; only uncached pairs go to the GPU.
+    All uncached pairs are processed in a single batched generate() call,
+    replacing N sequential calls with one.
+
+    Args:
+        pairs: List of (predicted, ground_truth) tuples to score.
+
+    Returns:
+        List of equivalence scores in [0.0, 1.0], one per input pair.
+    """
+    import torch
+
+    if not pairs:
+        return []
+
+    # Normalize keys and check cache
+    keys = [(p.strip(), g.strip()) for p, g in pairs]
+    scores: list[float | None] = [_score_cache.get(k) for k in keys]
+
+    # Collect unique uncached pairs (preserve first-occurrence index)
+    seen: dict[tuple[str, str], int] = {}  # key → position in inference list
+    inference_keys: list[tuple[str, str]] = []
+    for i, key in enumerate(keys):
+        if scores[i] is None and key not in seen:
+            seen[key] = len(inference_keys)
+            inference_keys.append(key)
+
+    if inference_keys:
+        model, tokenizer = _get_judge_model()
+
+        texts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": _JUDGE_PROMPT.format(
+                    ground_truth=gt, predicted=pred
+                )}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for pred, gt in inference_keys
+        ]
+
+        orig_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        try:
+            inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
+        finally:
+            tokenizer.padding_side = orig_side
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=10,
+                do_sample=False,
+            )
+
+        prompt_len = inputs["input_ids"].shape[1]
+        for pos, key in enumerate(inference_keys):
+            generated = tokenizer.decode(
+                outputs[pos][prompt_len:], skip_special_tokens=True
+            ).strip()
+            _score_cache[key] = _parse_score(generated)
+
+    # Fill in all results from cache (now fully populated)
+    return [_score_cache[k] for k in keys]

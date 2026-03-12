@@ -153,7 +153,7 @@ spec:
 
         # LLM Judge (Qwen2.5-3B for open-ended verification)
         - name: VLM_USE_LLM_JUDGE
-          value: "0"
+          value: "1"
         - name: VLM_JUDGE_MODEL_ID
           value: "Qwen/Qwen2.5-3B-Instruct"
 
