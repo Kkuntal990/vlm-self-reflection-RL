@@ -725,7 +725,7 @@ def generate_self_reflection_rollout(
                 a1_prompts,
                 imgs_expanded,
                 device,
-                max_new_tokens=config.max_completion_length,
+                max_new_tokens=config.a1_max_completion_length,
                 temperature=config.temperature,
                 top_p=config.top_p,
             )
@@ -743,7 +743,7 @@ def generate_self_reflection_rollout(
                 f1_prompts,
                 imgs_expanded,
                 device,
-                max_new_tokens=config.max_completion_length,
+                max_new_tokens=config.f1_max_completion_length,
                 temperature=config.feedback_temperature,
                 top_p=config.top_p,
             )
@@ -761,7 +761,7 @@ def generate_self_reflection_rollout(
                 a2_prompts,
                 imgs_expanded,
                 device,
-                max_new_tokens=config.max_completion_length,
+                max_new_tokens=config.a2_max_completion_length,
                 temperature=config.a2_temperature,
                 top_p=config.top_p,
             )

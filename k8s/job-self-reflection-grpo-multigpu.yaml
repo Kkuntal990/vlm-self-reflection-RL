@@ -39,6 +39,9 @@ spec:
             --max_samples ${MAX_SAMPLES:-0} \
             --k_samples ${K_SAMPLES:-4} \
             --max_completion_length ${MAX_COMPLETION_LENGTH:-512} \
+            --a1_max_completion_length ${A1_MAX_COMPLETION:-200} \
+            --f1_max_completion_length ${F1_MAX_COMPLETION:-512} \
+            --a2_max_completion_length ${A2_MAX_COMPLETION:-200} \
             --temperature ${TEMPERATURE:-0.7} \
             --feedback_temperature ${FEEDBACK_TEMPERATURE:-0.9} \
             --a2_temperature ${A2_TEMPERATURE:-0.3} \
@@ -62,7 +65,7 @@ spec:
             --logging_steps ${LOGGING_STEPS:-10} \
             --save_steps ${SAVE_STEPS:-500} \
             --seed ${SEED:-42} 
-            
+
           echo "=== Training complete ==="
 
         env:
@@ -85,6 +88,12 @@ spec:
           value: "0"
         - name: MAX_COMPLETION_LENGTH
           value: "512"
+        - name: A1_MAX_COMPLETION
+          value: "200"
+        - name: F1_MAX_COMPLETION
+          value: "512"
+        - name: A2_MAX_COMPLETION
+          value: "200"
         - name: TEMPERATURE
           value: "0.7"
         - name: FEEDBACK_TEMPERATURE
@@ -94,13 +103,13 @@ spec:
         - name: LEARNING_RATE
           value: "1e-5"
         - name: BATCH_SIZE
-          value: "16"
+          value: "8"
         - name: GRAD_ACC
-          value: "4"
+          value: "8"
         - name: EPOCHS
           value: "1"
         - name: INNER_EPOCHS
-          value: "4"
+          value: "2"
         - name: KL_COEFF
           value: "0.05"
         - name: CLIP_RANGE
@@ -144,7 +153,7 @@ spec:
 
         # LLM Judge (Qwen2.5-3B for open-ended verification)
         - name: VLM_USE_LLM_JUDGE
-          value: "1"
+          value: "0"
         - name: VLM_JUDGE_MODEL_ID
           value: "Qwen/Qwen2.5-3B-Instruct"
 
@@ -174,11 +183,11 @@ spec:
           limits:
             nvidia.com/a100: "2"
             memory: "96Gi"
-            cpu: "4"
+            cpu: "8"
           requests:
             nvidia.com/a100: "2"
             memory: "96Gi"
-            cpu: "4"
+            cpu: "8"
 
         volumeMounts:
         - name: cache

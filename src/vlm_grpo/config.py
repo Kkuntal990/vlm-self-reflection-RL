@@ -153,6 +153,9 @@ class RolloutConfig:
 
     k_samples: int = 4
     max_completion_length: int = 512
+    a1_max_completion_length: int = 200
+    f1_max_completion_length: int = 512
+    a2_max_completion_length: int = 200
     temperature: float = 0.7
     feedback_temperature: float = 0.9
     top_p: float = 0.9

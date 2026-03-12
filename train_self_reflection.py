@@ -97,6 +97,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--k_samples", type=int, default=4, help="Trajectories per sample")
     parser.add_argument("--max_completion_length", type=int, default=512)
+    parser.add_argument("--a1_max_completion_length", type=int, default=200)
+    parser.add_argument("--f1_max_completion_length", type=int, default=512)
+    parser.add_argument("--a2_max_completion_length", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.7, help="A1 sampling temperature")
     parser.add_argument(
         "--feedback_temperature", type=float, default=0.9, help="F1 sampling temperature"
@@ -202,6 +205,9 @@ def main() -> None:
     rollout_config = RolloutConfig(
         k_samples=args.k_samples,
         max_completion_length=args.max_completion_length,
+        a1_max_completion_length=args.a1_max_completion_length,
+        f1_max_completion_length=args.f1_max_completion_length,
+        a2_max_completion_length=args.a2_max_completion_length,
         temperature=args.temperature,
         feedback_temperature=args.feedback_temperature,
         a2_temperature=args.a2_temperature,
@@ -292,6 +298,7 @@ def main() -> None:
     model = AutoModelForVision2Seq.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
     ).to(accelerator.device)
 
     # Enable gradient checkpointing to reduce activation memory
@@ -315,7 +322,7 @@ def main() -> None:
     # Create optimizer and prepare for distributed training
     from torch.optim import AdamW
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01, fused=True)
     model, optimizer = accelerator.prepare(model, optimizer)
     logger.info(
         f"Distributed training: {accelerator.num_processes} processes, device={accelerator.device}"

@@ -958,17 +958,15 @@ class SelfReflectionGRPOTrainer:
         ref_fb_lps_list: list[Any] = []
 
         with torch.no_grad():
+            # Combine a1/a2/f1 into one forward pass per mini-batch (3× fewer GPU ops)
             for mb_s in range(0, n_traj, inner_mini_bs):
                 mb_e = min(mb_s + inner_mini_bs, n_traj)
-                old_a1_lps_list += self._forward_from_pretokenized(
-                    a1_pretok, unwrapped_model, mb_s, mb_e
+                a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
+                    [a1_pretok, a2_pretok, f1_pretok], unwrapped_model, mb_s, mb_e
                 )
-                old_a2_lps_list += self._forward_from_pretokenized(
-                    a2_pretok, unwrapped_model, mb_s, mb_e
-                )
-                old_fb_lps_list += self._forward_from_pretokenized(
-                    f1_pretok, unwrapped_model, mb_s, mb_e
-                )
+                old_a1_lps_list += a1_lps
+                old_a2_lps_list += a2_lps
+                old_fb_lps_list += fb_lps
 
             # Ref log-probs: disable LoRA adapter or use separate ref_model
             if self.ref_model is None:
@@ -979,9 +977,12 @@ class SelfReflectionGRPOTrainer:
 
             for mb_s in range(0, n_traj, inner_mini_bs):
                 mb_e = min(mb_s + inner_mini_bs, n_traj)
-                ref_a1_lps_list += self._forward_from_pretokenized(a1_pretok, ref_m, mb_s, mb_e)
-                ref_a2_lps_list += self._forward_from_pretokenized(a2_pretok, ref_m, mb_s, mb_e)
-                ref_fb_lps_list += self._forward_from_pretokenized(f1_pretok, ref_m, mb_s, mb_e)
+                a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
+                    [a1_pretok, a2_pretok, f1_pretok], ref_m, mb_s, mb_e
+                )
+                ref_a1_lps_list += a1_lps
+                ref_a2_lps_list += a2_lps
+                ref_fb_lps_list += fb_lps
 
             if self.ref_model is None:
                 unwrapped_model.enable_adapter_layers()
@@ -1027,14 +1028,8 @@ class SelfReflectionGRPOTrainer:
             for mb_start in range(0, n_traj_inner, inner_mini_bs):
                 mb_end = min(mb_start + inner_mini_bs, n_traj_inner)
 
-                mb_a1_lps = self._forward_from_pretokenized(
-                    a1_pretok, inner_model, mb_start, mb_end
-                )
-                mb_a2_lps = self._forward_from_pretokenized(
-                    a2_pretok, inner_model, mb_start, mb_end
-                )
-                mb_fb_lps = self._forward_from_pretokenized(
-                    f1_pretok, inner_model, mb_start, mb_end
+                mb_a1_lps, mb_a2_lps, mb_fb_lps = self._forward_from_pretokenized_multi(
+                    [a1_pretok, a2_pretok, f1_pretok], inner_model, mb_start, mb_end
                 )
 
                 # Accumulate loss over mini-batch, backward once per mini-batch
@@ -1307,7 +1302,7 @@ class SelfReflectionGRPOTrainer:
         """
         has_image = any(img is not None for img in images)
         full_texts: list[str] = []
-        prompt_lens: list[int] = []
+        prompt_texts: list[str] = []
         for messages in messages_list:
             prompt_messages = messages[:-1]
             full_text = self.processor.apply_chat_template(
@@ -1321,13 +1316,16 @@ class SelfReflectionGRPOTrainer:
             if has_image and "<image>" not in prompt_text:
                 prompt_text = "<image>\n" + prompt_text
             full_texts.append(full_text)
-            prompt_lens.append(
-                self.processor.tokenizer(prompt_text, return_tensors="pt")["input_ids"].shape[1]
-            )
-        full_lens = [
-            self.processor.tokenizer(ft, return_tensors="pt")["input_ids"].shape[1]
-            for ft in full_texts
-        ]
+            prompt_texts.append(prompt_text)
+        # Batch tokenize to avoid N sequential tokenizer calls
+        prompt_enc = self.processor.tokenizer(
+            prompt_texts, padding=False, return_attention_mask=False
+        )
+        prompt_lens = [len(ids) for ids in prompt_enc["input_ids"]]
+        full_enc = self.processor.tokenizer(
+            full_texts, padding=False, return_attention_mask=False
+        )
+        full_lens = [len(ids) for ids in full_enc["input_ids"]]
         return {
             "full_texts": full_texts,
             "prompt_lens": prompt_lens,
@@ -1406,6 +1404,96 @@ class SelfReflectionGRPOTrainer:
             )
 
         return log_probs_list
+
+    def _forward_from_pretokenized_multi(
+        self,
+        pretok_list: list[dict],
+        model: Any,
+        mb_start: int = 0,
+        mb_end: Optional[int] = None,
+    ) -> list[list[Any]]:
+        """Single forward pass for multiple pretokenized trajectory sets.
+
+        Concatenates sequences from all sets into one batch, runs one GPU
+        forward pass, then splits results back per set. Reduces forward-pass
+        count (and CLIP vision encoder invocations) by len(pretok_list)×
+        compared to calling _forward_from_pretokenized separately for each set.
+
+        Args:
+            pretok_list: List of pretok dicts from _preprocess_trajectory_texts.
+            model: Model to run the forward pass on.
+            mb_start: Mini-batch start index.
+            mb_end: Mini-batch end index (default: full slice for each set).
+
+        Returns:
+            List of len(pretok_list) lists, each containing scalar log-prob
+            tensors for the corresponding set's mini-batch slice.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        all_full_texts: list[str] = []
+        all_prompt_lens: list[int] = []
+        all_full_lens: list[int] = []
+        all_imgs: list[Any] = []
+        set_sizes: list[int] = []
+
+        for pretok in pretok_list:
+            _end = mb_end if mb_end is not None else len(pretok["full_texts"])
+            sl = slice(mb_start, _end)
+            texts = pretok["full_texts"][sl]
+            set_sizes.append(len(texts))
+            all_full_texts.extend(texts)
+            all_prompt_lens.extend(pretok["prompt_lens"][sl])
+            all_full_lens.extend(pretok["full_lens"][sl])
+            all_imgs.extend(pretok["images"][sl])
+
+        n = len(all_full_texts)
+        has_image = any(img is not None for img in all_imgs)
+
+        orig_side = self.processor.tokenizer.padding_side
+        self.processor.tokenizer.padding_side = "left"
+        try:
+            if has_image:
+                batch_inputs = self.processor(
+                    text=all_full_texts,
+                    images=all_imgs,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+            else:
+                batch_inputs = self.processor(
+                    text=all_full_texts,
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+        finally:
+            self.processor.tokenizer.padding_side = orig_side
+
+        outputs = model(**batch_inputs, use_cache=False)
+        logits = outputs.logits  # (n, padded_seq_len, vocab_size)
+        del outputs  # free non-logit activations early
+
+        total_len = batch_inputs["input_ids"].shape[1]
+        all_lps: list[Any] = []
+        for i in range(n):
+            pad_len = total_len - all_full_lens[i]
+            real_prompt_start = pad_len + all_prompt_lens[i]
+            shift_logits = logits[i, real_prompt_start - 1 : -1, :]
+            shift_labels = batch_inputs["input_ids"][i, real_prompt_start:]
+            shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            lp = F.log_softmax(shift_logits, dim=-1)
+            token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            all_lps.append(
+                token_lp.sum() if token_lp.numel() > 0 else torch.tensor(0.0, device=self.device)
+            )
+
+        result: list[list[Any]] = []
+        offset = 0
+        for size in set_sizes:
+            result.append(all_lps[offset : offset + size])
+            offset += size
+        return result
 
     def _compute_log_probs_batched(
         self,
