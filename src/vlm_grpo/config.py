@@ -395,6 +395,7 @@ class SelfReflectionConfig:
 
     Attributes:
         model_id: HuggingFace model identifier or local checkpoint path
+        model_type: Model family ("auto", "llava", "qwen2vl")
         dataset_path: Path to JSONL dataset
         val_dataset_path: Path to validation JSONL dataset
         image_base_dir: Base directory for resolving relative image paths
@@ -411,8 +412,12 @@ class SelfReflectionConfig:
         lora_r: LoRA rank
         lora_alpha: LoRA alpha
         lora_target_modules: Target modules for LoRA
-        kl_coeff: KL divergence coefficient for GRPO
+        kl_coeff: KL divergence coefficient for GRPO (0.0 disables KL)
         clip_range: Policy ratio clipping range
+        loss_type: GRPO loss variant ("grpo" or "dr_grpo")
+        freeze_vision_tower: Whether to freeze the vision encoder
+        max_pixels: Maximum total pixels per image (Qwen2.5-VL dynamic resolution)
+        min_pixels: Minimum total pixels per image (Qwen2.5-VL dynamic resolution)
         early_stopping: Early stopping configuration
         sanity_check_samples: Samples for sanity check mode (0=disabled)
         logging_steps: Steps between logging
@@ -422,6 +427,7 @@ class SelfReflectionConfig:
     """
 
     model_id: str = "llava-hf/llava-1.5-7b-hf"
+    model_type: str = "auto"
     dataset_path: str = ""
     val_dataset_path: str = ""
     image_base_dir: str = "/outputs/image_base"
@@ -442,6 +448,10 @@ class SelfReflectionConfig:
     )
     kl_coeff: float = 0.05
     clip_range: float = 0.2
+    loss_type: str = "grpo"
+    freeze_vision_tower: bool = False
+    max_pixels: int = 401408
+    min_pixels: int = 200704
     num_inner_epochs: int = 4
     inner_mini_batch_size: int = 8
     debug: bool = False

@@ -36,13 +36,21 @@ logger = logging.getLogger(__name__)
 MAX_IMAGE_DIM = 1024
 
 
-def load_image_safe(image_path: str) -> Optional[Image.Image]:
+def load_image_safe(
+    image_path: str,
+    max_pixels: Optional[int] = None,
+) -> Optional[Image.Image]:
     """Load image from path with error handling and RGB conversion.
 
-    Resizes images larger than MAX_IMAGE_DIM to save GPU memory.
+    Resizes images to save GPU memory using one of two strategies:
+    - max_pixels: resize based on total pixel count (for Qwen2.5-VL dynamic resolution)
+    - MAX_IMAGE_DIM: resize based on max dimension (legacy LLaVA behavior)
 
     Args:
         image_path: Absolute path to image file
+        max_pixels: Maximum total pixels (width * height). If provided,
+            uses pixel-count-based resizing. If None, falls back to
+            MAX_IMAGE_DIM dimension-based resizing.
 
     Returns:
         PIL Image in RGB mode, or None if loading failed
@@ -52,13 +60,23 @@ def load_image_safe(image_path: str) -> Optional[Image.Image]:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Resize if too large
         w, h = image.size
-        if max(w, h) > MAX_IMAGE_DIM:
-            scale = MAX_IMAGE_DIM / max(w, h)
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            image = image.resize((new_w, new_h), Image.LANCZOS)
+
+        if max_pixels is not None:
+            # Pixel-count-based resizing (Qwen2.5-VL style)
+            total_pixels = w * h
+            if total_pixels > max_pixels:
+                scale = (max_pixels / total_pixels) ** 0.5
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                image = image.resize((new_w, new_h), Image.LANCZOS)
+        else:
+            # Dimension-based resizing (LLaVA legacy)
+            if max(w, h) > MAX_IMAGE_DIM:
+                scale = MAX_IMAGE_DIM / max(w, h)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                image = image.resize((new_w, new_h), Image.LANCZOS)
 
         return image
     except Exception as e:
@@ -427,6 +445,7 @@ def load_self_reflection_dataset(
     dataset_path: str,
     image_base_dir: str = "/outputs/image_base",
     max_samples: int = 0,
+    max_pixels: Optional[int] = None,
 ) -> list[dict]:
     """Load dataset for full self-reflection GRPO training.
 
@@ -439,6 +458,8 @@ def load_self_reflection_dataset(
         dataset_path: Path to JSONL dataset
         image_base_dir: Base directory for resolving relative image paths
         max_samples: Maximum samples to load (0 = all)
+        max_pixels: Maximum total pixels per image for resizing. If None,
+            uses legacy MAX_IMAGE_DIM-based resizing.
 
     Returns:
         List of dicts with keys: question, image_path, ground_truth,

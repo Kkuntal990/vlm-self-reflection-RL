@@ -100,46 +100,66 @@ def build_critic_prompt(
     answer1: str,
     answer_type: str = "open",
     choices: str = "",
+    model_type: str = "llava",
 ) -> list[dict]:
-    """Build role-flipped critic prompt for feedback generation.
+    """Build critic prompt for feedback generation.
 
-    Matches the inference script's image-hoisting approach for LLaVA:
-        System: [image] + critic prompt  (image hoisted here)
-        Assistant: question              (role-flipped, text only)
-        User: answer1
+    For LLaVA: uses role-flipped image-hoisting approach where image is
+    placed in the system message because LLaVA's apply_chat_template
+    does not reliably preserve <image> in non-user roles.
 
-    During SFT training the image was in assistant content as a plain
-    ``<image>`` text token.  At inference/generation time LLaVA's
-    ``apply_chat_template`` does not reliably preserve ``<image>`` in
-    non-user roles, so the inference script hoists images to the system
-    message.  We follow the same approach here.
+    For Qwen2.5-VL: uses natural conversation structure where the critic
+    sees the image+question as user input and A1 as assistant response.
+    Qwen's processor handles images natively in any role.
 
     Args:
         question: The visual question (cleaned, no <image> tag)
         answer1: The initial answer to critique
         answer_type: Expected answer type (unused, kept for API compat)
         choices: Optional MCQ choices (unused, kept for API compat)
+        model_type: Model family ("llava" or "qwen2vl")
 
     Returns:
         List of message dicts in conversational format
     """
-    messages = [
-        {
-            "role": "system",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": FEEDBACK_CRITIC_SYSTEM_PROMPT},
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": question}],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": answer1}],
-        },
-    ]
+    if model_type == "qwen2vl":
+        # Qwen2.5-VL: natural conversation structure, no image hoisting
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": FEEDBACK_CRITIC_SYSTEM_PROMPT}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": question},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": answer1}],
+            },
+        ]
+    else:
+        # LLaVA: role-flipped with image hoisted to system message
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": FEEDBACK_CRITIC_SYSTEM_PROMPT},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": question}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": answer1}],
+            },
+        ]
 
     return messages
 

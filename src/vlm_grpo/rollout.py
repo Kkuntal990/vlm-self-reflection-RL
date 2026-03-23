@@ -154,6 +154,7 @@ class RolloutEngine:
         config: RolloutConfig,
         reward_weights: CriticRewardWeights,
         device: str = "cuda",
+        model_type: str = "llava",
     ) -> None:
         """Initialize the rollout engine.
 
@@ -163,12 +164,14 @@ class RolloutEngine:
             config: Rollout configuration
             reward_weights: Critic reward weights for scoring
             device: Device for generation
+            model_type: Model family ("llava" or "qwen2vl")
         """
         self.model = model
         self.processor = processor
         self.config = config
         self.reward_weights = reward_weights
         self.device = device
+        self.model_type = model_type
 
     def generate_critic_rollout(
         self,
@@ -303,15 +306,17 @@ class RolloutEngine:
             List of K feedback text strings
         """
 
-        messages = build_critic_prompt(question, answer1, answer_type, choices)
+        messages = build_critic_prompt(
+            question, answer1, answer_type, choices, model_type=self.model_type
+        )
 
         # Build input from messages using the processor
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
-        # Re-inject <image> if template stripped it from non-user roles
-        if image is not None and "<image>" not in text:
+        # Re-inject <image> if template stripped it from non-user roles (LLaVA only)
+        if self.model_type != "qwen2vl" and image is not None and "<image>" not in text:
             text = "<image>\n" + text
 
         if image is not None:
@@ -509,6 +514,7 @@ def _generate_completions(
     temperature: float,
     top_p: float,
     k: int,
+    model_type: str = "llava",
 ) -> list[str]:
     """Generate K completions for given messages.
 
@@ -522,16 +528,16 @@ def _generate_completions(
         temperature: Sampling temperature
         top_p: Top-p sampling
         k: Number of completions
+        model_type: Model family ("llava" or "qwen2vl")
 
     Returns:
         List of K text completions
     """
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    # apply_chat_template may strip <image> from non-user roles (e.g., the
-    # critic prompt puts <image> in assistant content).  Re-inject the token
-    # so the processor can map it to the provided PIL image.
-    if image is not None and "<image>" not in text:
+    # Re-inject <image> token for LLaVA when template strips it from
+    # non-user roles. Qwen2.5-VL handles images natively.
+    if model_type != "qwen2vl" and image is not None and "<image>" not in text:
         text = "<image>\n" + text
 
     if image is not None:
@@ -583,6 +589,7 @@ def _generate_batch_completions(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    model_type: str = "llava",
 ) -> list[str]:
     """Generate one completion per message sequence, batched in one generate call.
 
@@ -599,6 +606,7 @@ def _generate_batch_completions(
         max_new_tokens: Maximum tokens per generation
         temperature: Sampling temperature
         top_p: Top-p sampling
+        model_type: Model family ("llava" or "qwen2vl")
 
     Returns:
         List of N text completions, one per input sequence
@@ -609,7 +617,8 @@ def _generate_batch_completions(
         for msgs in messages_list
     ]
     has_image = any(img is not None for img in images)
-    if has_image:
+    # Re-inject <image> token for LLaVA only; Qwen handles images natively
+    if has_image and model_type != "qwen2vl":
         texts = ["<image>\n" + t if "<image>" not in t else t for t in texts]
 
     # Left-pad for batched autoregressive generation so real tokens sit at
@@ -662,6 +671,7 @@ def generate_self_reflection_rollout(
     response_weights: Any,
     feedback_weights: Any,
     device: str = "cuda",
+    model_type: str = "llava",
 ) -> list[SelfReflectionRolloutResult]:
     """Generate K full self-reflection trajectories per sample.
 
@@ -680,6 +690,7 @@ def generate_self_reflection_rollout(
         response_weights: ResponseRewardWeights for scoring A1+A2
         feedback_weights: FeedbackRewardWeights for scoring F1
         device: Device for generation
+        model_type: Model family ("llava" or "qwen2vl")
 
     Returns:
         List of SelfReflectionRolloutResult, one per sample
@@ -728,12 +739,13 @@ def generate_self_reflection_rollout(
                 max_new_tokens=config.a1_max_completion_length,
                 temperature=config.temperature,
                 top_p=config.top_p,
+                model_type=model_type,
             )
             all_a1s.extend(chunk_a1s)
 
             # Step 2: Generate F1 for each trajectory.
             f1_prompts = [
-                build_critic_prompt(chunk_qs[i], chunk_a1s[i * k + j])
+                build_critic_prompt(chunk_qs[i], chunk_a1s[i * k + j], model_type=model_type)
                 for i in range(chunk_size)
                 for j in range(k)
             ]
@@ -746,6 +758,7 @@ def generate_self_reflection_rollout(
                 max_new_tokens=config.f1_max_completion_length,
                 temperature=config.feedback_temperature,
                 top_p=config.top_p,
+                model_type=model_type,
             )
             all_f1s.extend(chunk_f1s)
 
@@ -764,6 +777,7 @@ def generate_self_reflection_rollout(
                 max_new_tokens=config.a2_max_completion_length,
                 temperature=config.a2_temperature,
                 top_p=config.top_p,
+                model_type=model_type,
             )
             all_a2s.extend(chunk_a2s)
 

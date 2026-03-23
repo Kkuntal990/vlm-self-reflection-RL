@@ -55,6 +55,13 @@ def parse_args() -> argparse.Namespace:
         default="llava-hf/llava-1.5-7b-hf",
         help="HuggingFace model ID or local checkpoint path",
     )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="auto",
+        choices=["auto", "llava", "qwen2vl"],
+        help="Model family: 'auto' (detect from model_id), 'llava', or 'qwen2vl'",
+    )
 
     # Dataset
     parser.add_argument(
@@ -132,6 +139,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
 
+    # Qwen2.5-VL specific
+    parser.add_argument(
+        "--freeze_vision_tower", action="store_true", help="Freeze vision encoder weights"
+    )
+    parser.add_argument("--max_pixels", type=int, default=401408, help="Max pixels per image")
+    parser.add_argument("--min_pixels", type=int, default=200704, help="Min pixels per image")
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="grpo",
+        choices=["grpo", "dr_grpo"],
+        help="GRPO loss variant: 'grpo' (vanilla) or 'dr_grpo' (removes length/difficulty bias)",
+    )
+
     # Response reward weights
     parser.add_argument("--w_a1_correctness", type=float, default=0.5)
     parser.add_argument("--w_a2_correctness", type=float, default=1.0)
@@ -182,6 +203,16 @@ def main() -> None:
     if not accelerator.is_main_process:
         logging.getLogger().setLevel(logging.WARNING)
 
+    # Auto-detect model type from model_id if set to "auto"
+    model_type = args.model_type
+    if model_type == "auto":
+        model_id_lower = args.model_id.lower()
+        if "qwen" in model_id_lower:
+            model_type = "qwen2vl"
+        else:
+            model_type = "llava"
+        logger.info(f"Auto-detected model_type: {model_type}")
+
     # Build configs
     from vlm_grpo.config import (
         FeedbackRewardWeights,
@@ -215,6 +246,7 @@ def main() -> None:
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
+        model_type=model_type,
         dataset_path=args.dataset_path,
         val_dataset_path=args.val_dataset_path,
         image_base_dir=args.image_base_dir,
@@ -232,6 +264,10 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         kl_coeff=args.kl_coeff,
         clip_range=args.clip_range,
+        loss_type=args.loss_type,
+        freeze_vision_tower=args.freeze_vision_tower,
+        max_pixels=args.max_pixels,
+        min_pixels=args.min_pixels,
         num_inner_epochs=args.num_inner_epochs,
         debug=args.debug,
         sanity_check_samples=args.sanity_check_samples,
@@ -255,10 +291,13 @@ def main() -> None:
         requested_indices = None
         load_limit = args.sanity_check_samples or args.max_samples
 
+    # Pass max_pixels for Qwen2.5-VL pixel-count-based image resizing
+    img_max_pixels = args.max_pixels if model_type == "qwen2vl" else None
     train_dataset = load_self_reflection_dataset(
         args.dataset_path,
         image_base_dir=args.image_base_dir,
         max_samples=load_limit,
+        max_pixels=img_max_pixels,
     )
 
     # Filter to requested indices
@@ -276,6 +315,7 @@ def main() -> None:
             args.val_dataset_path,
             image_base_dir=args.image_base_dir,
             max_samples=min(500, args.sanity_check_samples or 500),
+            max_pixels=img_max_pixels,
         )
         logger.info(f"Validation dataset: {len(val_dataset)} samples")
 
@@ -286,20 +326,48 @@ def main() -> None:
         return
 
     # Load model + ref model
-    logger.info(f"Loading model: {args.model_id}")
+    logger.info(f"Loading model: {args.model_id} (type={model_type})")
 
     import torch
-    from transformers import AutoModelForVision2Seq, AutoProcessor
+    from transformers import AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(args.model_id)
+    # Load processor with pixel constraints for Qwen2.5-VL
+    if model_type == "qwen2vl":
+        processor = AutoProcessor.from_pretrained(
+            args.model_id,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+        )
+    else:
+        processor = AutoProcessor.from_pretrained(args.model_id)
 
     # Load policy model (ref model not needed — PEFT adapter disable gives base weights)
     logger.info("Loading policy model...")
-    model = AutoModelForVision2Seq.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    ).to(accelerator.device)
+    if model_type == "qwen2vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        ).to(accelerator.device)
+    else:
+        from transformers import AutoModelForVision2Seq
+
+        model = AutoModelForVision2Seq.from_pretrained(
+            args.model_id,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+        ).to(accelerator.device)
+
+    # Freeze vision tower if requested (saves memory, preserves visual features)
+    if args.freeze_vision_tower:
+        frozen_count = 0
+        for name, param in model.named_parameters():
+            if "visual" in name:
+                param.requires_grad = False
+                frozen_count += 1
+        logger.info(f"Froze {frozen_count} vision tower parameters")
 
     # Enable gradient checkpointing to reduce activation memory
     model.gradient_checkpointing_enable()
@@ -309,10 +377,17 @@ def main() -> None:
     if not args.no_peft:
         from peft import LoraConfig, get_peft_model
 
+        # Qwen2.5-VL: use all-linear targets (PEFT auto-excludes frozen params)
+        # LLaVA: use explicit target modules
+        if model_type == "qwen2vl":
+            target_modules = "all-linear"
+        else:
+            target_modules = config.lora_target_modules
+
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            target_modules=config.lora_target_modules,
+            target_modules=target_modules,
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, lora_config)

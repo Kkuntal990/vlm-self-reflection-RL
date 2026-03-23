@@ -308,7 +308,10 @@ class CriticGRPOTrainer:
 
         # Step 3: Group-relative advantage normalization
         rewards_tensor = torch.tensor(all_rewards, device=self.device)
-        advantages = self._compute_group_advantages(rewards_tensor, self.config.rollout.k_samples)
+        loss_type = getattr(self.config, "loss_type", "grpo")
+        advantages = self._compute_group_advantages(
+            rewards_tensor, self.config.rollout.k_samples, loss_type=loss_type
+        )
 
         # Step 4: Compute GRPO loss
         log_probs = torch.stack(all_log_probs)
@@ -432,6 +435,7 @@ class CriticGRPOTrainer:
         self,
         rewards: Any,
         k: int,
+        loss_type: str = "grpo",
     ) -> Any:
         """Compute group-relative advantages for GRPO.
 
@@ -440,6 +444,9 @@ class CriticGRPOTrainer:
         Args:
             rewards: Tensor of all rewards (shape: [N * K])
             k: Group size
+            loss_type: GRPO variant. "grpo" uses std normalization,
+                "dr_grpo" uses only mean subtraction (removes length
+                and difficulty bias per arXiv:2503.20783).
 
         Returns:
             Tensor of advantages (same shape as rewards)
@@ -455,11 +462,16 @@ class CriticGRPOTrainer:
             group = rewards[start:end]
 
             mean = group.mean()
-            std = group.std()
-            if std > 0:
-                advantages[start:end] = (group - mean) / (std + 1e-8)
+            if loss_type == "dr_grpo":
+                # Dr. GRPO: no std normalization (removes difficulty bias)
+                advantages[start:end] = group - mean
             else:
-                advantages[start:end] = 0.0
+                # Vanilla GRPO: normalize by std
+                std = group.std()
+                if std > 0:
+                    advantages[start:end] = (group - mean) / (std + 1e-8)
+                else:
+                    advantages[start:end] = 0.0
 
         # Handle remaining samples (if not divisible by k)
         remaining = len(rewards) - n_groups * k
@@ -467,9 +479,12 @@ class CriticGRPOTrainer:
             start = n_groups * k
             group = rewards[start:]
             mean = group.mean()
-            std = group.std()
-            if std > 0:
-                advantages[start:] = (group - mean) / (std + 1e-8)
+            if loss_type == "dr_grpo":
+                advantages[start:] = group - mean
+            else:
+                std = group.std()
+                if std > 0:
+                    advantages[start:] = (group - mean) / (std + 1e-8)
 
         return advantages
 
@@ -831,6 +846,7 @@ class SelfReflectionGRPOTrainer:
         if had_grad_ckpt:
             gen_model.gradient_checkpointing_disable()
 
+        model_type = getattr(self.config, "model_type", "llava")
         rollout_results = generate_self_reflection_rollout(
             model=gen_model,
             processor=self.processor,
@@ -839,6 +855,7 @@ class SelfReflectionGRPOTrainer:
             response_weights=self.config.response_weights,
             feedback_weights=self.config.feedback_weights,
             device=str(self.device),
+            model_type=model_type,
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
 
@@ -897,7 +914,7 @@ class SelfReflectionGRPOTrainer:
                 a1_prompt = build_initial_answer_prompt(result.question)
                 a1_full = build_prompt_with_completion(a1_prompt, a1)
 
-                f1_prompt = build_critic_prompt(result.question, a1)
+                f1_prompt = build_critic_prompt(result.question, a1, model_type=model_type)
                 f1_full = build_prompt_with_completion(f1_prompt, f1)
 
                 a2_prompt = build_refiner_prompt(result.question, a1, f1)
@@ -925,8 +942,9 @@ class SelfReflectionGRPOTrainer:
         # Step 3: Group-relative advantages (computed once, frozen)
         resp_rewards_t = torch.tensor(all_resp_rewards, device=self.device)
         fb_rewards_t = torch.tensor(all_fb_rewards, device=self.device)
-        resp_advantages = self._compute_group_advantages(resp_rewards_t, k)
-        fb_advantages = self._compute_group_advantages(fb_rewards_t, k)
+        loss_type = getattr(self.config, "loss_type", "grpo")
+        resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
+        fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
 
         # Step 4: Pre-tokenize once, then compute old/ref log-probs in mini-batches.
         #
@@ -968,33 +986,40 @@ class SelfReflectionGRPOTrainer:
                 old_a2_lps_list += a2_lps
                 old_fb_lps_list += fb_lps
 
-            # Ref log-probs: disable LoRA adapter or use separate ref_model
-            if self.ref_model is None:
-                unwrapped_model.disable_adapter_layers()
-                ref_m = unwrapped_model
-            else:
-                ref_m = self.ref_model
+            # Ref log-probs: only needed when kl_coeff > 0
+            if self.config.kl_coeff > 0:
+                if self.ref_model is None:
+                    unwrapped_model.disable_adapter_layers()
+                    ref_m = unwrapped_model
+                else:
+                    ref_m = self.ref_model
 
-            for mb_s in range(0, n_traj, inner_mini_bs):
-                mb_e = min(mb_s + inner_mini_bs, n_traj)
-                a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
-                    [a1_pretok, a2_pretok, f1_pretok], ref_m, mb_s, mb_e
-                )
-                ref_a1_lps_list += a1_lps
-                ref_a2_lps_list += a2_lps
-                ref_fb_lps_list += fb_lps
+                for mb_s in range(0, n_traj, inner_mini_bs):
+                    mb_e = min(mb_s + inner_mini_bs, n_traj)
+                    a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
+                        [a1_pretok, a2_pretok, f1_pretok], ref_m, mb_s, mb_e
+                    )
+                    ref_a1_lps_list += a1_lps
+                    ref_a2_lps_list += a2_lps
+                    ref_fb_lps_list += fb_lps
 
-            if self.ref_model is None:
-                unwrapped_model.enable_adapter_layers()
+                if self.ref_model is None:
+                    unwrapped_model.enable_adapter_layers()
 
             old_resp_lps = torch.stack(
                 [a1 + a2 for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)]
             )
             old_fb_lps = torch.stack(old_fb_lps_list)
-            ref_resp_lps = torch.stack(
-                [a1 + a2 for a1, a2 in zip(ref_a1_lps_list, ref_a2_lps_list)]
-            )
-            ref_fb_lps = torch.stack(ref_fb_lps_list)
+
+            if self.config.kl_coeff > 0:
+                ref_resp_lps = torch.stack(
+                    [a1 + a2 for a1, a2 in zip(ref_a1_lps_list, ref_a2_lps_list)]
+                )
+                ref_fb_lps = torch.stack(ref_fb_lps_list)
+            else:
+                # Dummy tensors when KL is disabled (not used in loss computation)
+                ref_resp_lps = torch.zeros_like(old_resp_lps)
+                ref_fb_lps = torch.zeros_like(old_fb_lps)
 
         # No explicit cache clear — PyTorch reuses memory automatically.
 
@@ -1076,11 +1101,15 @@ class SelfReflectionGRPOTrainer:
                     traj_fb_loss = -torch.min(fb_surr1, fb_surr2)
 
                     # KL loss (TRL approximation): always ≥ 0, exponent clamped
-                    resp_kl_delta = torch.clamp(resp_kl_raw, min=-20.0, max=20.0)
-                    resp_kl = torch.exp(resp_kl_delta) - resp_kl_delta - 1
-                    fb_kl_delta = torch.clamp(fb_kl_raw, min=-20.0, max=20.0)
-                    fb_kl = torch.exp(fb_kl_delta) - fb_kl_delta - 1
-                    traj_kl_loss = self.config.kl_coeff * (resp_kl + fb_kl) / 2.0
+                    # Skip KL computation entirely when kl_coeff=0 (Dr. GRPO default)
+                    if self.config.kl_coeff > 0:
+                        resp_kl_delta = torch.clamp(resp_kl_raw, min=-20.0, max=20.0)
+                        resp_kl = torch.exp(resp_kl_delta) - resp_kl_delta - 1
+                        fb_kl_delta = torch.clamp(fb_kl_raw, min=-20.0, max=20.0)
+                        fb_kl = torch.exp(fb_kl_delta) - fb_kl_delta - 1
+                        traj_kl_loss = self.config.kl_coeff * (resp_kl + fb_kl) / 2.0
+                    else:
+                        traj_kl_loss = torch.tensor(0.0, device=resp_lp.device)
 
                     traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
                     mb_loss = traj_loss if mb_loss is None else mb_loss + traj_loss
@@ -1180,6 +1209,7 @@ class SelfReflectionGRPOTrainer:
         if had_grad_ckpt:
             gen_model.gradient_checkpointing_disable()
 
+        model_type = getattr(self.config, "model_type", "llava")
         with torch.no_grad():
             rollout_results = generate_self_reflection_rollout(
                 model=gen_model,
@@ -1189,6 +1219,7 @@ class SelfReflectionGRPOTrainer:
                 response_weights=self.config.response_weights,
                 feedback_weights=self.config.feedback_weights,
                 device=str(self.device),
+                model_type=model_type,
             )
 
         if had_grad_ckpt:
@@ -1322,9 +1353,7 @@ class SelfReflectionGRPOTrainer:
             prompt_texts, padding=False, return_attention_mask=False
         )
         prompt_lens = [len(ids) for ids in prompt_enc["input_ids"]]
-        full_enc = self.processor.tokenizer(
-            full_texts, padding=False, return_attention_mask=False
-        )
+        full_enc = self.processor.tokenizer(full_texts, padding=False, return_attention_mask=False)
         full_lens = [len(ids) for ids in full_enc["input_ids"]]
         return {
             "full_texts": full_texts,
@@ -1590,6 +1619,7 @@ class SelfReflectionGRPOTrainer:
         self,
         rewards: Any,
         k: int,
+        loss_type: str = "grpo",
     ) -> Any:
         """Compute group-relative advantages for GRPO.
 
@@ -1598,6 +1628,9 @@ class SelfReflectionGRPOTrainer:
         Args:
             rewards: Tensor of all rewards (shape: [N * K])
             k: Group size
+            loss_type: GRPO variant. "grpo" uses std normalization,
+                "dr_grpo" uses only mean subtraction (removes length
+                and difficulty bias per arXiv:2503.20783).
 
         Returns:
             Tensor of advantages (same shape as rewards)
@@ -1613,11 +1646,14 @@ class SelfReflectionGRPOTrainer:
             group = rewards[start:end]
 
             mean = group.mean()
-            std = group.std()
-            if std > 0:
-                advantages[start:end] = (group - mean) / (std + 1e-8)
+            if loss_type == "dr_grpo":
+                advantages[start:end] = group - mean
             else:
-                advantages[start:end] = 0.0
+                std = group.std()
+                if std > 0:
+                    advantages[start:end] = (group - mean) / (std + 1e-8)
+                else:
+                    advantages[start:end] = 0.0
 
         # Handle remaining samples
         remaining = len(rewards) - n_groups * k
@@ -1625,9 +1661,12 @@ class SelfReflectionGRPOTrainer:
             start = n_groups * k
             group = rewards[start:]
             mean = group.mean()
-            std = group.std()
-            if std > 0:
-                advantages[start:] = (group - mean) / (std + 1e-8)
+            if loss_type == "dr_grpo":
+                advantages[start:] = group - mean
+            else:
+                std = group.std()
+                if std > 0:
+                    advantages[start:] = (group - mean) / (std + 1e-8)
 
         return advantages
 

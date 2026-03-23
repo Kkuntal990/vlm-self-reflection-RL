@@ -790,15 +790,22 @@ def _verify_open_ended(
         )
 
     # Stage 3: Token-set F1
-    token_f1 = _compute_token_f1(extracted, ground_truth)
-    if token_f1 >= _TOKEN_F1_THRESHOLD:
-        return MatchResult(
-            answer_type=answer_type,
-            parse_ok=True,
-            verdict=CORRECT,
-            extracted=extracted,
-            score=token_f1,
-        )
+    # Restrict to short answers (≤4 words each). On sentence-level outputs,
+    # token-F1 is too permissive — sentences like "The vegetable to the left
+    # of the napkin is corn" vs "...is carrot" share 9/10 tokens and pass
+    # the threshold despite having a completely wrong key noun.
+    pred_words = len(_normalize_text(extracted).split())
+    gt_words = len(_normalize_text(ground_truth).split())
+    if pred_words <= 4 and gt_words <= 4:
+        token_f1 = _compute_token_f1(extracted, ground_truth)
+        if token_f1 >= _TOKEN_F1_THRESHOLD:
+            return MatchResult(
+                answer_type=answer_type,
+                parse_ok=True,
+                verdict=CORRECT,
+                extracted=extracted,
+                score=token_f1,
+            )
 
     # Stage 4: ANLS (1.0 - normalized_edit_distance)
     # Restrict to short atomic answers. On sentence-level outputs ANLS is too

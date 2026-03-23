@@ -51,7 +51,8 @@ _score_cache: dict[tuple[str, str], float] = {}
 
 _JUDGE_PROMPT = """You are an answer equivalence judge for visual question answering.
 
-Two answers should be considered equivalent if they express the same meaning even if wording is different.
+Two answers should be considered equivalent if they express the same meaning \
+even if wording is different.
 
 Examples of equivalent answers (score 10):
 - "3" and "three"
@@ -224,9 +225,12 @@ def llm_judge_score_batch(pairs: list[tuple[str, str]]) -> list[float]:
 
         texts = [
             tokenizer.apply_chat_template(
-                [{"role": "user", "content": _JUDGE_PROMPT.format(
-                    ground_truth=gt, predicted=pred
-                )}],
+                [
+                    {
+                        "role": "user",
+                        "content": _JUDGE_PROMPT.format(ground_truth=gt, predicted=pred),
+                    }
+                ],
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -256,3 +260,106 @@ def llm_judge_score_batch(pairs: list[tuple[str, str]]) -> list[float]:
 
     # Fill in all results from cache (now fully populated)
     return [_score_cache[k] for k in keys]
+
+
+# =============================================================================
+# LLM Format Judge
+# =============================================================================
+
+_FORMAT_JUDGE_PROMPT = """\
+You are a format compliance judge for visual question answering.
+
+Your task: Determine whether the predicted answer has the \
+SAME FORMAT as the ground truth answer. \
+You are NOT judging correctness — only format similarity.
+
+Format means:
+- Same structural type (single letter, letter with text, \
+yes/no, number, short phrase, full sentence)
+- Similar length (within 2x token count)
+
+Examples of MATCHING format (score 10):
+- GT: "B. 24" Pred: "C. 18" (both letter-dot-number)
+- GT: "B. Yes" Pred: "A. No" (both letter-dot-word)
+- GT: "B" Pred: "C" (both single letters)
+- GT: "The fence is in front" Pred: "The cat is behind" (both sentences)
+- GT: "15" Pred: "36" (both single numbers)
+- GT: "red" Pred: "blue" (both single words)
+- GT: "Yes" Pred: "No" (both single yes/no)
+
+Examples of NON-MATCHING format (score 0):
+- GT: "B" Pred: "The answer is B because..." (letter vs explanation)
+- GT: "Yes" Pred: "I think it might be correct..." (word vs verbose)
+- GT: "3" Pred: "There are approximately three items" (number vs sentence)
+- GT: "red" Pred: "The dominant color appears to be red" (word vs sentence)
+
+Rate format similarity on a scale of 0-10:
+- 10: Identical format
+- 7-9: Very similar format (minor differences in length)
+- 4-6: Somewhat similar
+- 0-3: Different format (e.g., single token vs multi-sentence)
+
+Ground Truth: {ground_truth}
+Predicted Answer: {predicted}
+
+Respond with only a single integer from 0 to 10."""
+
+# Separate cache for format judgments (keyed by pred, gt, answer_type)
+_format_cache: dict[tuple[str, str, str], float] = {}
+
+
+def llm_format_judge(
+    predicted: str,
+    ground_truth: str,
+    answer_type: str,
+) -> float:
+    """Judge whether predicted answer has the same format as ground truth.
+
+    Uses the Qwen2.5-3B-Instruct model to evaluate format similarity,
+    NOT semantic correctness. Results are cached.
+
+    Args:
+        predicted: Predicted answer text
+        ground_truth: Ground truth answer text
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open")
+
+    Returns:
+        Format similarity score in [0.0, 1.0] where 1.0 = identical format
+    """
+    import torch
+
+    key = (predicted.strip(), ground_truth.strip(), answer_type)
+    if key in _format_cache:
+        return _format_cache[key]
+
+    model, tokenizer = _get_judge_model()
+
+    prompt = _FORMAT_JUDGE_PROMPT.format(
+        ground_truth=key[1],
+        predicted=key[0],
+    )
+
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=10,
+            do_sample=False,
+        )
+
+    generated = tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    ).strip()
+
+    score = _parse_score(generated)
+    _format_cache[key] = score
+    return score

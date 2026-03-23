@@ -4,6 +4,10 @@
 from vlm_grpo.rewards.composition import (
     CriticRewardWeights,
     RefinerRewardWeights,
+    _compute_refiner_format_reward,
+    _contains_cjk,
+    _count_content_units,
+    compute_critic_format_reward,
     compute_critic_reward_breakdown,
     compute_refiner_reward_breakdown,
     get_refiner_reward_functions,
@@ -256,6 +260,7 @@ class TestRefinerTRLFunctions:
             completions=["A", "B", ""],
             answer_type=["mcq", "mcq", "mcq"],
             choices=["", "", ""],
+            ground_truth=["A", "B", "A"],
         )
         assert len(rewards) == 3
         assert rewards[0] == 0.0  # Valid MCQ (penalty-only: 0.0 = compliant)
@@ -313,3 +318,149 @@ class TestRefinerTRLFunctions:
             answer_type=None,
         )
         assert len(rewards) == 1
+
+
+# =============================================================================
+# CJK Helper Functions
+# =============================================================================
+
+
+class TestCJKHelpers:
+    """Tests for CJK detection and content unit counting."""
+
+    def test_contains_cjk_chinese(self) -> None:
+        assert _contains_cjk("这是中文") is True
+
+    def test_contains_cjk_english(self) -> None:
+        assert _contains_cjk("This is English") is False
+
+    def test_contains_cjk_mixed(self) -> None:
+        assert _contains_cjk("Answer is 正确") is True
+
+    def test_contains_cjk_empty(self) -> None:
+        assert _contains_cjk("") is False
+
+    def test_count_english(self) -> None:
+        assert _count_content_units("The answer is correct") == 4
+
+    def test_count_chinese(self) -> None:
+        # 6 CJK characters: 答案是正确的
+        assert _count_content_units("答案是正确的") == 6
+
+    def test_count_mixed(self) -> None:
+        # "Answer" + "is" (2 words) + 正确 (2 chars) = 4
+        assert _count_content_units("Answer is 正确") == 4
+
+    def test_count_empty(self) -> None:
+        assert _count_content_units("") == 0
+
+    def test_count_chinese_long_sentence(self) -> None:
+        # Real Chinese feedback: many chars → large count
+        feedback = "你的回答是24，但这个答案是错误的"
+        count = _count_content_units(feedback)
+        assert count >= 10  # Should be well above 5-word threshold
+
+
+# =============================================================================
+# Critic Format CJK
+# =============================================================================
+
+
+class TestCriticFormatCJK:
+    """Tests for CJK support in critic format reward."""
+
+    def test_chinese_substantive_feedback(self) -> None:
+        """Chinese feedback with many characters should get +1.0."""
+        feedback = "答案是正确的，与图像匹配。"
+        assert compute_critic_format_reward(feedback) == 1.0
+
+    def test_chinese_with_stance_keyword(self) -> None:
+        """Chinese feedback with stance keyword should get +1.0."""
+        feedback = "答案正确"  # 4 chars with 正确
+        assert compute_critic_format_reward(feedback) == 1.0
+
+    def test_chinese_short_no_stance(self) -> None:
+        """Very short Chinese without stance should get -2.0."""
+        feedback = "好"  # 1 char
+        assert compute_critic_format_reward(feedback) == -2.0
+
+    def test_chinese_medium_no_stance(self) -> None:
+        """3-4 Chinese chars without stance keyword should get -1.0."""
+        feedback = "还可以吧"  # 4 chars, no stance keyword
+        assert compute_critic_format_reward(feedback) == -1.0
+
+    def test_english_unchanged(self) -> None:
+        """English feedback still works correctly."""
+        assert compute_critic_format_reward("Answer is correct.") == 1.0
+        assert compute_critic_format_reward("OK") == -2.0
+        assert compute_critic_format_reward("Maybe try again.") == -1.0
+
+    def test_real_chinese_feedback(self) -> None:
+        """Real Chinese feedback from training logs should get +1.0."""
+        feedback = (
+            "你的回答是24，但这个答案是错误的。你需要考虑PA=12这个信息，"
+            "因为这个长度给了我们一个比例关系。"
+        )
+        assert compute_critic_format_reward(feedback) == 1.0
+
+
+# =============================================================================
+# Refiner Format LLM Fallback
+# =============================================================================
+
+
+class TestRefinerFormatFallback:
+    """Tests for refiner format reward with LLM fallback paths."""
+
+    def test_mcq_single_letter_passes(self) -> None:
+        """Single letter passes deterministic check, no LLM needed."""
+        assert _compute_refiner_format_reward("A", "mcq") == 0.0
+        assert _compute_refiner_format_reward("B", "mcq", "B. 24") == 0.0
+
+    def test_mcq_letter_dot_text_fails_without_gt(self) -> None:
+        """'B. 24' fails without ground_truth (no fallback possible)."""
+        assert _compute_refiner_format_reward("B. 24", "mcq") == -1.0
+
+    def test_mcq_letter_dot_text_fails_without_llm(self) -> None:
+        """'B. 24' with GT but LLM disabled still fails."""
+        import os
+
+        os.environ.pop("VLM_USE_LLM_JUDGE", None)
+        assert _compute_refiner_format_reward("B. 24", "mcq", "B. 24") == -1.0
+
+    def test_yesno_standard_passes(self) -> None:
+        """Standard yes/no passes deterministic check."""
+        assert _compute_refiner_format_reward("Yes", "yesno") == 0.0
+        assert _compute_refiner_format_reward("no", "yesno") == 0.0
+
+    def test_yesno_sentence_fails_without_gt(self) -> None:
+        """Sentence answer fails yesno without ground_truth."""
+        assert _compute_refiner_format_reward("The fence is in front", "yesno") == -1.0
+
+    def test_yesno_sentence_fails_without_llm(self) -> None:
+        """Sentence with GT but LLM disabled still fails."""
+        import os
+
+        os.environ.pop("VLM_USE_LLM_JUDGE", None)
+        assert (
+            _compute_refiner_format_reward(
+                "The fence is in front",
+                "yesno",
+                "The fence is in front of the boy.",
+            )
+            == -1.0
+        )
+
+    def test_empty_always_fails(self) -> None:
+        """Empty answer always gets -1.0 regardless of GT."""
+        assert _compute_refiner_format_reward("", "mcq", "B") == -1.0
+        assert _compute_refiner_format_reward("", "yesno", "Yes") == -1.0
+
+    def test_numeric_no_fallback(self) -> None:
+        """Numeric format has no LLM fallback — deterministic only."""
+        assert _compute_refiner_format_reward("42", "numeric") == 0.0
+        assert _compute_refiner_format_reward("not a number", "numeric") == -1.0
+
+    def test_open_always_passes(self) -> None:
+        """Open format passes for any non-empty text."""
+        assert _compute_refiner_format_reward("anything", "open") == 0.0

@@ -14,8 +14,6 @@ Usage:
 
 import re
 
-from vlm_grpo.trajectory import normalize_answer
-
 # Feedback calibration keyword patterns
 _POSITIVE_FEEDBACK_PATTERNS = [
     re.compile(p, re.IGNORECASE)

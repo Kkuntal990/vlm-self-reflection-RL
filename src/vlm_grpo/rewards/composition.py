@@ -187,6 +187,59 @@ class RefinerRewardBreakdown:
 # Critic Format Reward
 # =============================================================================
 
+# CJK character detection for proper word counting in Chinese/Japanese/Korean
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _contains_cjk(text: str) -> bool:
+    """Check if text contains CJK characters.
+
+    Args:
+        text: Input text string
+
+    Returns:
+        True if any CJK characters are found
+    """
+    return bool(_CJK_CHAR_RE.search(text))
+
+
+def _count_content_units(text: str) -> int:
+    """Count content units: CJK characters + whitespace-delimited non-CJK tokens.
+
+    For pure English text, behaves like len(text.split()).
+    For CJK text, each CJK character counts as one unit (≈ one word).
+    For mixed text, combines both counts.
+
+    Args:
+        text: Input text string
+
+    Returns:
+        Content unit count
+    """
+    if not _contains_cjk(text):
+        return len(text.split())
+
+    count = 0
+    non_cjk_buf: list[str] = []
+    for ch in text:
+        if _CJK_CHAR_RE.match(ch):
+            if non_cjk_buf:
+                token = "".join(non_cjk_buf).strip()
+                if token:
+                    count += len(token.split())
+                non_cjk_buf = []
+            count += 1
+        else:
+            non_cjk_buf.append(ch)
+
+    if non_cjk_buf:
+        token = "".join(non_cjk_buf).strip()
+        if token:
+            count += len(token.split())
+
+    return count
+
+
 # Stance keywords: feedback must take a position on A1's correctness
 _CRITIC_FORMAT_STANCE_KEYWORDS: list[re.Pattern] = [
     re.compile(p, re.IGNORECASE)
@@ -198,6 +251,17 @@ _CRITIC_FORMAT_STANCE_KEYWORDS: list[re.Pattern] = [
         r"\bincorrect\b",
         r"\baccurate\b",
     ]
+] + [
+    # Chinese stance keywords (no word boundaries needed for CJK)
+    re.compile(p)
+    for p in [
+        r"正确",
+        r"错误",
+        r"不正确",
+        r"准确",
+        r"应该",
+        r"修改",
+    ]
 ]
 
 
@@ -205,9 +269,11 @@ def compute_critic_format_reward(feedback_text: str) -> float:
     """R_format for critic: validate feedback format with stance detection.
 
     Three-tier scoring:
-        Empty or <3 words            → -2.0  (heavy penalty for safe empty)
-        3-4 words, no stance keyword → -1.0  (weak/vague feedback)
-        >=5 words OR stance keyword  → +1.0  (substantive feedback)
+        Empty or <3 units            → -2.0  (heavy penalty for safe empty)
+        3-4 units, no stance keyword → -1.0  (weak/vague feedback)
+        >=5 units OR stance keyword  → +1.0  (substantive feedback)
+
+    For CJK text, each character counts as one unit (≈ one word).
 
     Args:
         feedback_text: Feedback text from the critic
@@ -219,7 +285,7 @@ def compute_critic_format_reward(feedback_text: str) -> float:
     if not stripped:
         return -2.0
 
-    word_count = len(stripped.split())
+    word_count = _count_content_units(stripped)
     if word_count < 3:
         return -2.0
 
@@ -340,8 +406,8 @@ def compute_refiner_reward_breakdown(
     Returns:
         RefinerRewardBreakdown with all component scores
     """
-    # Format reward (normalize-first, penalty-only)
-    r_format = _compute_refiner_format_reward(a2_text, answer_type)
+    # Format reward (normalize-first, penalty-only, LLM fallback)
+    r_format = _compute_refiner_format_reward(a2_text, answer_type, ground_truth)
     format_valid = r_format >= 0
 
     # Extract A2 for correctness (liberal extraction, separate from format)
@@ -423,27 +489,70 @@ def _extract_a2_text(completion: Any) -> str:
     return str(completion)
 
 
+# Threshold for LLM format fallback (0-1 scale, 0.7 = score 7/10)
+_LLM_FORMAT_THRESHOLD: float = 0.7
+
+
+def _llm_format_fallback(
+    a2_text: str,
+    ground_truth: str,
+    answer_type: str,
+) -> float:
+    """LLM fallback for format check when deterministic check fails.
+
+    Only invoked when ground_truth is available and LLM judge is enabled.
+
+    Args:
+        a2_text: Raw A2 text
+        ground_truth: Ground truth answer
+        answer_type: Answer type string
+
+    Returns:
+        0.0 if LLM says format matches, -1.0 otherwise
+    """
+    if not ground_truth:
+        return -1.0
+
+    try:
+        from vlm_grpo.rewards.judge_llm import is_enabled, llm_format_judge
+
+        if not is_enabled():
+            return -1.0
+
+        score = llm_format_judge(a2_text.strip(), ground_truth, answer_type)
+        if score >= _LLM_FORMAT_THRESHOLD:
+            return 0.0
+        return -1.0
+    except Exception as e:
+        logger.warning(f"LLM format fallback failed: {e}")
+        return -1.0
+
+
 def _compute_refiner_format_reward(
     a2_text: str,
     answer_type: str,
+    ground_truth: str = "",
 ) -> float:
     """R_format for refiner: normalize-first, penalty-only format check.
 
     Pipeline:
         1. normalize_answer(a2_text) → strip, lowercase, remove trailing
            punctuation, unwrap parens
-        2. Type-specific format check on normalized answer:
+        2. Type-specific deterministic format check on normalized answer:
            - MCQ: single letter a-f
            - YesNo: "yes" or "no"
            - Numeric: parseable number (int, float, fraction, percentage)
            - Open: any non-empty text
+        3. LLM fallback: if deterministic check fails for MCQ/YesNo and
+           ground_truth is available and LLM judge is enabled, ask LLM
+           whether predicted answer has the same format as GT.
 
     Penalty-only: 0.0 when compliant, -1.0 when not.
-    Does NOT use liberal extraction — "The answer is B" fails MCQ format.
 
     Args:
         a2_text: Raw A2 text from the refiner
         answer_type: Expected answer type
+        ground_truth: Ground truth answer (for LLM format fallback)
 
     Returns:
         0.0 if format-compliant, -1.0 if not
@@ -455,10 +564,10 @@ def _compute_refiner_format_reward(
 
     if answer_type == "mcq":
         if len(normalized) != 1 or normalized not in "abcdef":
-            return -1.0
+            return _llm_format_fallback(a2_text, ground_truth, answer_type)
     elif answer_type == "yesno":
         if normalized not in ("yes", "no"):
-            return -1.0
+            return _llm_format_fallback(a2_text, ground_truth, answer_type)
     elif answer_type == "numeric":
         num_text = normalized.replace(",", "")
         if "/" in num_text:
@@ -484,6 +593,7 @@ def refiner_format_reward_fn(
     completions: list,
     answer_type: list[str] | None = None,
     choices: list[str] | None = None,
+    ground_truth: list[str] | None = None,
     **kwargs: Any,
 ) -> list[float]:
     """TRL-compatible format reward for refiner A2 completions.
@@ -492,6 +602,7 @@ def refiner_format_reward_fn(
         completions: List of K completions from GRPOTrainer
         answer_type: List of answer types (from dataset columns)
         choices: List of MCQ choices (from dataset columns)
+        ground_truth: List of ground truths (for LLM format fallback)
         **kwargs: Additional dataset columns (ignored)
 
     Returns:
@@ -500,8 +611,9 @@ def refiner_format_reward_fn(
     rewards = []
     for i, comp in enumerate(completions):
         at = answer_type[i] if answer_type else "open"
+        gt = ground_truth[i] if ground_truth else ""
         a2_text = _extract_a2_text(comp)
-        r = _compute_refiner_format_reward(a2_text, at)
+        r = _compute_refiner_format_reward(a2_text, at, gt)
         rewards.append(r)
     return rewards
 
@@ -531,7 +643,7 @@ def refiner_correctness_reward_fn(
         at = answer_type[i] if answer_type else "open"
 
         a2_text = _extract_a2_text(comp)
-        format_valid = _compute_refiner_format_reward(a2_text, at) >= 0
+        format_valid = _compute_refiner_format_reward(a2_text, at, gt) >= 0
 
         r = compute_a2_correctness_reward(
             a2_extracted=a2_text,
@@ -571,7 +683,7 @@ def refiner_no_regression_reward_fn(
         a1_correct = a1_is_correct[i] if a1_is_correct else True
 
         a2_text = _extract_a2_text(comp)
-        format_valid = _compute_refiner_format_reward(a2_text, at) >= 0
+        format_valid = _compute_refiner_format_reward(a2_text, at, gt) >= 0
 
         r = compute_no_regression_reward(
             a2_extracted=a2_text,
@@ -612,7 +724,7 @@ def refiner_minimal_edit_reward_fn(
         at = answer_type[i] if answer_type else "open"
 
         a2_text = _extract_a2_text(comp)
-        format_valid = _compute_refiner_format_reward(a2_text, at) >= 0
+        format_valid = _compute_refiner_format_reward(a2_text, at, gt) >= 0
 
         r = compute_minimal_edit_reward(
             a1=a1,
@@ -723,8 +835,8 @@ def compute_response_reward_breakdown(
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
 
-    # Format reward (normalize-first, penalty-only)
-    r_a2_format = _compute_refiner_format_reward(a2_text, answer_type)
+    # Format reward (normalize-first, penalty-only, LLM fallback)
+    r_a2_format = _compute_refiner_format_reward(a2_text, answer_type, ground_truth)
     a2_format_valid = r_a2_format >= 0
 
     # Extract A2 for correctness (liberal extraction, separate from format)
