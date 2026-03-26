@@ -107,11 +107,11 @@ spec:
         - name: CLIP_RANGE
           value: "0.2"
         - name: INNER_EPOCHS
-          value: "4"
+          value: "2"
 
         # Generation
         - name: MAX_SAMPLES
-          value: "35000"
+          value: "15000"
         - name: MAX_COMPLETION_LENGTH
           value: "512"
         - name: A1_MAX_COMPLETION
