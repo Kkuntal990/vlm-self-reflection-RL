@@ -131,7 +131,7 @@ spec:
         - name: LEARNING_RATE
           value: "1e-6"
         - name: BATCH_SIZE
-          value: "2"
+          value: "4"
         - name: GRAD_ACC
           value: "2"
         - name: EPOCHS
