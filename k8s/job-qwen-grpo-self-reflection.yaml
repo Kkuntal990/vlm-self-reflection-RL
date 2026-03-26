@@ -1,0 +1,260 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-grpo-self-reflection-v1
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: grpo-trainer
+        model: qwen2-5-vl-7b
+        task: self-reflection-grpo
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: huggingface/trl:0.29.0
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "========================================="
+          echo "Qwen2.5-VL-7B Self-Reflection GRPO"
+          echo "Model: ${MODEL_ID}"
+          echo "Dataset: ${DATASET_PATH}"
+          echo "Output: ${OUTPUT_DIR}"
+          echo "GPUs: ${NUM_GPUS}"
+          echo "Loss: ${LOSS_TYPE}"
+          echo "LLM Judge: ${VLM_USE_LLM_JUDGE} (${VLM_JUDGE_MODEL_ID})"
+          echo "========================================="
+
+          # GPU check
+          nvidia-smi
+          echo ""
+
+          # Install dependencies
+          pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
+
+          # Clone and install project
+          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          cd /workspace/vlm-self-reflection-RL
+          pip install -e . 2>&1 | tail -3
+
+          # Run training (multi-GPU via accelerate)
+          accelerate launch --num_processes=${NUM_GPUS:-4} train_self_reflection.py \
+            --model_id "${MODEL_ID}" \
+            --model_type qwen2vl \
+            --dataset_path "${DATASET_PATH}" \
+            --val_dataset_path "${VAL_DATASET_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            --image_base_dir "${IMAGE_BASE_DIR}" \
+            --max_samples ${MAX_SAMPLES:-0} \
+            --k_samples ${K_SAMPLES:-8} \
+            --max_completion_length ${MAX_COMPLETION_LENGTH:-512} \
+            --a1_max_completion_length ${A1_MAX_COMPLETION:-200} \
+            --f1_max_completion_length ${F1_MAX_COMPLETION:-512} \
+            --a2_max_completion_length ${A2_MAX_COMPLETION:-200} \
+            --temperature ${TEMPERATURE:-1.0} \
+            --feedback_temperature ${FEEDBACK_TEMPERATURE:-1.0} \
+            --a2_temperature ${A2_TEMPERATURE:-0.3} \
+            --learning_rate ${LEARNING_RATE:-1e-6} \
+            --per_device_train_batch_size ${BATCH_SIZE:-1} \
+            --gradient_accumulation_steps ${GRAD_ACC:-4} \
+            --num_train_epochs ${EPOCHS:-1} \
+            --num_inner_epochs ${INNER_EPOCHS:-1} \
+            --kl_coeff ${KL_COEFF:-0.0} \
+            --clip_range ${CLIP_RANGE:-0.2} \
+            --loss_type ${LOSS_TYPE:-dr_grpo} \
+            --lora_r ${LORA_R:-64} \
+            --lora_alpha ${LORA_ALPHA:-128} \
+            --freeze_vision_tower \
+            --max_pixels ${MAX_PIXELS:-1003520} \
+            --min_pixels ${MIN_PIXELS:-200704} \
+            --w_a1_correctness ${W_A1_CORRECTNESS:-1.0} \
+            --w_a2_correctness ${W_A2_CORRECTNESS:-1.0} \
+            --w_no_regression ${W_NO_REGRESSION:-2.0} \
+            --w_a2_format ${W_A2_FORMAT:-0.15} \
+            --w_minimal_edit ${W_MINIMAL_EDIT:-0.3} \
+            --w_downstream ${W_DOWNSTREAM:-2.0} \
+            --w_fb_format ${W_FB_FORMAT:-0.15} \
+            --logging_steps ${LOGGING_STEPS:-10} \
+            --save_steps ${SAVE_STEPS:-500} \
+            --seed ${SEED:-42}
+
+          echo "=== Training complete ==="
+
+        env:
+        # Model and data
+        - name: MODEL_ID
+          value: "Qwen/Qwen2.5-VL-7B-Instruct"
+        - name: DATASET_PATH
+          value: "/outputs/grpo_data/balanced_70k.jsonl"
+        - name: VAL_DATASET_PATH
+          value: ""
+        - name: OUTPUT_DIR
+          value: "/outputs/grpo_qwen_sr_v1"
+        - name: IMAGE_BASE_DIR
+          value: "/outputs/image_base"
+
+        # GRPO core
+        - name: K_SAMPLES
+          value: "8"
+        - name: LOSS_TYPE
+          value: "dr_grpo"
+        - name: KL_COEFF
+          value: "0.0"
+        - name: CLIP_RANGE
+          value: "0.2"
+        - name: INNER_EPOCHS
+          value: "1"
+
+        # Generation
+        - name: MAX_SAMPLES
+          value: "0"
+        - name: MAX_COMPLETION_LENGTH
+          value: "512"
+        - name: A1_MAX_COMPLETION
+          value: "200"
+        - name: F1_MAX_COMPLETION
+          value: "512"
+        - name: A2_MAX_COMPLETION
+          value: "200"
+        - name: TEMPERATURE
+          value: "1.0"
+        - name: FEEDBACK_TEMPERATURE
+          value: "1.0"
+        - name: A2_TEMPERATURE
+          value: "0.3"
+
+        # Optimization
+        - name: LEARNING_RATE
+          value: "1e-6"
+        - name: BATCH_SIZE
+          value: "1"
+        - name: GRAD_ACC
+          value: "4"
+        - name: EPOCHS
+          value: "1"
+        - name: NUM_GPUS
+          value: "4"
+
+        # LoRA (r=64, alpha=128 → scaling=2.0)
+        - name: LORA_R
+          value: "64"
+        - name: LORA_ALPHA
+          value: "128"
+
+        # Qwen2.5-VL image resolution
+        - name: MAX_PIXELS
+          value: "1003520"
+        - name: MIN_PIXELS
+          value: "200704"
+
+        # Response reward weights
+        - name: W_A1_CORRECTNESS
+          value: "1.0"
+        - name: W_A2_CORRECTNESS
+          value: "1.0"
+        - name: W_NO_REGRESSION
+          value: "2.0"
+        - name: W_A2_FORMAT
+          value: "0.15"
+        - name: W_MINIMAL_EDIT
+          value: "0.3"
+
+        # Feedback reward weights (no calibration)
+        - name: W_DOWNSTREAM
+          value: "2.0"
+        - name: W_FB_FORMAT
+          value: "0.15"
+
+        # Logging
+        - name: LOGGING_STEPS
+          value: "10"
+        - name: SAVE_STEPS
+          value: "500"
+        - name: SEED
+          value: "42"
+
+        # LLM Judge (Qwen2.5-7B for answer verification)
+        - name: VLM_USE_LLM_JUDGE
+          value: "1"
+        - name: VLM_JUDGE_MODEL_ID
+          value: "Qwen/Qwen2.5-7B-Instruct"
+
+        # HuggingFace
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+
+        # Python and CUDA
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        - name: WANDB_PROJECT
+          value: "vlm-self-reflection-grpo"
+
+        resources:
+          limits:
+            nvidia.com/a100: "4"
+            memory: "128Gi"
+            cpu: "8"
+          requests:
+            nvidia.com/a100: "4"
+            memory: "128Gi"
+            cpu: "8"
+
+        volumeMounts:
+        - name: cache
+          mountPath: /cache
+        - name: outputs
+          mountPath: /outputs
+        - name: dev-shm
+          mountPath: /dev/shm
+
+      tolerations:
+      - key: nautilus.io/reservation
+        operator: Exists
+        effect: NoSchedule
+      - key: nautilus.io/hardware
+        operator: Equal
+        value: large-gpu
+      - effect: PreferNoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      - key: nautilus.io/issue
+        operator: Exists
+        effect: NoSchedule
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+
+      volumes:
+      - name: cache
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: ms-swift-outputs-pvc
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
