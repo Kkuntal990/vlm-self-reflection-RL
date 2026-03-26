@@ -492,8 +492,10 @@ def load_self_reflection_dataset(
         # Resolve image path
         image_path = _resolve_image_path(sample, image_base_dir)
 
-        if not os.path.isfile(image_path):
-            logger.warning(f"Image not found: {image_path}")
+        # Skip isfile() check — it's extremely slow on network filesystems
+        # (CephFS/NFS). 70K stat calls × 4 accelerate processes can take 30+ min.
+        # The dataset was validated at preparation time; trust the paths.
+        if not image_path:
             skipped += 1
             continue
 
