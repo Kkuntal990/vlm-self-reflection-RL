@@ -99,7 +99,7 @@ spec:
 
         # GRPO core
         - name: K_SAMPLES
-          value: "8"
+          value: "4"
         - name: LOSS_TYPE
           value: "dr_grpo"
         - name: KL_COEFF
@@ -111,7 +111,7 @@ spec:
 
         # Generation
         - name: MAX_SAMPLES
-          value: "0"
+          value: "35000"
         - name: MAX_COMPLETION_LENGTH
           value: "512"
         - name: A1_MAX_COMPLETION
