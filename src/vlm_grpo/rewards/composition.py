@@ -808,47 +808,50 @@ def compute_response_reward_breakdown(
     Returns:
         TrajectoryResponseRewardBreakdown with all component scores
     """
-    # Determine A1 correctness at runtime
+    # Verify A1 and A2 ONCE each (previously called 7 times per trajectory).
+    # Results are reused by all sub-reward functions.
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
+    a2_correct = a2_result.is_correct
 
     # Format reward (normalize-first, penalty-only, LLM fallback)
     r_a2_format = _compute_refiner_format_reward(a2_text, answer_type, ground_truth)
     a2_format_valid = r_a2_format >= 0
 
-    # Extract A2 for correctness (liberal extraction, separate from format)
+    # Extract A2 for display
     a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
 
     # A1 correctness reward
     r_a1 = 1.0 if a1_correct else -1.0
 
-    # A2 correctness reward (pass raw text so verify_answer can extract both
-    # option letter and answer text for MCQ matching)
-    r_a2 = compute_a2_correctness_reward(
-        a2_extracted=a2_text,
-        ground_truth=ground_truth,
-        answer_type=answer_type,
-    )
+    # A2 correctness reward (use pre-computed result)
+    if answer_type in ("counting", "open") and a2_result.score is not None:
+        r_a2 = 2.0 * a2_result.score - 1.0
+    else:
+        r_a2 = 1.0 if a2_correct else -1.0
 
-    # No-regression reward
-    r_no_reg = compute_no_regression_reward(
-        a2_extracted=a2_text,
-        ground_truth=ground_truth,
-        answer_type=answer_type,
-        a1_is_correct=a1_correct,
-    )
+    # No-regression reward (use pre-computed a1_correct, a2_correct)
+    if a1_correct:
+        r_no_reg = 1.0 if a2_correct else -3.0
+    else:
+        r_no_reg = 2.0 if a2_correct else 0.0
 
-    # Minimal edit reward
-    r_edit = compute_minimal_edit_reward(
-        a1=a1_text,
-        a2_extracted=a2_text,
-        ground_truth=ground_truth,
-        answer_type=answer_type,
-    )
+    # Minimal edit reward (only when both correct)
+    if a1_correct and a2_correct:
+        from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+        from vlm_grpo.utils import normalized_edit_distance
 
-    # Determine A2 correctness
-    a2_result = verify_answer(a2_text, ground_truth, answer_type)
-    a2_correct = a2_result.is_correct
+        if answer_type in DETERMINISTIC_TYPES:
+            a1_cmp = a1_result.extracted
+            a2_cmp = a2_result.extracted
+        else:
+            a1_cmp = a1_text.strip().lower()
+            a2_cmp = a2_text.strip().lower()
+        edit_dist = normalized_edit_distance(a1_cmp, a2_cmp)
+        r_edit = max(1.0 - 0.5 * edit_dist, 0.0)
+    else:
+        r_edit = 0.0
 
     components = {
         "a1_correctness": r_a1,
@@ -907,23 +910,23 @@ def compute_feedback_reward_breakdown(
     Returns:
         TrajectoryFeedbackRewardBreakdown with all component scores
     """
-    # Determine A1 correctness
+    # Verify A1 and A2 ONCE (downstream needs both)
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
+    a2_correct = a2_result.is_correct
 
     # Feedback format reward
     r_format = compute_critic_format_reward(feedback_text)
     format_valid = r_format > 0
 
-    # Downstream-aware reward (pass raw text for MCQ answer text matching)
-    r_downstream = compute_downstream_aware_reward(
-        feedback_text=feedback_text,
-        a2_extracted=a2_text,
-        ground_truth=ground_truth,
-        answer_type=answer_type,
-        a1=a1_text,
-        a1_is_correct=a1_correct,
-    )
+    # Downstream-aware reward (computed directly, no extra verify_answer call)
+    if not feedback_text.strip():
+        r_downstream = 0.0
+    elif a1_correct:
+        r_downstream = 1.0 if a2_correct else -2.0
+    else:
+        r_downstream = 2.0 if a2_correct else -1.0
 
     components = {
         "downstream": r_downstream,

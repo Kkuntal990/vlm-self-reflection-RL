@@ -1006,20 +1006,19 @@ class SelfReflectionGRPOTrainer:
                 if self.ref_model is None:
                     unwrapped_model.enable_adapter_layers()
 
-            old_resp_lps = torch.stack(
-                [a1 + a2 for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)]
-            )
-            old_fb_lps = torch.stack(old_fb_lps_list)
+            # Per-token log-probs: keep as lists of variable-length tensors.
+            # For response, concatenate A1 and A2 tokens per trajectory.
+            old_resp_lps = [torch.cat([a1, a2]) for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)]
+            old_fb_lps = old_fb_lps_list  # already list of per-token tensors
 
             if self.config.kl_coeff > 0:
-                ref_resp_lps = torch.stack(
-                    [a1 + a2 for a1, a2 in zip(ref_a1_lps_list, ref_a2_lps_list)]
-                )
-                ref_fb_lps = torch.stack(ref_fb_lps_list)
+                ref_resp_lps = [
+                    torch.cat([a1, a2]) for a1, a2 in zip(ref_a1_lps_list, ref_a2_lps_list)
+                ]
+                ref_fb_lps = ref_fb_lps_list
             else:
-                # Dummy tensors when KL is disabled (not used in loss computation)
-                ref_resp_lps = torch.zeros_like(old_resp_lps)
-                ref_fb_lps = torch.zeros_like(old_fb_lps)
+                ref_resp_lps = None
+                ref_fb_lps = None
 
         # No explicit cache clear — PyTorch reuses memory automatically.
 
@@ -1057,31 +1056,38 @@ class SelfReflectionGRPOTrainer:
                     [a1_pretok, a2_pretok, f1_pretok], inner_model, mb_start, mb_end
                 )
 
-                # Backward per-trajectory to avoid advantage cancellation.
-                # With group-relative advantages, sum(advantages) ≈ 0 by
-                # construction. Accumulating then calling backward() once
-                # produces near-zero gradients. Instead, backward() each
-                # trajectory's loss independently so gradients reflect the
-                # individual advantage direction, not the cancelled sum.
+                # Token-level GRPO loss (standard formulation).
+                # Per-token ratios produce non-zero gradients even with
+                # inner_epochs=1 because each token's gradient flows through
+                # its own path. The scalar advantage broadcasts to all tokens
+                # of a trajectory (outcome supervision).
+                # References:
+                #   - DeepSeekMath GRPO: arXiv:2402.03300
+                #   - TRL GRPOTrainer: github.com/huggingface/trl
+                #   - DAPO token-level loss: arXiv:2503.14476
+                mb_loss = None
                 for j in range(mb_end - mb_start):
                     ti = mb_start + j
-                    resp_lp = mb_a1_lps[j] + mb_a2_lps[j]
-                    fb_lp = mb_fb_lps[j]
 
+                    # Per-token log-probs: cat A1+A2 for response
+                    resp_new = torch.cat([mb_a1_lps[j], mb_a2_lps[j]])
+                    fb_new = mb_fb_lps[j]
+
+                    # Per-token ratios
                     resp_ratio_raw = torch.nan_to_num(
-                        resp_lp - old_resp_lps[ti], nan=0.0, posinf=20.0, neginf=-20.0
+                        resp_new - old_resp_lps[ti].detach(),
+                        nan=0.0,
+                        posinf=20.0,
+                        neginf=-20.0,
                     )
                     fb_ratio_raw = torch.nan_to_num(
-                        fb_lp - old_fb_lps[ti], nan=0.0, posinf=20.0, neginf=-20.0
-                    )
-                    resp_kl_raw = torch.nan_to_num(
-                        ref_resp_lps[ti] - resp_lp, nan=0.0, posinf=20.0, neginf=-20.0
-                    )
-                    fb_kl_raw = torch.nan_to_num(
-                        ref_fb_lps[ti] - fb_lp, nan=0.0, posinf=20.0, neginf=-20.0
+                        fb_new - old_fb_lps[ti].detach(),
+                        nan=0.0,
+                        posinf=20.0,
+                        neginf=-20.0,
                     )
 
-                    # Response GRPO loss
+                    # Response: per-token clipped surrogate, advantage broadcasts
                     resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
                     resp_ratio = torch.exp(resp_log_ratio)
                     resp_surr1 = resp_ratio * resp_advantages[ti]
@@ -1089,37 +1095,54 @@ class SelfReflectionGRPOTrainer:
                         torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
                         * resp_advantages[ti]
                     )
-                    traj_resp_loss = -torch.min(resp_surr1, resp_surr2)
+                    traj_resp_loss = -torch.min(resp_surr1, resp_surr2).mean()
 
-                    # Feedback GRPO loss
+                    # Feedback: per-token clipped surrogate
                     fb_log_ratio = torch.clamp(fb_ratio_raw, min=-20.0, max=20.0)
                     fb_ratio = torch.exp(fb_log_ratio)
                     fb_surr1 = fb_ratio * fb_advantages[ti]
                     fb_surr2 = (
                         torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range) * fb_advantages[ti]
                     )
-                    traj_fb_loss = -torch.min(fb_surr1, fb_surr2)
+                    traj_fb_loss = -torch.min(fb_surr1, fb_surr2).mean()
 
-                    # KL loss
-                    if self.config.kl_coeff > 0:
-                        resp_kl_delta = torch.clamp(resp_kl_raw, min=-20.0, max=20.0)
-                        resp_kl = torch.exp(resp_kl_delta) - resp_kl_delta - 1
-                        fb_kl_delta = torch.clamp(fb_kl_raw, min=-20.0, max=20.0)
-                        fb_kl = torch.exp(fb_kl_delta) - fb_kl_delta - 1
+                    # KL loss (per-token, averaged)
+                    if self.config.kl_coeff > 0 and ref_resp_lps is not None:
+                        resp_kl_raw = torch.nan_to_num(
+                            ref_resp_lps[ti].detach() - resp_new,
+                            nan=0.0,
+                            posinf=20.0,
+                            neginf=-20.0,
+                        )
+                        resp_kl = (
+                            torch.exp(torch.clamp(resp_kl_raw, -20.0, 20.0))
+                            - torch.clamp(resp_kl_raw, -20.0, 20.0)
+                            - 1
+                        ).mean()
+                        fb_kl_raw = torch.nan_to_num(
+                            ref_fb_lps[ti].detach() - fb_new,
+                            nan=0.0,
+                            posinf=20.0,
+                            neginf=-20.0,
+                        )
+                        fb_kl = (
+                            torch.exp(torch.clamp(fb_kl_raw, -20.0, 20.0))
+                            - torch.clamp(fb_kl_raw, -20.0, 20.0)
+                            - 1
+                        ).mean()
                         traj_kl_loss = self.config.kl_coeff * (resp_kl + fb_kl) / 2.0
                     else:
-                        traj_kl_loss = torch.tensor(0.0, device=resp_lp.device)
+                        traj_kl_loss = torch.tensor(0.0, device=resp_new.device)
 
-                    # Per-trajectory backward (gradients accumulate across trajectories).
-                    # retain_graph=True for all but the last trajectory in this
-                    # mini-batch since they share the same forward computation graph.
                     traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
-                    is_last_in_mb = j == mb_end - mb_start - 1
-                    traj_loss.backward(retain_graph=not is_last_in_mb)
+                    mb_loss = traj_loss if mb_loss is None else mb_loss + traj_loss
 
                     epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
                     epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
                     epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
+
+                if mb_loss is not None:
+                    mb_loss.backward()
 
             # Manually all-reduce gradients across DDP processes
             if self.accelerator is not None and torch.distributed.is_initialized():
@@ -1428,8 +1451,11 @@ class SelfReflectionGRPOTrainer:
             shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
             lp = F.log_softmax(shift_logits, dim=-1)
             token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            # Return per-token log-probs (not summed) for token-level GRPO loss.
+            # Standard GRPO (DeepSeekMath arXiv:2402.03300, TRL GRPOTrainer)
+            # computes per-token ratios for non-zero gradients with inner_epochs=1.
             log_probs_list.append(
-                token_lp.sum() if token_lp.numel() > 0 else torch.tensor(0.0, device=self.device)
+                token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
             )
 
         return log_probs_list
@@ -1514,7 +1540,7 @@ class SelfReflectionGRPOTrainer:
             lp = F.log_softmax(shift_logits, dim=-1)
             token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
             all_lps.append(
-                token_lp.sum() if token_lp.numel() > 0 else torch.tensor(0.0, device=self.device)
+                token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
             )
 
         result: list[list[Any]] = []
@@ -1609,8 +1635,11 @@ class SelfReflectionGRPOTrainer:
             shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
             lp = F.log_softmax(shift_logits, dim=-1)
             token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            # Return per-token log-probs (not summed) for token-level GRPO loss.
+            # Standard GRPO (DeepSeekMath arXiv:2402.03300, TRL GRPOTrainer)
+            # computes per-token ratios for non-zero gradients with inner_epochs=1.
             log_probs_list.append(
-                token_lp.sum() if token_lp.numel() > 0 else torch.tensor(0.0, device=self.device)
+                token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
             )
 
         return log_probs_list

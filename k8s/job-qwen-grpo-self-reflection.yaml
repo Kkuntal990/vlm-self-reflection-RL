@@ -107,7 +107,7 @@ spec:
         - name: CLIP_RANGE
           value: "0.2"
         - name: INNER_EPOCHS
-          value: "2"
+          value: "1"
 
         # Generation
         - name: MAX_SAMPLES
