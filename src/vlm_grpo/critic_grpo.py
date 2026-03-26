@@ -1152,16 +1152,15 @@ class SelfReflectionGRPOTrainer:
                             param.grad,
                             op=torch.distributed.ReduceOp.AVG,
                         )
-                self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
-            else:
-                torch.nn.utils.clip_grad_norm_(inner_model.parameters(), 1.0)
 
-            # Skip optimizer step if any gradient contains NaN/inf to avoid
-            # corrupting model weights (which causes generate() to crash)
-            has_nan_grad = any(
-                param.grad is not None and not torch.isfinite(param.grad).all()
-                for param in inner_model.parameters()
-            )
+            # Clip grad norm and log it to verify gradients are flowing.
+            # With GRPO inner_epochs=1 and kl=0, loss is mathematically 0
+            # but gradients are non-zero (REINFORCE gradient estimator).
+            # Confirmed by TRL issue #3452: loss=0 with grad_norm>0 is expected.
+            grad_norm = torch.nn.utils.clip_grad_norm_(inner_model.parameters(), 1.0).item()
+
+            # Skip optimizer step if any gradient contains NaN/inf
+            has_nan_grad = not math.isfinite(grad_norm)
             if has_nan_grad:
                 logger.warning(
                     f"  [inner epoch {inner_epoch + 1}] NaN/inf gradient detected — "
@@ -1175,10 +1174,19 @@ class SelfReflectionGRPOTrainer:
             total_fb_loss += epoch_fb_loss
             total_kl_loss += epoch_kl_loss
 
+        # Log advantage statistics to detect the std=0 problem
+        # (all K trajectories getting identical rewards → zero advantages → zero gradients)
+        resp_adv_abs_mean = resp_advantages.abs().mean().item()
+        fb_adv_abs_mean = fb_advantages.abs().mean().item()
+        n_zero_adv = (resp_advantages == 0).sum().item()
+
         logger.info(
             f"  Inner epochs done: resp_loss={total_resp_loss / num_inner:.4f}, "
             f"fb_loss={total_fb_loss / num_inner:.4f}, "
-            f"kl_loss={total_kl_loss / num_inner:.4f}"
+            f"kl_loss={total_kl_loss / num_inner:.4f}, "
+            f"grad_norm={grad_norm:.4f}, "
+            f"resp_adv_mean={resp_adv_abs_mean:.4f}, "
+            f"zero_adv={n_zero_adv}/{len(resp_advantages)}"
         )
 
         if self.scheduler is not None:
