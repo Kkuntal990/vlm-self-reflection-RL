@@ -1057,17 +1057,17 @@ class SelfReflectionGRPOTrainer:
                     [a1_pretok, a2_pretok, f1_pretok], inner_model, mb_start, mb_end
                 )
 
-                # Accumulate loss over mini-batch, backward once per mini-batch
-                mb_loss: Optional[Any] = None
+                # Backward per-trajectory to avoid advantage cancellation.
+                # With group-relative advantages, sum(advantages) ≈ 0 by
+                # construction. Accumulating then calling backward() once
+                # produces near-zero gradients. Instead, backward() each
+                # trajectory's loss independently so gradients reflect the
+                # individual advantage direction, not the cancelled sum.
                 for j in range(mb_end - mb_start):
                     ti = mb_start + j
                     resp_lp = mb_a1_lps[j] + mb_a2_lps[j]
                     fb_lp = mb_fb_lps[j]
 
-                    # Note: torch.clamp does NOT sanitize NaN (NaN passes through).
-                    # Apply nan_to_num on the difference before clamping so that
-                    # any NaN log-prob (fp16 + grad-ckpt edge case) becomes a
-                    # neutral 0.0 rather than propagating through exp().
                     resp_ratio_raw = torch.nan_to_num(
                         resp_lp - old_resp_lps[ti], nan=0.0, posinf=20.0, neginf=-20.0
                     )
@@ -1081,7 +1081,7 @@ class SelfReflectionGRPOTrainer:
                         ref_fb_lps[ti] - fb_lp, nan=0.0, posinf=20.0, neginf=-20.0
                     )
 
-                    # Response GRPO loss: clamp ratio exponent to prevent overflow
+                    # Response GRPO loss
                     resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
                     resp_ratio = torch.exp(resp_log_ratio)
                     resp_surr1 = resp_ratio * resp_advantages[ti]
@@ -1100,8 +1100,7 @@ class SelfReflectionGRPOTrainer:
                     )
                     traj_fb_loss = -torch.min(fb_surr1, fb_surr2)
 
-                    # KL loss (TRL approximation): always ≥ 0, exponent clamped
-                    # Skip KL computation entirely when kl_coeff=0 (Dr. GRPO default)
+                    # KL loss
                     if self.config.kl_coeff > 0:
                         resp_kl_delta = torch.clamp(resp_kl_raw, min=-20.0, max=20.0)
                         resp_kl = torch.exp(resp_kl_delta) - resp_kl_delta - 1
@@ -1111,15 +1110,16 @@ class SelfReflectionGRPOTrainer:
                     else:
                         traj_kl_loss = torch.tensor(0.0, device=resp_lp.device)
 
+                    # Per-trajectory backward (gradients accumulate across trajectories).
+                    # retain_graph=True for all but the last trajectory in this
+                    # mini-batch since they share the same forward computation graph.
                     traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
-                    mb_loss = traj_loss if mb_loss is None else mb_loss + traj_loss
+                    is_last_in_mb = j == mb_end - mb_start - 1
+                    traj_loss.backward(retain_graph=not is_last_in_mb)
 
                     epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
                     epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
                     epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
-
-                if mb_loss is not None:
-                    mb_loss.backward()
 
             # Manually all-reduce gradients across DDP processes
             if self.accelerator is not None and torch.distributed.is_initialized():
