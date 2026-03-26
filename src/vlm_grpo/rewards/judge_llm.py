@@ -149,9 +149,7 @@ def _parse_score(generated: str) -> float:
     return 0.0
 
 
-def llm_judge_score(
-    predicted: str, ground_truth: str, question: str = ""
-) -> float:
+def llm_judge_score(predicted: str, ground_truth: str, question: str = "") -> float:
     """Score the correctness of predicted answer vs ground truth using LLM.
 
     Uses Qwen2.5-7B-Instruct to produce a 0-10 score, normalized to [0, 1].

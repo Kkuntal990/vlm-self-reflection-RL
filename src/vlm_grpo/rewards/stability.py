@@ -27,7 +27,6 @@ def compute_no_regression_reward(
     ground_truth: str,
     answer_type: str,
     a1_is_correct: bool,
-    format_valid: bool,
     tolerance: float = 0.01,
 ) -> float:
     """R_no_regression: Penalize RW flips, reward WR fixes.
@@ -40,22 +39,18 @@ def compute_no_regression_reward(
         A2 correct (WR): +2.0 (reward fixing errors)
         A2 wrong (WW):   0.0  (neutral)
 
-    Gated by format validity: returns 0.0 if format is invalid.
+    NOT gated by format: correctness is evaluated independently.
 
     Args:
         a2_extracted: Normalized extracted A2 answer
         ground_truth: Ground truth answer
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         a1_is_correct: Whether A1 was correct
-        format_valid: Whether the completion format passed validation
         tolerance: Numeric tolerance for comparison
 
     Returns:
         Regression reward value
     """
-    if not format_valid:
-        return 0.0
-
     result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
     a2_correct = result.is_correct
 
@@ -73,7 +68,6 @@ def compute_minimal_edit_reward(
     a2_extracted: str,
     ground_truth: str,
     answer_type: str,
-    format_valid: bool,
     lambda_edit: float = 0.5,
     tolerance: float = 0.01,
 ) -> float:
@@ -83,21 +77,19 @@ def compute_minimal_edit_reward(
     on the extracted/normalized token strings (e.g. "A" vs "A").
     For open types, edit distance is computed on raw stripped text.
 
+    NOT gated by format: correctness is evaluated independently.
+
     Args:
         a1: Initial answer text
         a2_extracted: Normalized extracted A2 answer
         ground_truth: Ground truth answer
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
-        format_valid: Whether the completion format passed validation
         lambda_edit: Scaling factor for edit distance penalty
         tolerance: Numeric tolerance for comparison
 
     Returns:
         [0.0, 1.0] where 1.0 means identical answers, 0.0 if not applicable
     """
-    if not format_valid:
-        return 0.0
-
     a1_result = verify_answer(a1, ground_truth, answer_type, tolerance=tolerance)
     if not a1_result.is_correct:
         return 0.0

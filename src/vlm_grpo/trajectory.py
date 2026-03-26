@@ -23,9 +23,7 @@ _MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.)\s*$")
 # Matches "(A)", "(b)" or "A.", "b." at word boundary
 _MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)|([A-Fa-f])\.)")
 # Captures "(A) Yes" or "a. Yes" → letter + answer_text
-_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(
-    r"(?:\(([A-Fa-f])\)\s*|([A-Fa-f])\.\s*)(.*)", re.DOTALL
-)
+_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)\s*|([A-Fa-f])\.\s*)(.*)", re.DOTALL)
 # Matches "The answer is X" / "answer: X" / "Answer is X" / "answer:X" patterns
 _MCQ_ANSWER_IS_PATTERN = re.compile(
     r"(?:the\s+)?answer\s*(?:is|:)\s*\(?([A-Fa-f])\)?", re.IGNORECASE

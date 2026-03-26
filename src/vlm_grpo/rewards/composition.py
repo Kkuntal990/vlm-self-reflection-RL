@@ -404,7 +404,6 @@ def compute_refiner_reward_breakdown(
         a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
-        format_valid=format_valid,
     )
 
     # No-regression reward
@@ -413,7 +412,6 @@ def compute_refiner_reward_breakdown(
         ground_truth=ground_truth,
         answer_type=answer_type,
         a1_is_correct=a1_is_correct,
-        format_valid=format_valid,
     )
 
     # Minimal-edit reward
@@ -422,7 +420,6 @@ def compute_refiner_reward_breakdown(
         a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
-        format_valid=format_valid,
     )
 
     # Determine A2 correctness for logging
@@ -629,13 +626,11 @@ def refiner_correctness_reward_fn(
         at = answer_type[i] if answer_type else "open"
 
         a2_text = _extract_a2_text(comp)
-        format_valid = _compute_refiner_format_reward(a2_text, at, gt) >= 0
 
         r = compute_a2_correctness_reward(
             a2_extracted=a2_text,
             ground_truth=gt,
             answer_type=at,
-            format_valid=format_valid,
         )
         rewards.append(r)
     return rewards
@@ -669,14 +664,12 @@ def refiner_no_regression_reward_fn(
         a1_correct = a1_is_correct[i] if a1_is_correct else True
 
         a2_text = _extract_a2_text(comp)
-        format_valid = _compute_refiner_format_reward(a2_text, at, gt) >= 0
 
         r = compute_no_regression_reward(
             a2_extracted=a2_text,
             ground_truth=gt,
             answer_type=at,
             a1_is_correct=a1_correct,
-            format_valid=format_valid,
         )
         rewards.append(r)
     return rewards
@@ -710,14 +703,12 @@ def refiner_minimal_edit_reward_fn(
         at = answer_type[i] if answer_type else "open"
 
         a2_text = _extract_a2_text(comp)
-        format_valid = _compute_refiner_format_reward(a2_text, at, gt) >= 0
 
         r = compute_minimal_edit_reward(
             a1=a1,
             a2_extracted=a2_text,
             ground_truth=gt,
             answer_type=at,
-            format_valid=format_valid,
         )
         rewards.append(r)
     return rewards
@@ -837,7 +828,6 @@ def compute_response_reward_breakdown(
         a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
-        format_valid=a2_format_valid,
     )
 
     # No-regression reward
@@ -846,7 +836,6 @@ def compute_response_reward_breakdown(
         ground_truth=ground_truth,
         answer_type=answer_type,
         a1_is_correct=a1_correct,
-        format_valid=a2_format_valid,
     )
 
     # Minimal edit reward
@@ -855,7 +844,6 @@ def compute_response_reward_breakdown(
         a2_extracted=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
-        format_valid=a2_format_valid,
     )
 
     # Determine A2 correctness

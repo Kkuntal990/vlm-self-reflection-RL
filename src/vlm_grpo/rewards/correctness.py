@@ -15,7 +15,7 @@ Usage:
         compute_downstream_improvement_reward,
     )
 
-    r = compute_a2_correctness_reward("A", "A", "mcq", format_valid=True)
+    r = compute_a2_correctness_reward("A", "A", "mcq")
     assert r == 1.0
 """
 
@@ -26,7 +26,6 @@ def compute_a2_correctness_reward(
     a2_extracted: str,
     ground_truth: str,
     answer_type: str,
-    format_valid: bool,
     tolerance: float = 0.01,
 ) -> float:
     """R_a2_correct: Check if A2 matches ground truth.
@@ -37,21 +36,18 @@ def compute_a2_correctness_reward(
     For open-ended: continuous reward from LLM judge or similarity score
     (RARL arXiv:2506.06600, VisionThink arXiv:2507.13348).
 
-    Gated by format validity: returns 0.0 if format is invalid.
+    NOT gated by format: correctness is evaluated independently.
+    Format compliance is a separate reward component.
 
     Args:
         a2_extracted: Normalized extracted A2 answer
         ground_truth: Ground truth answer
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
-        format_valid: Whether the completion format passed validation
         tolerance: Numeric tolerance for comparison
 
     Returns:
         Reward in [-1.0, 1.0]. Continuous for counting/open, binary for others.
     """
-    if not format_valid:
-        return 0.0
-
     result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
 
     # Counting and open-ended: use continuous score when available.
@@ -72,7 +68,6 @@ def compute_downstream_improvement_reward(
     ground_truth: str,
     answer_type: str,
     a1_is_correct: bool,
-    format_valid: bool,
     tolerance: float = 0.01,
 ) -> float:
     """R_downstream_improvement: Reward based on A1→A2 correctness transition.
@@ -83,7 +78,7 @@ def compute_downstream_improvement_reward(
     - WR (Wrong→Right): A1 wrong, A2 correct    → +2.0 (fixed it)
     - WW (Wrong→Wrong): A1 wrong, A2 wrong      → -0.5 (failed to fix)
 
-    Gated by format validity: returns 0.0 if format is invalid.
+    NOT gated by format: correctness is evaluated independently.
 
     Args:
         a1: Initial answer text
@@ -91,15 +86,11 @@ def compute_downstream_improvement_reward(
         ground_truth: Ground truth answer
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         a1_is_correct: Whether A1 was correct
-        format_valid: Whether the completion format passed validation
         tolerance: Numeric tolerance for comparison
 
     Returns:
         Transition reward value
     """
-    if not format_valid:
-        return 0.0
-
     result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
     a2_correct = result.is_correct
 

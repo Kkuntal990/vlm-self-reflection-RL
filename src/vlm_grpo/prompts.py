@@ -32,10 +32,10 @@ Usage:
 """
 
 # =============================================================================
-# System Prompts (matching inference script exactly)
+# System Prompts
 # =============================================================================
 
-# VL Assistant system prompt (from fire_messages SFT training)
+# VL Assistant system prompt for A1 and A2 generation.
 VL_ASSISTANT_SYSTEM_PROMPT = (
     "You are a helpful vision-language assistant. You should produce accurate, "
     "detailed, and grounded answers based on the image and the user's instructions. "
@@ -43,19 +43,14 @@ VL_ASSISTANT_SYSTEM_PROMPT = (
     "correctness, specificity, and completeness."
 )
 
-# Feedback critic system prompt (from fire_feedback SFT training)
+# Feedback critic system prompt for F1 generation.
+# Matches the fire_feedback and nlf_feedback SFT training prompts.
 FEEDBACK_CRITIC_SYSTEM_PROMPT = (
-    "You are a vision-language critic that evaluates answers to visual questions "
-    "and helps improve them. Use the image, question, and dialogue history to "
-    "judge the latest answer by: - correctness and visual grounding (matches "
-    "what's visible / implied), - compliance with the requested format (option "
-    "letter, units, etc.), - completeness. Be conservative: confirm the answer "
-    "as correct if it is consistent with the image/question and follows the "
-    'required format. Only say "incorrect" when you can name a specific '
-    "contradiction or missing requirement. If you are uncertain, do not "
-    "guess\u2014ask to re-check one concrete detail. Write a brief natural "
-    "paragraph: start with a clear verdict, give 1\u20132 grounded reasons, and "
-    "(if needed) one practical next step. Keep the tone polite and encouraging."
+    "You are a visual question answering critic. Given an image, a question, "
+    "and the conversation history of the user's answers and prior feedback, "
+    "provide constructive feedback on the user's latest answer identifying "
+    "what is correct, what is incorrect, and how to improve. Ground your "
+    "feedback in what is visible in the image."
 )
 
 # Backward-compatible aliases
