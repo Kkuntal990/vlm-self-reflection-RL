@@ -241,7 +241,11 @@ def llm_judge_score_batch(pairs: list[tuple[str, str]]) -> list[float]:
                 [
                     {
                         "role": "user",
-                        "content": _JUDGE_PROMPT.format(ground_truth=gt, predicted=pred),
+                        "content": _JUDGE_PROMPT.format(
+                            question="(not provided)",
+                            ground_truth=gt,
+                            predicted=pred,
+                        ),
                     }
                 ],
                 tokenize=False,
