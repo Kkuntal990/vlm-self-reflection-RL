@@ -131,9 +131,9 @@ spec:
         - name: LEARNING_RATE
           value: "1e-6"
         - name: BATCH_SIZE
-          value: "1"
+          value: "2"
         - name: GRAD_ACC
-          value: "4"
+          value: "2"
         - name: EPOCHS
           value: "1"
         - name: NUM_GPUS
