@@ -34,10 +34,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from vlm_grpo.rewards.correctness import compute_a2_correctness_reward
-from vlm_grpo.rewards.feedback import (
-    compute_downstream_aware_reward,
-    compute_feedback_calibration_reward,
-)
+from vlm_grpo.rewards.feedback import compute_downstream_aware_reward
 from vlm_grpo.rewards.stability import (
     compute_minimal_edit_reward,
     compute_no_regression_reward,
@@ -67,26 +64,23 @@ class CriticRewardWeights:
     """Weights for critic reward composition.
 
     reward = w_downstream * R_downstream
-           + w_calibration * R_calibration
            + w_format * R_format
 
     Attributes:
         w_downstream: Weight for downstream-aware reward (dominant)
-        w_calibration: Weight for feedback calibration
         w_format: Weight for format compliance
     """
 
     w_downstream: float = 2.0
-    w_calibration: float = 1.0
-    w_format: float = 0.5
+    w_format: float = 0.15
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
 
     def to_list(self) -> list[float]:
-        """Return weights as ordered list: [format, calibration, downstream]."""
-        return [self.w_format, self.w_calibration, self.w_downstream]
+        """Return weights as ordered list: [format, downstream]."""
+        return [self.w_format, self.w_downstream]
 
 
 @dataclass
@@ -108,7 +102,7 @@ class RefinerRewardWeights:
     w_correctness: float = 1.0
     w_no_regression: float = 2.0
     w_minimal_edit: float = 0.3
-    w_format: float = 0.5
+    w_format: float = 0.15
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -309,7 +303,7 @@ def compute_critic_reward_breakdown(
 ) -> CriticRewardBreakdown:
     """Compute full reward breakdown for one critic completion.
 
-    Combines: downstream-aware, calibration, and format rewards.
+    Combines: downstream-aware and format rewards.
 
     Args:
         feedback_text: Feedback text from the critic
@@ -341,12 +335,6 @@ def compute_critic_reward_breakdown(
         a1_is_correct=a1_is_correct,
     )
 
-    # Calibration reward
-    r_calibration = compute_feedback_calibration_reward(
-        feedback_text=feedback_text,
-        a1_is_correct=a1_is_correct,
-    )
-
     # Determine A2 correctness for logging
     a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a2_correct = a2_result.is_correct
@@ -355,12 +343,10 @@ def compute_critic_reward_breakdown(
     components = {
         "format": r_format,
         "downstream": r_downstream,
-        "calibration": r_calibration,
     }
     weighted_components = {
         "format": r_format * weights.w_format,
         "downstream": r_downstream * weights.w_downstream,
-        "calibration": r_calibration * weights.w_calibration,
     }
     total_reward = sum(weighted_components.values())
 
@@ -914,8 +900,12 @@ def compute_feedback_reward_breakdown(
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
-    Evaluates feedback quality: downstream-aware (did F1 help A2?),
-    calibration (does F1 correctly assess A1?), and format.
+    Evaluates feedback quality using outcome-based signals:
+    downstream-aware (did F1 help A2?) and format (is F1 substantive?).
+
+    Calibration (keyword-based assessment of A1) is intentionally omitted:
+    it forces formulaic language and is redundant with downstream reward
+    which directly measures whether feedback improved the answer.
 
     Args:
         feedback_text: Feedback text from the critic
@@ -947,20 +937,12 @@ def compute_feedback_reward_breakdown(
         a1_is_correct=a1_correct,
     )
 
-    # Calibration reward (does feedback correctly assess A1?)
-    r_calibration = compute_feedback_calibration_reward(
-        feedback_text=feedback_text,
-        a1_is_correct=a1_correct,
-    )
-
     components = {
         "downstream": r_downstream,
-        "calibration": r_calibration,
         "format": r_format,
     }
     weighted_components = {
         "downstream": r_downstream * weights.w_downstream,
-        "calibration": r_calibration * weights.w_calibration,
         "format": r_format * weights.w_format,
     }
     total_reward = sum(weighted_components.values())

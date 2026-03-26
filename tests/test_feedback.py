@@ -129,7 +129,7 @@ class TestDownstreamAwareReward:
             a1="B",
             a1_is_correct=False,
         )
-        assert r == 3.0
+        assert r == 2.0
 
     def test_ww_a1_wrong(self) -> None:
         """Failed feedback: A1 wrong → A2 wrong (WW) → -1.0."""
@@ -176,7 +176,7 @@ class TestDownstreamAwareReward:
             a1="No",
             a1_is_correct=False,
         )
-        assert r == 3.0
+        assert r == 2.0
 
     def test_numeric_rr(self) -> None:
         r = compute_downstream_aware_reward(

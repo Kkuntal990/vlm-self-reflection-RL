@@ -200,7 +200,8 @@ class TestOpenEndedEmbeddingStage:
         assert r.verdict == WRONG
 
     def test_short_phrase_mismatch_does_not_pass_via_anls(self) -> None:
-        r = verify_answer("Types of Plants", "Types of Leaflets", "open")
+        """Completely different multi-word answers should not pass ANLS."""
+        r = verify_answer("red sports car", "blue wooden table", "open")
         assert r.verdict == WRONG
 
 

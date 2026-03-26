@@ -17,13 +17,19 @@ Usage:
 
 import re
 
-# Answer extraction patterns
-_MCQ_LETTER_PATTERN = re.compile(r"[A-F]")
-_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-F])\)|([A-F])\.)\s*$")
-# Matches "(A)", "(B)" or "A.", "B." at word boundary
-_MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-F])\)|([A-F])\.)")
-# Captures "(A) Yes" or "A. Yes" → letter + answer_text
-_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(r"(?:\(([A-F])\)\s*|([A-F])\.\s*)(.*)", re.DOTALL)
+# Answer extraction patterns (case-insensitive for a-f / A-F)
+_MCQ_LETTER_PATTERN = re.compile(r"[A-Fa-f]")
+_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.)\s*$")
+# Matches "(A)", "(b)" or "A.", "b." at word boundary
+_MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)|([A-Fa-f])\.)")
+# Captures "(A) Yes" or "a. Yes" → letter + answer_text
+_MCQ_LETTER_AND_TEXT_PATTERN = re.compile(
+    r"(?:\(([A-Fa-f])\)\s*|([A-Fa-f])\.\s*)(.*)", re.DOTALL
+)
+# Matches "The answer is X" / "answer: X" / "Answer is X" / "answer:X" patterns
+_MCQ_ANSWER_IS_PATTERN = re.compile(
+    r"(?:the\s+)?answer\s*(?:is|:)\s*\(?([A-Fa-f])\)?", re.IGNORECASE
+)
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
@@ -190,6 +196,11 @@ def _extract_mcq_answer(text: str) -> str:
     if option_match:
         letter = option_match.group(1) or option_match.group(2)
         return letter.upper()
+
+    # Try "The answer is X" / "answer: X" pattern
+    answer_is_match = _MCQ_ANSWER_IS_PATTERN.search(text)
+    if answer_is_match:
+        return answer_is_match.group(1).upper()
 
     # Find all MCQ letters in the text
     letters = _MCQ_LETTER_PATTERN.findall(text.upper())

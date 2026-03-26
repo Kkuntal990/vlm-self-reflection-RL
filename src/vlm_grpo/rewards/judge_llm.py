@@ -2,7 +2,7 @@
 """
 LLM-as-judge for open-ended VQA answer equivalence.
 
-Uses Qwen2.5-3B-Instruct on GPU to determine if a predicted answer is
+Uses Qwen2.5-7B-Instruct on GPU to determine if a predicted answer is
 semantically equivalent to a ground truth answer. Replaces embedding
 cosine similarity for more accurate semantic matching in the open-ended
 verification cascade.
@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configurable via environment variables
-_JUDGE_MODEL_ID = os.environ.get("VLM_JUDGE_MODEL_ID", "Qwen/Qwen2.5-3B-Instruct")
+_JUDGE_MODEL_ID = os.environ.get("VLM_JUDGE_MODEL_ID", "Qwen/Qwen2.5-7B-Instruct")
 
 # Singleton model and tokenizer
 _judge_model: Any = None
@@ -49,34 +49,45 @@ _judge_tokenizer: Any = None
 # Module-level cache shared by both llm_judge_score and llm_judge_score_batch
 _score_cache: dict[tuple[str, str], float] = {}
 
-_JUDGE_PROMPT = """You are an answer equivalence judge for visual question answering.
+_JUDGE_PROMPT = """You are an answer correctness judge for visual question answering.
 
-Two answers should be considered equivalent if they express the same meaning \
-even if wording is different.
+Your task is to compare a predicted answer with the ground truth answer for a \
+given question and rate the prediction's correctness.
+
+Evaluation criteria:
+- If the ground truth is a definitive answer (a specific word, number, name, \
+yes/no), strictly compare the prediction to the ground truth. The prediction \
+must match in meaning.
+- If the ground truth is open-ended (a description, explanation, or reasoning), \
+the prediction is correct if it captures the key facts from the ground truth \
+without introducing factual errors. A shorter but factually correct answer \
+should still receive a high score.
+- Synonyms, paraphrases, and equivalent expressions count as correct.
+- Contradictions in key facts (wrong numbers, wrong objects, opposite \
+directions) are always incorrect.
 
 Examples of equivalent answers (score 10):
 - "3" and "three"
 - "There are three slices" and "3 slices"
 - "No" and "No, it is not."
-- "We are not going" and "We ain't going"
 - "a cat" and "a domestic cat sitting on the table"
-- "The brand is LG" and "LG"
+- "taxi" and "cab"
 
 Examples of NOT equivalent answers (score 0):
 - "3" and "4" (different numbers)
 - "Yes" and "No" (opposite polarity)
 - "left" and "right" (opposite direction)
 - "dog" and "cat" (different entities)
-- "red" and "blue" (different attributes)
-- "The pepper is on the left" and "The pepper is on the right" (contradictory)
+- "bottles" and "breads" (different objects)
 
-Rate how equivalent the predicted answer is to the ground truth on a scale of 0-10:
-- 10: Identical or perfect paraphrase (same meaning, same facts)
-- 7-9: Mostly equivalent (same core answer, minor differences in detail or wording)
-- 4-6: Partially equivalent (some overlap but missing or different key information)
+Rate the correctness of the predicted answer on a scale of 0-10:
+- 10: Identical or perfect paraphrase (same meaning, same key facts)
+- 7-9: Mostly correct (same core answer, minor wording or detail differences)
+- 4-6: Partially correct (some overlap but missing or different key information)
 - 1-3: Mostly wrong (different answer, different facts, contradictions)
 - 0: Completely wrong or unrelated
 
+Question: {question}
 Ground Truth: {ground_truth}
 Predicted Answer: {predicted}
 
@@ -138,18 +149,21 @@ def _parse_score(generated: str) -> float:
     return 0.0
 
 
-def llm_judge_score(predicted: str, ground_truth: str) -> float:
-    """Score the equivalence of predicted answer vs ground truth using LLM.
+def llm_judge_score(
+    predicted: str, ground_truth: str, question: str = ""
+) -> float:
+    """Score the correctness of predicted answer vs ground truth using LLM.
 
-    Uses Qwen2.5-3B-Instruct to produce a 0-10 score, normalized to [0, 1].
+    Uses Qwen2.5-7B-Instruct to produce a 0-10 score, normalized to [0, 1].
     Results are cached in a module-level dict (maxsize unlimited).
 
     Args:
         predicted: Predicted answer text
         ground_truth: Ground truth answer text
+        question: Original question text (provides context for judgment)
 
     Returns:
-        Equivalence score in [0.0, 1.0] where 1.0 = perfect match
+        Correctness score in [0.0, 1.0] where 1.0 = perfect match
     """
     import torch
 
@@ -160,6 +174,7 @@ def llm_judge_score(predicted: str, ground_truth: str) -> float:
     model, tokenizer = _get_judge_model()
 
     prompt = _JUDGE_PROMPT.format(
+        question=question.strip() if question else "(not provided)",
         ground_truth=key[1],
         predicted=key[0],
     )
@@ -315,7 +330,7 @@ def llm_format_judge(
 ) -> float:
     """Judge whether predicted answer has the same format as ground truth.
 
-    Uses the Qwen2.5-3B-Instruct model to evaluate format similarity,
+    Uses the Qwen2.5-7B-Instruct model to evaluate format similarity,
     NOT semantic correctness. Results are cached.
 
     Args:

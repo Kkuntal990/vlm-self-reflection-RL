@@ -38,7 +38,7 @@ class RewardWeights:
     """
 
     w_final: float = 1.0
-    w_format: float = 0.5
+    w_format: float = 0.15
     w_rw: float = 2.0
     w_edit: float = 0.3
     w_fb: float = 0.5
@@ -81,26 +81,23 @@ class CriticRewardWeights:
     """Weights for critic reward composition.
 
     reward = w_downstream * R_downstream
-           + w_calibration * R_calibration
            + w_format * R_format
 
     Attributes:
         w_downstream: Weight for downstream-aware reward (dominant)
-        w_calibration: Weight for feedback calibration
         w_format: Weight for format compliance
     """
 
     w_downstream: float = 2.0
-    w_calibration: float = 1.0
-    w_format: float = 0.5
+    w_format: float = 0.15
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
 
     def to_list(self) -> list[float]:
-        """Return weights as ordered list: [format, calibration, downstream]."""
-        return [self.w_format, self.w_calibration, self.w_downstream]
+        """Return weights as ordered list: [format, downstream]."""
+        return [self.w_format, self.w_downstream]
 
 
 @dataclass
@@ -122,7 +119,7 @@ class RefinerRewardWeights:
     w_correctness: float = 1.0
     w_no_regression: float = 2.0
     w_minimal_edit: float = 0.3
-    w_format: float = 0.5
+    w_format: float = 0.15
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -351,10 +348,10 @@ class ResponseRewardWeights:
         w_minimal_edit: Weight for minimal edit reward
     """
 
-    w_a1_correctness: float = 0.5
+    w_a1_correctness: float = 1.0
     w_a2_correctness: float = 1.0
     w_no_regression: float = 2.0
-    w_a2_format: float = 0.5
+    w_a2_format: float = 0.15
     w_minimal_edit: float = 0.3
 
     def to_dict(self) -> dict:
@@ -367,18 +364,15 @@ class FeedbackRewardWeights:
     """Weights for feedback reward (applied to F1 log-prob).
 
     reward_fb = w_downstream * R_downstream
-              + w_calibration * R_calibration
               + w_format * R_format
 
     Attributes:
         w_downstream: Weight for downstream-aware reward (dominant)
-        w_calibration: Weight for feedback calibration
         w_format: Weight for format compliance
     """
 
     w_downstream: float = 2.0
-    w_calibration: float = 1.0
-    w_format: float = 0.5
+    w_format: float = 0.15
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

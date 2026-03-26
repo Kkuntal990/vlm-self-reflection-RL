@@ -181,9 +181,6 @@ def parse_args() -> argparse.Namespace:
         "--w_downstream", type=float, default=2.0, help="Downstream reward weight",
     )
     parser.add_argument(
-        "--w_calibration", type=float, default=1.0, help="Calibration reward weight",
-    )
-    parser.add_argument(
         "--w_format", type=float, default=0.5, help="Format reward weight",
     )
 
@@ -221,7 +218,6 @@ def _run_sanity_check(args: argparse.Namespace) -> None:
 
     weights = CriticRewardWeights(
         w_downstream=args.w_downstream,
-        w_calibration=args.w_calibration,
         w_format=args.w_format,
     )
 
@@ -261,7 +257,6 @@ def _run_sanity_check(args: argparse.Namespace) -> None:
             logger.info(
                 f"  [{name}] total={bd.total_reward:+.2f} | "
                 f"downstream={bd.components['downstream']:+.1f} "
-                f"calib={bd.components['calibration']:+.1f} "
                 f"format={bd.components['format']:+.1f} | "
                 f"a2_correct={bd.a2_correct}"
             )
@@ -340,7 +335,6 @@ def main() -> None:
     # Build configuration
     reward_weights = CriticRewardWeights(
         w_downstream=args.w_downstream,
-        w_calibration=args.w_calibration,
         w_format=args.w_format,
     )
 

@@ -48,15 +48,15 @@ class TestA2CorrectnessReward:
         r = compute_a2_correctness_reward("cat", "cat", "open", format_valid=True)
         assert r == 1.0
 
-    def test_open_mismatch_returns_wrong(self) -> None:
-        """Unrelated open-ended answer → WRONG → -1.0."""
+    def test_open_mismatch_returns_negative(self) -> None:
+        """Unrelated open-ended answer → low score → negative continuous reward."""
         r = compute_a2_correctness_reward("airplane", "cat", "open", format_valid=True)
-        assert r == -1.0
+        assert r < 0  # Continuous: low similarity maps to negative reward
 
-    def test_open_substring_returns_correct(self) -> None:
-        """Substring match → CORRECT → +1.0."""
+    def test_open_substring_returns_high(self) -> None:
+        """Substring match → high score → near +1.0 continuous reward."""
         r = compute_a2_correctness_reward("a domestic cat", "cat", "open", format_valid=True)
-        assert r == 1.0
+        assert r > 0.8  # Continuous: score=0.95 → reward=0.9
 
     def test_format_invalid_returns_zero(self) -> None:
         r = compute_a2_correctness_reward("A", "A", "mcq", format_valid=False)

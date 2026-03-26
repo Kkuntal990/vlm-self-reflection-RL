@@ -31,6 +31,12 @@ def compute_a2_correctness_reward(
 ) -> float:
     """R_a2_correct: Check if A2 matches ground truth.
 
+    For deterministic types (MCQ, YesNo, Numeric): binary +1.0/-1.0.
+    For counting: continuous reward based on fuzzy score (CrowdVLM-R1,
+    arXiv:2504.03724). Predicting 5 when GT is 6 gets partial credit.
+    For open-ended: continuous reward from LLM judge or similarity score
+    (RARL arXiv:2506.06600, VisionThink arXiv:2507.13348).
+
     Gated by format validity: returns 0.0 if format is invalid.
 
     Args:
@@ -41,13 +47,20 @@ def compute_a2_correctness_reward(
         tolerance: Numeric tolerance for comparison
 
     Returns:
-        +1.0 correct, -1.0 incorrect
+        Reward in [-1.0, 1.0]. Continuous for counting/open, binary for others.
     """
     if not format_valid:
         return 0.0
 
     result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
 
+    # Counting and open-ended: use continuous score when available.
+    # Maps score [0, 1] to reward [-1, +1] via: reward = 2*score - 1.
+    # score=1.0 → +1.0, score=0.5 → 0.0, score=0.0 → -1.0.
+    if answer_type in ("counting", "open") and result.score is not None:
+        return 2.0 * result.score - 1.0
+
+    # Deterministic types (MCQ, YesNo, Numeric): binary
     if result.is_correct:
         return 1.0
     return -1.0

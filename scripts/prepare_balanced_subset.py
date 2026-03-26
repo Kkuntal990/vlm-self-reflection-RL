@@ -2,15 +2,17 @@
 """
 Prepare a balanced subset of the training data for GRPO experiments.
 
-Reads multiple JSONL dataset files, classifies each sample by answer_type,
-and creates a balanced subset with configurable target counts per type.
+Two-step classification pipeline:
+1. Extract the actual answer from GT (strip "Thought: ... Answer: ..." wrapper,
+   strip "Rationale: ..." suffix)
+2. Classify using BOTH the question text and extracted answer
 
 Default strategy (70K total):
   - MCQ: 13,000 (random sample)
   - Yes/No: 7,000 (random sample)
-  - Counting: all (~4,500, take all)
-  - Open-ended: ~22,750 (split remaining evenly)
-  - Short answer: ~22,750 (split remaining evenly)
+  - Counting: all (~5,700, take all)
+  - Numeric: merge into short
+  - Open-ended + Short: split remaining evenly
 
 Usage:
     python scripts/prepare_balanced_subset.py \
@@ -22,14 +24,11 @@ Usage:
                       /outputs/mixed_training_v1/vqa_scienceqa.jsonl \
                       /outputs/mixed_training_v1/vqa_tallyqa.jsonl \
         --output /outputs/grpo_data/balanced_70k.jsonl \
-        --total 70000 \
-        --mcq 13000 \
-        --yesno 7000
+        --total 70000 --mcq 13000 --yesno 7000
 
     # Dry run (show statistics only)
     python scripts/prepare_balanced_subset.py \
-        --input_files /outputs/mixed_training_v1/*.jsonl \
-        --dry_run
+        --input_files /outputs/mixed_training_v1/*.jsonl --dry_run
 """
 
 import argparse
@@ -49,94 +48,184 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def detect_answer_type(
-    question: str,
-    ground_truth: str,
-    choices: str = "",
-    category: str = "",
-) -> str:
-    """Classify a sample into an answer type.
+# =============================================================================
+# Answer Extraction
+# =============================================================================
+
+
+def extract_answer_from_gt(raw_gt: str) -> str:
+    """Extract the actual answer from a GT that may have Thought/Answer format.
+
+    Handles:
+    - "Thought: ... Answer: actual answer" → "actual answer"
+    - "Answer: office.\nRationale: ..." → "office."
+    - Multiple "Answer:" tags → uses the LAST one
+    - Plain text (no tags) → returns as-is
+
+    Args:
+        raw_gt: Raw ground truth text from the dataset
+
+    Returns:
+        Extracted answer string, stripped of thought/rationale wrappers
+    """
+    # Find all "Answer:" occurrences, use the last one
+    matches = list(re.finditer(r"Answer:\s*(.*?)(?=\nThought:|\Z)", raw_gt, re.DOTALL))
+    if matches:
+        answer = matches[-1].group(1).strip()
+        # Strip rationale suffix (aokvqa format: "Answer: X\nRationale: ...")
+        if "\nRationale:" in answer:
+            answer = answer.split("\nRationale:")[0].strip()
+        return answer
+    return raw_gt.strip()
+
+
+# =============================================================================
+# Answer Type Classification
+# =============================================================================
+
+
+def classify_sample(question: str, extracted_answer: str) -> str:
+    """Classify a sample using BOTH the question and extracted answer.
+
+    Uses question patterns to detect MCQ (options/choices) and Yes/No
+    (interrogative form), combined with answer format analysis.
+
+    Fixes from audit (v2):
+    - Filter refusal/safety responses ("I cannot", "I'm sorry")
+    - Exclude proper names from MCQ detection ("A. Singh" is NOT MCQ)
+    - Detect inline options ("based on the options") for MCQ
+    - Detect lowercase (a)/(b)/(c)/(d) MCQ patterns
+    - Exclude years (1900-2099) and large IDs (>5 digits) from counting
 
     Args:
         question: Question text
-        ground_truth: Ground truth answer string
-        choices: Explicit choices string (if any)
-        category: Dataset category field (if any)
+        extracted_answer: Answer text after extraction from GT
 
     Returns:
-        One of: "mcq", "yesno", "counting", "open", "short"
+        One of: "mcq", "yesno", "counting", "numeric", "short", "open",
+        or "_refusal" for filtered samples
     """
-    gt_lower = ground_truth.strip().lower()
+    a = extracted_answer.strip()
+    a_lower = a.lower().rstrip(".")
     q_lower = question.lower()
 
-    # Explicit category mapping
-    category_map = {
-        "mcq": "mcq",
-        "yes_no": "yesno",
-        "counting": "counting",
-    }
-    if category in category_map:
-        return category_map[category]
+    # --- Filter: refusal/safety responses are not useful for training ---
+    if re.search(
+        r"\b(i cannot|i'm sorry|i apologize|i'm unable|as an ai)\b",
+        a_lower,
+    ):
+        return "_refusal"
 
-    # Check for explicit choices
-    if choices:
+    # --- MCQ detection ---
+
+    # 1. Single letter A-F → MCQ
+    if len(a_lower) == 1 and a_lower in "abcdef":
         return "mcq"
 
-    # MCQ pattern in question: "(A) text" or "A. text"
-    mcq_paren = re.compile(r"\([A-F]\)\s*\w+", re.IGNORECASE)
-    mcq_dot = re.compile(r"^[A-F]\.\s*.+", re.MULTILINE | re.IGNORECASE)
-    if mcq_paren.search(question) or mcq_dot.search(question):
+    # 2. Answer starts with MCQ pattern: '(A)', 'A.', 'A)' + text
+    # Exclude proper names: "A. Singh" (uppercase after space) is NOT MCQ
+    # Allow: "A. 50 degrees" (digit after space) IS MCQ
+    mcq_prefix = re.match(r"^(?:\([A-F]\)|[A-F][).])\s+(\S)", a)
+    if mcq_prefix:
+        next_char = mcq_prefix.group(1)
+        if not next_char.isupper() or next_char.isdigit():
+            return "mcq"
+
+    # 3. Answer starts with lowercase (a)/(b)/(c)/(d) → MCQ
+    if re.match(r"^\([a-d]\)\s", a):
         return "mcq"
 
-    # Single letter answer (likely MCQ)
-    if len(gt_lower) == 1 and gt_lower in "abcdef":
+    # 4. Question has explicit options AND answer is short (<=5 words)
+    has_options = bool(
+        re.search(r"\([A-F]\)\s*\w", question, re.IGNORECASE)
+        or re.search(r"^[A-F]\.\s*.+", question, re.MULTILINE | re.IGNORECASE)
+        or re.search(r"\bOptions?:\s", question, re.IGNORECASE)
+        or re.search(r"\bchoices?\s*(?:given|are|:)", question, re.IGNORECASE)
+        or re.search(r"\bselect\b.*\b(?:answer|option|choice)", question, re.IGNORECASE)
+        or re.search(r"\bbased on the options\b", question, re.IGNORECASE)
+        or re.search(
+            r"\bfrom the (?:following|given|above) (?:options|choices)\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+    if has_options and len(a.split()) <= 5:
         return "mcq"
 
-    # Yes/No
-    if gt_lower in ("yes", "no", "y", "n", "true", "false"):
+    # --- Yes/No detection ---
+
+    # 5. Bare yes/no answer
+    if a_lower in ("yes", "no"):
         return "yesno"
 
-    # Counting: numeric GT + counting question pattern
-    counting_patterns = [
-        r"how many",
-        r"number of",
-        r"count",
-        r"total number",
-        r"how much",
-        r"what is the number",
-    ]
-    is_counting_q = any(re.search(p, q_lower) for p in counting_patterns)
+    # 6. Question is yes/no form AND answer starts with yes/no
+    yesno_q = bool(
+        re.match(
+            r"^(?:is |are |was |were |do |does |did |can |could |will |would "
+            r"|has |have |had |should )",
+            q_lower,
+        )
+    )
+    if yesno_q and re.match(r"^(yes|no)\b", a_lower):
+        return "yesno"
+
+    # --- Numeric / Counting detection ---
+
+    # Strip trailing %, °, and common suffixes for numeric check
+    num_text = a_lower.replace(",", "").rstrip("%°")
     try:
-        float(ground_truth.strip().replace(",", ""))
+        float(num_text)
         is_numeric = True
     except ValueError:
         is_numeric = False
 
-    if is_numeric and is_counting_q:
-        return "counting"
-
-    # Numeric (non-counting)
     if is_numeric:
-        return "short"
+        counting_pats = [
+            r"\bhow many\b",
+            r"\bnumber of\b",
+            r"\bcount\b",
+            r"\btotal number\b",
+            r"\bhow much\b",
+        ]
+        is_counting_q = any(re.search(p, q_lower) for p in counting_pats)
 
-    # Short vs open: heuristic based on GT length
-    gt_words = ground_truth.strip().split()
-    if len(gt_words) <= 5:
-        return "short"
+        # Exclude years (4-digit 1900-2099) and large IDs (>5 digits)
+        is_year = bool(re.match(r"^(19|20)\d{2}$", num_text))
+        is_large_id = len(num_text.replace(".", "").replace("-", "")) > 5
 
+        if is_counting_q and not is_year and not is_large_id:
+            return "counting"
+        return "numeric"
+
+    # --- Short vs Open ---
+    if len(a.split()) <= 5:
+        return "short"
     return "open"
 
 
-def load_samples(input_files: list[str]) -> list[dict]:
-    """Load and concatenate samples from multiple JSONL files.
+# =============================================================================
+# Data Loading
+# =============================================================================
+
+
+def load_and_process_samples(input_files: list[str]) -> list[dict]:
+    """Load JSONL files, extract answers, classify, and return processed samples.
+
+    Each output sample has:
+    - Original fields (messages, images, etc.)
+    - answer_type: classified type
+    - ground_truth: extracted answer (stripped of Thought/Rationale)
+    - question: extracted question text
+    - _source_file: source filename (removed before writing)
 
     Args:
-        input_files: List of paths to JSONL files
+        input_files: Paths to JSONL files
 
     Returns:
-        List of sample dicts with source file info
+        List of processed sample dicts
     """
     all_samples = []
+
     for filepath in input_files:
         path = Path(filepath)
         if not path.exists():
@@ -151,11 +240,35 @@ def load_samples(input_files: list[str]) -> list[dict]:
                     continue
                 try:
                     sample = json.loads(line)
-                    sample["_source_file"] = path.name
-                    all_samples.append(sample)
-                    count += 1
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse line in {path.name}: {e}")
+                    continue
+
+                # Extract question and raw GT from messages format
+                if "messages" in sample:
+                    msgs = sample["messages"]
+                    user_msgs = [m["content"] for m in msgs if m["role"] == "user"]
+                    asst_msgs = [m["content"] for m in msgs if m["role"] == "assistant"]
+                    question = user_msgs[0] if user_msgs else ""
+                    raw_gt = asst_msgs[-1] if asst_msgs else ""
+                else:
+                    question = sample.get("question", "")
+                    raw_gt = sample.get("ground_truth", "")
+
+                # Step 1: Extract answer from GT
+                extracted = extract_answer_from_gt(raw_gt)
+
+                # Step 2: Classify using question + extracted answer
+                answer_type = classify_sample(question, extracted)
+
+                # Store processed fields
+                sample["question"] = question.replace("<image>", "").strip()
+                sample["ground_truth"] = extracted
+                sample["answer_type"] = answer_type
+                sample["_source_file"] = path.name
+
+                all_samples.append(sample)
+                count += 1
 
         logger.info(f"Loaded {count} samples from {path.name}")
 
@@ -163,33 +276,9 @@ def load_samples(input_files: list[str]) -> list[dict]:
     return all_samples
 
 
-def extract_fields(sample: dict) -> dict:
-    """Extract question, ground_truth, and other fields from a sample.
-
-    Handles both flat JSONL and messages-format JSONL.
-
-    Args:
-        sample: Raw JSONL record
-
-    Returns:
-        Dict with question, ground_truth, answer_type, choices, etc.
-    """
-    if "messages" in sample and "question" not in sample:
-        messages = sample.get("messages", [])
-        user_msgs = [m for m in messages if m["role"] == "user"]
-        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
-        question = user_msgs[0]["content"] if user_msgs else ""
-        ground_truth = assistant_msgs[-1]["content"] if assistant_msgs else ""
-    else:
-        question = sample.get("question", "")
-        ground_truth = sample.get("ground_truth", "")
-
-    return {
-        "question": question,
-        "ground_truth": ground_truth,
-        "choices": sample.get("choices", ""),
-        "category": sample.get("category", ""),
-    }
+# =============================================================================
+# CLI
+# =============================================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,7 +308,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mcq", type=int, default=13000, help="Target MCQ count")
     parser.add_argument("--yesno", type=int, default=7000, help="Target Yes/No count")
     parser.add_argument(
-        "--counting", type=int, default=0, help="Target counting count (0 = take all)"
+        "--counting",
+        type=int,
+        default=0,
+        help="Target counting count (0 = take all)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--dry_run", action="store_true", help="Show statistics without writing")
@@ -227,29 +319,37 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
+
 def main() -> None:
     """Main function for balanced dataset preparation."""
     args = parse_args()
     random.seed(args.seed)
 
-    # Load all samples
-    all_samples = load_samples(args.input_files)
+    # Load, extract answers, and classify
+    all_samples = load_and_process_samples(args.input_files)
     if not all_samples:
         logger.error("No samples loaded. Check input file paths.")
         return
 
-    # Classify each sample by answer type
+    # Bucket by answer type (merge numeric into short, filter refusals)
     type_buckets: dict[str, list[dict]] = defaultdict(list)
+    refusal_count = 0
     for sample in all_samples:
-        fields = extract_fields(sample)
-        answer_type = detect_answer_type(
-            fields["question"],
-            fields["ground_truth"],
-            fields["choices"],
-            fields["category"],
-        )
-        sample["answer_type"] = answer_type
-        type_buckets[answer_type].append(sample)
+        at = sample["answer_type"]
+        if at == "_refusal":
+            refusal_count += 1
+            continue
+        if at == "numeric":
+            at = "short"
+            sample["answer_type"] = "short"
+        type_buckets[at].append(sample)
+
+    if refusal_count > 0:
+        logger.info(f"Filtered {refusal_count} refusal/safety samples")
 
     # Print distribution
     logger.info("\n=== Original Distribution ===")
@@ -261,6 +361,16 @@ def main() -> None:
     logger.info(f"  {'TOTAL':>10s}: {total_orig:>7d}")
 
     if args.dry_run:
+        # Show per-source breakdown
+        logger.info("\n=== Per-Source Breakdown ===")
+        source_type_counts: dict[str, Counter] = defaultdict(Counter)
+        for s in all_samples:
+            source_type_counts[s["_source_file"]][s["answer_type"]] += 1
+        for src, counts in sorted(source_type_counts.items()):
+            total_src = sum(counts.values())
+            parts = [f"{at}={c}" for at, c in sorted(counts.items()) if c > 0]
+            logger.info(f"  {src}: {total_src} total — {', '.join(parts)}")
+
         logger.info("\nDry run complete. Use --output to write balanced subset.")
         return
 
@@ -269,7 +379,6 @@ def main() -> None:
         return
 
     # Determine target counts
-    # Fixed targets
     mcq_target = min(args.mcq, len(type_buckets["mcq"]))
     yesno_target = min(args.yesno, len(type_buckets["yesno"]))
     counting_target = (
@@ -281,13 +390,11 @@ def main() -> None:
     fixed_total = mcq_target + yesno_target + counting_target
     remaining = args.total - fixed_total
 
-    # Split remaining evenly between open and short
-    open_target = remaining // 2
-    short_target = remaining - open_target  # handle odd number
-
-    # Cap at available
-    open_target = min(open_target, len(type_buckets["open"]))
-    short_target = min(short_target, len(type_buckets["short"]))
+    # Split remaining evenly between open and short, overflow to the other
+    short_available = len(type_buckets["short"])
+    open_available = len(type_buckets["open"])
+    short_target = min(remaining // 2, short_available)
+    open_target = min(remaining - short_target, open_available)
 
     targets = {
         "mcq": mcq_target,
@@ -324,7 +431,6 @@ def main() -> None:
 
     with open(output_path, "w") as f:
         for sample in selected:
-            # Remove internal metadata
             sample.pop("_source_file", None)
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
 

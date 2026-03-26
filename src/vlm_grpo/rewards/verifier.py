@@ -293,6 +293,29 @@ def _check_substring_containment(pred: str, gt: str) -> bool:
 # =============================================================================
 
 
+def _extract_answer_portion(text: str) -> str:
+    """Extract the answer from text that may have Thought/Answer format.
+
+    If the text follows "Thought: ... Answer: ..." format, extracts just the
+    answer portion. Otherwise returns the text as-is. Uses the LAST "Answer:"
+    match to handle rare double-tag cases.
+
+    Args:
+        text: Raw text possibly containing Thought/Answer wrapper
+
+    Returns:
+        Extracted answer string
+    """
+    matches = list(re.finditer(r"Answer:\s*(.*?)(?=\nThought:|\Z)", text, re.DOTALL))
+    if matches:
+        answer = matches[-1].group(1).strip()
+        # Strip rationale suffix if present
+        if "\nRationale:" in answer:
+            answer = answer.split("\nRationale:")[0].strip()
+        return answer
+    return text.strip()
+
+
 def verify_answer(
     raw_text: str,
     ground_truth: str,
@@ -303,6 +326,9 @@ def verify_answer(
     """Verify a raw answer text against ground truth.
 
     Returns CORRECT or WRONG -- never undetermined.
+
+    If either raw_text or ground_truth follows "Thought: ... Answer: ..."
+    format, the answer portion is extracted before verification.
 
     Dispatches by answer_type:
     - mcq: letter comparison, fallback to open if GT has no letter (Rule 3)
@@ -323,6 +349,10 @@ def verify_answer(
     Returns:
         MatchResult with verdict "CORRECT" or "WRONG"
     """
+    # Extract answer from Thought/Answer format if present
+    raw_text = _extract_answer_portion(raw_text)
+    ground_truth = _extract_answer_portion(ground_truth)
+
     if answer_type == "mcq":
         return _verify_mcq(raw_text, ground_truth, choices)
     elif answer_type == "yesno":
@@ -475,6 +505,10 @@ def _verify_yesno(
                         extracted=pred_verdict.capitalize(),
                         score=score,
                     )
+                else:
+                    # LLM judge disabled: use open-ended cascade to verify
+                    # the full answer, not just the yes/no prefix.
+                    return _verify_open_ended(raw_text, raw_text.strip(), ground_truth, "yesno")
             except Exception as e:
                 logger.warning(f"LLM judge failed in yesno path, using open-ended: {e}")
                 return _verify_open_ended(raw_text, raw_text.strip(), ground_truth, "yesno")
@@ -524,6 +558,8 @@ def _verify_yesno(
                         extracted=p.capitalize(),
                         score=score,
                     )
+                else:
+                    return _verify_open_ended(raw_text, raw_text.strip(), ground_truth, "yesno")
             except Exception as e:
                 logger.warning(f"LLM judge failed in yesno broad path, using open-ended: {e}")
                 return _verify_open_ended(raw_text, raw_text.strip(), ground_truth, "yesno")
@@ -566,20 +602,26 @@ def _verify_counting(
     pred_num = _extract_number_from_sentence(raw_text)
     gt_num = _extract_number_from_sentence(ground_truth)
 
-    # Both have numbers → compare
+    # Both have numbers → fuzzy comparison with continuous score.
+    # Binary exact-match rewards for counting underperform SFT
+    # (CrowdVLM-R1, arXiv:2504.03724). Fuzzy rewards give gradient
+    # signal for near-misses (predicting 5 when GT is 6).
+    # For small GT (0-2), use max(|gt|, 3) as denominator so
+    # off-by-one still gets partial credit (e.g., pred=1, GT=0 → 0.67).
     if pred_num is not None and gt_num is not None:
-        # Integer comparison for counting
-        if isinstance(pred_num, float) or isinstance(gt_num, float):
-            match = abs(pred_num - gt_num) < 0.01
+        if pred_num == gt_num:
+            score = 1.0
         else:
-            match = pred_num == gt_num
-        verdict = CORRECT if match else WRONG
+            abs_error = abs(pred_num - gt_num)
+            denom = max(abs(gt_num), 3)
+            score = max(0.0, 1.0 - abs_error / denom)
+        verdict = CORRECT if score >= 0.5 else WRONG
         return MatchResult(
             answer_type="counting",
             parse_ok=True,
             verdict=verdict,
             extracted=str(pred_num),
-            score=None,
+            score=score,
         )
 
     # Fallback to open-ended
@@ -709,15 +751,16 @@ def _has_color_conflict(pred: str, gt: str) -> bool:
 def _is_atomic_anls_candidate(pred: str, gt: str) -> bool:
     """Whether ANLS is appropriate for this answer pair.
 
-    ANLS is useful for OCR-style typos on short atomic answers ("colur" vs
-    "color"), but it is too permissive for sentence-level VQA answers where a
-    single wrong token can still yield a high string-similarity score.
+    ANLS is useful for OCR-style typos on short answers ("fire truk" vs
+    "fire truck"), but it is too permissive for sentence-level VQA answers
+    where a single wrong token can still yield a high string-similarity score.
+    Widened from 1-word to ≤3-word pairs to cover common short answers.
     """
     pred_norm = _normalize_text(pred)
     gt_norm = _normalize_text(gt)
     if not pred_norm or not gt_norm:
         return False
-    return len(pred_norm.split()) == 1 and len(gt_norm.split()) == 1
+    return len(pred_norm.split()) <= 3 and len(gt_norm.split()) <= 3
 
 
 def _verify_open_ended(

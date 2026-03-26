@@ -28,8 +28,7 @@ class TestCriticRewardWeights:
     def test_defaults(self) -> None:
         w = CriticRewardWeights()
         assert w.w_downstream == 2.0
-        assert w.w_calibration == 1.0
-        assert w.w_format == 0.5
+        assert w.w_format == 0.15
 
     def test_to_dict(self) -> None:
         w = CriticRewardWeights()
@@ -40,11 +39,11 @@ class TestCriticRewardWeights:
     def test_to_list(self) -> None:
         w = CriticRewardWeights()
         lst = w.to_list()
-        assert len(lst) == 3
-        assert lst == [0.5, 1.0, 2.0]  # [format, calibration, downstream]
+        assert len(lst) == 2
+        assert lst == [0.15, 2.0]  # [format, downstream]
 
     def test_custom_weights(self) -> None:
-        w = CriticRewardWeights(w_downstream=3.0, w_calibration=0.5, w_format=0.1)
+        w = CriticRewardWeights(w_downstream=3.0, w_format=0.1)
         assert w.w_downstream == 3.0
 
 
@@ -56,13 +55,13 @@ class TestRefinerRewardWeights:
         assert w.w_correctness == 1.0
         assert w.w_no_regression == 2.0
         assert w.w_minimal_edit == 0.3
-        assert w.w_format == 0.5
+        assert w.w_format == 0.15
 
     def test_to_list(self) -> None:
         w = RefinerRewardWeights()
         lst = w.to_list()
         assert len(lst) == 4
-        assert lst == [0.5, 1.0, 2.0, 0.3]
+        assert lst == [0.15, 1.0, 2.0, 0.3]
 
 
 # =============================================================================
@@ -88,7 +87,7 @@ class TestCriticRewardBreakdown:
         assert bd.a2_correct is True
         assert bd.format_valid is True
         assert bd.components["downstream"] == 1.0
-        assert bd.components["calibration"] == 1.0
+        assert "calibration" not in bd.components
         assert bd.total_reward > 0
 
     def test_rw_regression(self) -> None:

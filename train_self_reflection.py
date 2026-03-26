@@ -154,16 +154,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Response reward weights
-    parser.add_argument("--w_a1_correctness", type=float, default=0.5)
+    parser.add_argument("--w_a1_correctness", type=float, default=1.0)
     parser.add_argument("--w_a2_correctness", type=float, default=1.0)
     parser.add_argument("--w_no_regression", type=float, default=2.0)
-    parser.add_argument("--w_a2_format", type=float, default=0.5)
+    parser.add_argument("--w_a2_format", type=float, default=0.15)
     parser.add_argument("--w_minimal_edit", type=float, default=0.3)
 
     # Feedback reward weights
     parser.add_argument("--w_downstream", type=float, default=2.0)
-    parser.add_argument("--w_calibration", type=float, default=1.0)
-    parser.add_argument("--w_fb_format", type=float, default=0.5)
+    parser.add_argument("--w_fb_format", type=float, default=0.15)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -230,7 +229,6 @@ def main() -> None:
     )
     feedback_weights = FeedbackRewardWeights(
         w_downstream=args.w_downstream,
-        w_calibration=args.w_calibration,
         w_format=args.w_fb_format,
     )
     rollout_config = RolloutConfig(

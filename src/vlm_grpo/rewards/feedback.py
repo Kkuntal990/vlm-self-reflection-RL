@@ -119,7 +119,7 @@ def compute_downstream_aware_reward(
         A2 wrong (RW):   -2.0  (feedback caused regression)
 
     When A1 is wrong (full phase):
-        A2 correct (WR): +3.0  (feedback successfully fixed the error)
+        A2 correct (WR): +2.0  (feedback fixed the error, 2:1 ratio with RR)
         A2 wrong (WW):   -1.0  (feedback failed to help)
 
     Returns 0.0 if feedback is empty.
@@ -147,5 +147,5 @@ def compute_downstream_aware_reward(
             return 1.0  # RR: good feedback maintained correctness
         return -2.0  # RW: bad feedback caused regression
     if a2_correct:
-        return 3.0  # WR: great feedback fixed the error
+        return 2.0  # WR: feedback fixed the error (2:1 ratio with RR)
     return -1.0  # WW: feedback failed to help
