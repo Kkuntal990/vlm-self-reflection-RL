@@ -966,6 +966,32 @@ class SelfReflectionGRPOTrainer:
         resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
 
+        # Compute frac_reward_zero_std: fraction of K-groups where all
+        # trajectories got identical rewards (zero variance → zero learning signal).
+        # This is the key metric TRL tracks for detecting dead batches.
+        n_groups = len(resp_rewards_t) // k
+        n_zero_std_groups = 0
+        for gi in range(n_groups):
+            group = resp_rewards_t[gi * k : (gi + 1) * k]
+            if group.std().item() < 1e-8:
+                n_zero_std_groups += 1
+        frac_reward_zero_std = n_zero_std_groups / max(n_groups, 1)
+
+        # Compute completion length stats from rollout results
+        a1_lens = []
+        f1_lens = []
+        a2_lens = []
+        for result in rollout_results:
+            for a1 in result.answer1s:
+                a1_lens.append(len(a1.split()))
+            for f1 in result.feedbacks:
+                f1_lens.append(len(f1.split()))
+            for a2 in result.answer2s:
+                a2_lens.append(len(a2.split()))
+        avg_a1_len = sum(a1_lens) / max(len(a1_lens), 1)
+        avg_f1_len = sum(f1_lens) / max(len(f1_lens), 1)
+        avg_a2_len = sum(a2_lens) / max(len(a2_lens), 1)
+
         # Step 4: Pre-tokenize once, then compute old/ref log-probs in mini-batches.
         #
         # Pre-tokenization caches apply_chat_template strings and prompt/full
@@ -1199,13 +1225,19 @@ class SelfReflectionGRPOTrainer:
         resp_adv_abs_mean = resp_advantages.abs().mean().item()
         n_zero_adv = (resp_advantages == 0).sum().item()
 
+        # Entropy from the last training forward pass (set by _forward_from_pretokenized_multi)
+        entropy = getattr(self, "_last_entropy", 0.0)
+
         logger.info(
             f"  Inner epochs done: resp_loss={total_resp_loss / num_inner:.4f}, "
             f"fb_loss={total_fb_loss / num_inner:.4f}, "
             f"kl_loss={total_kl_loss / num_inner:.4f}, "
             f"grad_norm={grad_norm:.4f}, "
             f"resp_adv_mean={resp_adv_abs_mean:.4f}, "
-            f"zero_adv={n_zero_adv}/{len(resp_advantages)}"
+            f"zero_adv={n_zero_adv}/{len(resp_advantages)}, "
+            f"entropy={entropy:.3f}, "
+            f"frac_zero_std={frac_reward_zero_std:.2f}, "
+            f"len_a1={avg_a1_len:.0f}/f1={avg_f1_len:.0f}/a2={avg_a2_len:.0f}"
         )
 
         if self.scheduler is not None:
@@ -1558,6 +1590,7 @@ class SelfReflectionGRPOTrainer:
 
         total_len = batch_inputs["input_ids"].shape[1]
         all_lps: list[Any] = []
+        all_entropies: list[float] = []
         for i in range(n):
             pad_len = total_len - all_full_lens[i]
             real_prompt_start = pad_len + all_prompt_lens[i]
@@ -1569,6 +1602,14 @@ class SelfReflectionGRPOTrainer:
             all_lps.append(
                 token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
             )
+            # Per-token entropy: -sum(p * log(p)) averaged over completion tokens.
+            # Tracks output diversity — collapse below ln(2)≈0.693 signals
+            # premature convergence (GTPO arXiv:2508.03772, DAPO arXiv:2503.14476).
+            token_entropy = -(lp.exp() * lp).sum(dim=-1).mean().item()
+            all_entropies.append(token_entropy)
+
+        # Store batch-averaged entropy for the caller to read.
+        self._last_entropy = sum(all_entropies) / len(all_entropies) if all_entropies else 0.0
 
         result: list[list[Any]] = []
         offset = 0
