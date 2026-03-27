@@ -34,17 +34,20 @@ spec:
           echo ""
 
           # Install dependencies
-          pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
+          pip install "vllm>=0.12.0" wandb sentence-transformers deepspeed 2>&1 | tail -5
 
           # Clone and install project
           git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
           cd /workspace/vlm-self-reflection-RL
           pip install -e . 2>&1 | tail -3
 
-          # Run training (multi-GPU via accelerate)
-          accelerate launch --num_processes=${NUM_GPUS:-4} train_self_reflection.py \
+          # Run training (DeepSpeed ZeRO-3 + vLLM colocate)
+          # DeepSpeed is required for vLLM's external_launcher backend
+          accelerate launch --config_file /workspace/vlm-self-reflection-RL/k8s/deepspeed_zero3.yaml train_self_reflection.py \
             --model_id "${MODEL_ID}" \
             --model_type qwen2vl \
+            --use_vllm \
+            --vllm_gpu_memory_utilization 0.40 \
             --dataset_path "${DATASET_PATH}" \
             --val_dataset_path "${VAL_DATASET_PATH}" \
             --output_dir "${OUTPUT_DIR}" \

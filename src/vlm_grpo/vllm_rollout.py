@@ -82,6 +82,11 @@ class VLLMRolloutEngine:
             trust_remote_code=True,
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
+            # Join the existing torch.distributed process group instead of
+            # spawning new NCCL workers. Required for compatibility with
+            # accelerate/DeepSpeed multi-GPU training.
+            # Reference: https://huggingface.co/blog/vllm-colocate
+            distributed_executor_backend="external_launcher",
             limit_mm_per_prompt={"image": 1},
             mm_processor_kwargs={
                 "min_pixels": min_pixels,

@@ -424,12 +424,13 @@ def main() -> None:
         f"Process {accelerator.process_index}: samples {start}-{end} ({len(train_dataset)} samples)"
     )
 
-    # Initialize vLLM engine ONLY on rank 0 to avoid NCCL port conflicts.
-    # Rank 0 generates all completions and broadcasts to other ranks.
-    # This is the standard pattern used by TRL's GRPOTrainer server mode.
-    # Reference: https://huggingface.co/docs/trl/main/en/vllm_integration
+    # Initialize vLLM engine on ALL ranks. With distributed_executor_backend=
+    # "external_launcher", vLLM joins the existing torch.distributed group
+    # (set up by accelerate/DeepSpeed) instead of spawning its own workers.
+    # Each rank runs vLLM for its own data shard — no broadcast needed.
+    # Reference: https://huggingface.co/blog/vllm-colocate
     vllm_engine = None
-    if args.use_vllm and accelerator.is_main_process:
+    if args.use_vllm:
         from vlm_grpo.vllm_rollout import VLLMRolloutEngine
 
         vllm_engine = VLLMRolloutEngine(
@@ -441,7 +442,7 @@ def main() -> None:
             min_pixels=args.min_pixels,
         )
         vllm_engine.sleep()
-        logger.info("vLLM rollout engine initialized on rank 0 (sleeping)")
+        logger.info(f"vLLM engine initialized on rank {accelerator.process_index} (sleeping)")
 
     # Create trainer
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
