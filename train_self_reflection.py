@@ -153,6 +153,19 @@ def parse_args() -> argparse.Namespace:
         help="GRPO loss variant: 'grpo' (vanilla) or 'dr_grpo' (removes length/difficulty bias)",
     )
 
+    # vLLM acceleration
+    parser.add_argument(
+        "--use_vllm",
+        action="store_true",
+        help="Use vLLM for rollout generation (3-5x faster). Requires vllm package.",
+    )
+    parser.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.40,
+        help="Fraction of GPU memory for vLLM KV cache",
+    )
+
     # Response reward weights
     parser.add_argument("--w_a1_correctness", type=float, default=1.0)
     parser.add_argument("--w_a2_correctness", type=float, default=1.0)
@@ -411,6 +424,23 @@ def main() -> None:
         f"Process {accelerator.process_index}: samples {start}-{end} ({len(train_dataset)} samples)"
     )
 
+    # Initialize vLLM engine if requested
+    vllm_engine = None
+    if args.use_vllm:
+        from vlm_grpo.vllm_rollout import VLLMRolloutEngine
+
+        vllm_engine = VLLMRolloutEngine(
+            model_id=args.model_id,
+            processor=processor,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            max_model_len=2048,
+            max_pixels=args.max_pixels,
+            min_pixels=args.min_pixels,
+        )
+        # Start asleep — wake only during rollout
+        vllm_engine.sleep()
+        logger.info("vLLM rollout engine initialized (sleeping)")
+
     # Create trainer
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
 
@@ -421,12 +451,15 @@ def main() -> None:
         config=config,
         optimizer=optimizer,
         accelerator=accelerator,
+        vllm_engine=vllm_engine,
     )
 
     # Train
     logger.info("Starting self-reflection GRPO training...")
     logger.info("  Two-reward design: response (A1+A2) + feedback (F1)")
     logger.info("  Single LoRA adapter, shared parameter updates")
+    if vllm_engine:
+        logger.info("  vLLM rollout acceleration: ENABLED")
     trainer.train(train_dataset, val_dataset)
 
 

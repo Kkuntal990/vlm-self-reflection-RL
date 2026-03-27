@@ -629,6 +629,7 @@ class SelfReflectionGRPOTrainer:
         optimizer: Optional[Any] = None,
         scheduler: Optional[Any] = None,
         accelerator: Optional[Any] = None,
+        vllm_engine: Optional[Any] = None,
     ) -> None:
         """Initialize the self-reflection GRPO trainer.
 
@@ -646,6 +647,7 @@ class SelfReflectionGRPOTrainer:
             optimizer: Optional pre-configured optimizer
             scheduler: Optional learning rate scheduler
             accelerator: Optional HuggingFace Accelerator for distributed training
+            vllm_engine: Optional VLLMRolloutEngine for faster generation
         """
         from torch.optim import AdamW
 
@@ -654,6 +656,7 @@ class SelfReflectionGRPOTrainer:
         self.processor = processor
         self.config = config
         self.accelerator = accelerator
+        self.vllm_engine = vllm_engine
 
         if accelerator is not None:
             self.device = accelerator.device
@@ -847,6 +850,14 @@ class SelfReflectionGRPOTrainer:
             gen_model.gradient_checkpointing_disable()
 
         model_type = getattr(self.config, "model_type", "llava")
+
+        # vLLM sleep/wake cycle: wake for generation, sleep for training.
+        # This shares GPU memory between vLLM and the training model.
+        # Reference: https://docs.vllm.ai/en/latest/features/sleep_mode/
+        if self.vllm_engine is not None:
+            self.vllm_engine.update_weights_from_peft(gen_model)
+            self.vllm_engine.wake_up()
+
         rollout_results = generate_self_reflection_rollout(
             model=gen_model,
             processor=self.processor,
@@ -856,8 +867,13 @@ class SelfReflectionGRPOTrainer:
             feedback_weights=self.config.feedback_weights,
             device=str(self.device),
             model_type=model_type,
+            vllm_engine=self.vllm_engine,
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
+
+        # Put vLLM to sleep to free GPU memory for training
+        if self.vllm_engine is not None:
+            self.vllm_engine.sleep()
 
         # Re-enable gradient checkpointing for the training forward passes
         if had_grad_ckpt:
@@ -1177,7 +1193,6 @@ class SelfReflectionGRPOTrainer:
         # Log advantage statistics to detect the std=0 problem
         # (all K trajectories getting identical rewards → zero advantages → zero gradients)
         resp_adv_abs_mean = resp_advantages.abs().mean().item()
-        fb_adv_abs_mean = fb_advantages.abs().mean().item()
         n_zero_adv = (resp_advantages == 0).sum().item()
 
         logger.info(

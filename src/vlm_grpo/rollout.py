@@ -672,8 +672,12 @@ def generate_self_reflection_rollout(
     feedback_weights: Any,
     device: str = "cuda",
     model_type: str = "llava",
+    vllm_engine: Any = None,
 ) -> list[SelfReflectionRolloutResult]:
     """Generate K full self-reflection trajectories per sample.
+
+    If vllm_engine is provided, uses vLLM for generation (3-5x faster).
+    Otherwise falls back to HuggingFace model.generate().
 
     For each sample, generates K independent chains:
         A1 (temperature) -> F1 (temperature) -> A2 (greedy)
@@ -691,6 +695,7 @@ def generate_self_reflection_rollout(
         feedback_weights: FeedbackRewardWeights for scoring F1
         device: Device for generation
         model_type: Model family ("llava" or "qwen2vl")
+        vllm_engine: Optional VLLMRolloutEngine for faster generation
 
     Returns:
         List of SelfReflectionRolloutResult, one per sample
@@ -730,16 +735,39 @@ def generate_self_reflection_rollout(
             a1_prompts = [build_initial_answer_prompt(q) for q in chunk_qs for _ in range(k)]
             imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
 
-            chunk_a1s = _generate_batch_completions(
-                model,
-                processor,
+            # Route generation through vLLM (if available) or HF generate.
+            # vLLM provides 3-5x speedup via PagedAttention and continuous
+            # batching. Reference: https://docs.vllm.ai/en/latest/features/sleep_mode/
+            def _gen(msgs: list, imgs: list, max_tok: int, temp: float) -> list[str]:
+                if vllm_engine is not None:
+                    texts = [
+                        processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+                        for m in msgs
+                    ]
+                    return vllm_engine.generate_batch(
+                        prompts=texts,
+                        images=imgs,
+                        max_new_tokens=max_tok,
+                        temperature=temp,
+                        top_p=config.top_p,
+                    )
+                return _generate_batch_completions(
+                    model,
+                    processor,
+                    msgs,
+                    imgs,
+                    device,
+                    max_new_tokens=max_tok,
+                    temperature=temp,
+                    top_p=config.top_p,
+                    model_type=model_type,
+                )
+
+            chunk_a1s = _gen(
                 a1_prompts,
                 imgs_expanded,
-                device,
-                max_new_tokens=config.a1_max_completion_length,
-                temperature=config.temperature,
-                top_p=config.top_p,
-                model_type=model_type,
+                config.a1_max_completion_length,
+                config.temperature,
             )
             all_a1s.extend(chunk_a1s)
 
@@ -749,16 +777,11 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
-            chunk_f1s = _generate_batch_completions(
-                model,
-                processor,
+            chunk_f1s = _gen(
                 f1_prompts,
                 imgs_expanded,
-                device,
-                max_new_tokens=config.f1_max_completion_length,
-                temperature=config.feedback_temperature,
-                top_p=config.top_p,
-                model_type=model_type,
+                config.f1_max_completion_length,
+                config.feedback_temperature,
             )
             all_f1s.extend(chunk_f1s)
 
@@ -768,16 +791,11 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
-            chunk_a2s = _generate_batch_completions(
-                model,
-                processor,
+            chunk_a2s = _gen(
                 a2_prompts,
                 imgs_expanded,
-                device,
-                max_new_tokens=config.a2_max_completion_length,
-                temperature=config.a2_temperature,
-                top_p=config.top_p,
-                model_type=model_type,
+                config.a2_max_completion_length,
+                config.a2_temperature,
             )
             all_a2s.extend(chunk_a2s)
 
