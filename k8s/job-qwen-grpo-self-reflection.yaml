@@ -33,16 +33,22 @@ spec:
           nvidia-smi
           echo ""
 
-          # Install dependencies
-          pip install "vllm>=0.12.0" wandb sentence-transformers deepspeed 2>&1 | tail -5
+          # Install dependencies (no DeepSpeed — using DDP for vLLM compat)
+          pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
 
           # Clone and install project (vLLM feature branch)
           git clone -b ${GIT_BRANCH:-feature/vllm-deepspeed} https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
           cd /workspace/vlm-self-reflection-RL
           pip install -e . 2>&1 | tail -3
 
-          # Run training (multi-GPU via accelerate + vLLM colocate)
-          accelerate launch --num_processes=${NUM_GPUS:-4} train_self_reflection.py \
+          # Run training (multi-GPU DDP + vLLM colocate)
+          # Using DDP instead of DeepSpeed ZeRO-3 because ZeRO-3 causes
+          # cross-GPU memory allocation with vLLM external_launcher.
+          # With LoRA, ZeRO-3 saves minimal memory (optimizer states are tiny).
+          accelerate launch \
+            --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
+            --num_processes=${NUM_GPUS:-4} \
+            train_self_reflection.py \
             --model_id "${MODEL_ID}" \
             --model_type qwen2vl \
             --dataset_path "${DATASET_PATH}" \
