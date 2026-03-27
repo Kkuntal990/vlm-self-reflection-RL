@@ -409,6 +409,14 @@ def main() -> None:
     from torch.optim import AdamW
 
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01, fused=True)
+
+    # DeepSpeed requires train_micro_batch_size_per_gpu to be set.
+    # Since we use a custom training loop (no DataLoader), set it explicitly.
+    if accelerator.state.deepspeed_plugin is not None:
+        accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = (
+            args.per_device_train_batch_size
+        )
+
     model, optimizer = accelerator.prepare(model, optimizer)
     logger.info(
         f"Distributed training: {accelerator.num_processes} processes, device={accelerator.device}"
