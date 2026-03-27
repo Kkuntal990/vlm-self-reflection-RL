@@ -207,8 +207,9 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
-        # PYTORCH_CUDA_ALLOC_CONF: expandable_segments removed — incompatible
-        # with vLLM's memory pool (pytorch/pytorch#147851)
+        # Must be empty to avoid conflict with vLLM memory pool
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: ""
         - name: WANDB_PROJECT
           value: "vlm-self-reflection-grpo"
 
