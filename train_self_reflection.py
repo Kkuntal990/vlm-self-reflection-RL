@@ -162,8 +162,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vllm_gpu_memory_utilization",
         type=float,
-        default=0.40,
-        help="Fraction of GPU memory for vLLM KV cache",
+        default=0.30,
+        help="Fraction of GPU memory for vLLM KV cache (TRL default: 0.3)",
     )
 
     # Response reward weights
@@ -448,9 +448,13 @@ def main() -> None:
             max_model_len=2048,
             max_pixels=args.max_pixels,
             min_pixels=args.min_pixels,
+            seed=accelerator.process_index,
         )
         vllm_engine.sleep()
         logger.info(f"vLLM engine initialized on rank {accelerator.process_index} (sleeping)")
+        # Sync all ranks before continuing — prevents DeepSpeed hangs when
+        # main process is still loading weights asynchronously.
+        accelerator.wait_for_everyone()
 
     # Create trainer
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer

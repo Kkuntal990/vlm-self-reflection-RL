@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-self-reflection-v1
+  name: qwen-grpo-self-reflection-v2
 spec:
   backoffLimit: 0
   template:
@@ -36,12 +36,12 @@ spec:
           # Install dependencies
           pip install "vllm>=0.12.0" wandb sentence-transformers deepspeed 2>&1 | tail -5
 
-          # Clone and install project
-          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          # Clone and install project (vLLM feature branch)
+          git clone -b ${GIT_BRANCH:-feature/vllm-deepspeed} https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
           cd /workspace/vlm-self-reflection-RL
           pip install -e . 2>&1 | tail -3
 
-          # Run training (multi-GPU via accelerate)
+          # Run training (multi-GPU via accelerate + vLLM colocate)
           accelerate launch --num_processes=${NUM_GPUS:-4} train_self_reflection.py \
             --model_id "${MODEL_ID}" \
             --model_type qwen2vl \
@@ -49,6 +49,8 @@ spec:
             --val_dataset_path "${VAL_DATASET_PATH}" \
             --output_dir "${OUTPUT_DIR}" \
             --image_base_dir "${IMAGE_BASE_DIR}" \
+            --use_vllm \
+            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.30} \
             --max_samples ${MAX_SAMPLES:-0} \
             --k_samples ${K_SAMPLES:-8} \
             --max_completion_length ${MAX_COMPLETION_LENGTH:-512} \
@@ -147,7 +149,9 @@ spec:
 
         # vLLM acceleration
         - name: VLLM_GPU_MEM
-          value: "0.40"
+          value: "0.30"
+        - name: GIT_BRANCH
+          value: "feature/vllm-deepspeed"
 
         # Qwen2.5-VL image resolution
         - name: MAX_PIXELS
@@ -204,8 +208,12 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
+        # vLLM manages its own memory pool — expandable_segments conflicts
         - name: PYTORCH_CUDA_ALLOC_CONF
-          value: "expandable_segments:True"
+          value: ""
+        # Required for external_launcher mode (prevents child process spawning)
+        - name: VLLM_ENABLE_V1_MULTIPROCESSING
+          value: "0"
         - name: WANDB_PROJECT
           value: "vlm-self-reflection-grpo"
 

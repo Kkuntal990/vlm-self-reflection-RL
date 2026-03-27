@@ -852,11 +852,12 @@ class SelfReflectionGRPOTrainer:
         model_type = getattr(self.config, "model_type", "llava")
 
         # vLLM sleep/wake cycle: wake for generation, sleep for training.
-        # This shares GPU memory between vLLM and the training model.
-        # Reference: https://docs.vllm.ai/en/latest/features/sleep_mode/
+        # Sequence: wake → sync weights → generate → sleep.
+        # Must wake BEFORE syncing so vLLM's model is in GPU memory.
+        # Reference: TRL VLLMGeneration colocate pattern
         if self.vllm_engine is not None:
-            self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
             self.vllm_engine.wake_up()
+            self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
 
         rollout_results = generate_self_reflection_rollout(
             model=gen_model,

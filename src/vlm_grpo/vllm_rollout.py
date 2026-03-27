@@ -24,6 +24,7 @@ Usage:
 """
 
 import logging
+import os
 import sys
 from typing import Any
 
@@ -50,12 +51,13 @@ class VLLMRolloutEngine:
         self,
         model_id: str,
         processor: Any,
-        gpu_memory_utilization: float = 0.40,
+        gpu_memory_utilization: float = 0.30,
         max_model_len: int = 2048,
         max_pixels: int = 401408,
         min_pixels: int = 200704,
         tensor_parallel_size: int = 1,
         enforce_eager: bool = True,
+        seed: int = 0,
     ) -> None:
         """Initialize the vLLM rollout engine.
 
@@ -68,8 +70,14 @@ class VLLMRolloutEngine:
             min_pixels: Min pixels per image
             tensor_parallel_size: Number of GPUs for tensor parallelism
             enforce_eager: Disable CUDA graphs to save memory
+            seed: Random seed for sampling (use process rank for diversity)
         """
         from vllm import LLM
+
+        # Required for external_launcher mode — prevents vLLM from spawning
+        # child processes that conflict with accelerate/DeepSpeed.
+        # Reference: TRL VLLMGeneration, vLLM ExecutorWithExternalLauncher
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
         self.processor = processor
         self.model_id = model_id
@@ -94,6 +102,8 @@ class VLLMRolloutEngine:
             },
             enable_sleep_mode=True,
             dtype="bfloat16",
+            seed=seed,
+            max_num_batched_tokens=4096,
         )
         logger.info(
             f"vLLM engine ready: gpu_mem={gpu_memory_utilization}, "
@@ -101,15 +111,22 @@ class VLLMRolloutEngine:
         )
 
     def sleep(self) -> None:
-        """Put vLLM to sleep, freeing GPU memory for training.
+        """Put vLLM to sleep, freeing ALL GPU memory for training.
 
-        Level 1 sleep offloads model weights to CPU and discards
-        the KV cache, freeing most GPU memory.
+        Level 2 sleep discards both model weights and KV cache,
+        freeing all GPU memory. Matches TRL colocate pattern.
         """
-        self.llm.sleep(level=1)
+        self.llm.sleep(level=2)
 
     def wake_up(self) -> None:
-        """Wake vLLM up, reloading weights to GPU."""
+        """Wake vLLM up, reloading weights and KV cache to GPU.
+
+        Calls empty_cache() first to reclaim any fragmented memory
+        left over from training, matching TRL colocate pattern.
+        """
+        import torch
+
+        torch.cuda.empty_cache()
         self.llm.wake_up()
 
     def update_weights_from_peft(
@@ -139,6 +156,9 @@ class VLLMRolloutEngine:
         from contextlib import nullcontext
 
         import torch
+
+        # Clear training memory before loading weights into vLLM
+        torch.cuda.empty_cache()
 
         # Unwrap DDP/Accelerate if needed
         unwrapped = peft_model
@@ -187,6 +207,9 @@ class VLLMRolloutEngine:
 
             unwrapped.unmerge_adapter()
 
+        # Reset prefix cache since weights changed — cached KV states
+        # from previous weights are invalid.
+        self.llm.reset_prefix_cache()
         logger.info(f"Updated vLLM weights ({n_loaded} params synced)")
 
     def generate_batch(
