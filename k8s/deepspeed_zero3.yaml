@@ -2,12 +2,10 @@ compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
   deepspeed_config_file: /workspace/vlm-self-reflection-RL/k8s/ds_zero3_config.json
-  zero3_init_flag: true
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'
 machine_rank: 0
 main_training_function: main
-mixed_precision: bf16
 num_machines: 1
 num_processes: 4
 rdzv_backend: static
