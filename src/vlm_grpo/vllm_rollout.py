@@ -9,18 +9,20 @@ memory between generation (vLLM) and training (HF model).
 The sequential A1 -> F1 -> A2 dependency is handled with three
 separate batched vLLM generate() calls per rollout step.
 
+The sleep/wake/sync lifecycle per training step follows the TRL
+VLLMGeneration colocate pattern exactly:
+    1. wake_up_for_weights()     — allocate weight memory on GPU
+    2. update_weights_from_peft()— sync LoRA-merged weights to vLLM
+    3. wake_up_for_generation()  — allocate KV cache memory
+    4. generate_batch() x3       — A1, F1, A2 inference
+    5. sleep()                   — free ALL GPU memory for training
+
 References:
+    - TRL VLLMGeneration: trl/generation/vllm_generation.py
     - vLLM sleep mode: https://docs.vllm.ai/en/latest/features/sleep_mode/
-    - TRL colocate mode: https://huggingface.co/blog/vllm-colocate
-    - vLLM Qwen2.5-VL: https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen2.5-VL.html
-
-Usage:
-    from vlm_grpo.vllm_rollout import VLLMRolloutEngine
-
-    engine = VLLMRolloutEngine("Qwen/Qwen2.5-VL-7B-Instruct", processor)
-    engine.wake_up()
-    completions = engine.generate_batch(prompts, images, max_tokens=200, temperature=1.0)
-    engine.sleep()
+    - TRL colocate blog: https://huggingface.co/blog/vllm-colocate
+    - vLLM issue #26195: MM cache stale refs after sleep
+    - verl issue #1361: disable_mm_preprocessor_cache deprecation
 """
 
 import logging
@@ -95,7 +97,6 @@ class VLLMRolloutEngine:
             # accelerate/DeepSpeed multi-GPU training.
             # Reference: https://huggingface.co/blog/vllm-colocate
             distributed_executor_backend="external_launcher",
-            limit_mm_per_prompt={"image": 1},
             mm_processor_kwargs={
                 "min_pixels": min_pixels,
                 "max_pixels": max_pixels,
@@ -104,10 +105,13 @@ class VLLMRolloutEngine:
             dtype="bfloat16",
             seed=seed,
             max_num_batched_tokens=4096,
-            # Disable multimodal feature caching — sleep(level=2) frees
-            # cached image tensors but leaves stale hash references,
+            # Disable multimodal preprocessor cache. sleep(level=2) frees
+            # cached image feature tensors but leaves stale hash references,
             # causing AssertionError on the next generate() call.
-            disable_mm_preprocessor_cache=True,
+            # Use mm_processor_cache_gb (stable API, vLLM ≥0.10.2) instead of
+            # the deprecated disable_mm_preprocessor_cache (removed in ≥0.13).
+            # Reference: vLLM issue #26195, verl issue #1361
+            mm_processor_cache_gb=0,
         )
         logger.info(
             f"vLLM engine ready: gpu_mem={gpu_memory_utilization}, "
@@ -122,16 +126,34 @@ class VLLMRolloutEngine:
         """
         self.llm.sleep(level=2)
 
-    def wake_up(self) -> None:
-        """Wake vLLM up, reloading weights and KV cache to GPU.
+    def wake_up_for_weights(self) -> None:
+        """Wake up weight memory only (step 1 of 2).
 
-        Calls empty_cache() first to reclaim any fragmented memory
-        left over from training, matching TRL colocate pattern.
+        Frees fragmented training memory, then allocates GPU space for
+        model weights. Call update_weights_from_peft() next, then
+        wake_up_for_generation() before generating.
+
+        Matches TRL: ``wake_up(tags=["weights"])`` then ``collective_rpc``.
         """
         import torch
 
         torch.cuda.empty_cache()
-        self.llm.wake_up()
+        self.llm.wake_up(tags=["weights"])
+        # Workaround for vLLM issue #29341: weights may not reload
+        # properly after sleep level 2. Since we overwrite weights
+        # via load_weights() anyway, this is a safety net.
+        try:
+            self.llm.collective_rpc("reload_weights")
+        except (NotImplementedError, AttributeError):
+            pass
+
+    def wake_up_for_generation(self) -> None:
+        """Wake up KV cache memory (step 2 of 2).
+
+        Call this AFTER update_weights_from_peft() and BEFORE
+        generate_batch(). Allocates the KV cache blocks.
+        """
+        self.llm.wake_up(tags=["kv_cache"])
 
     def update_weights_from_peft(
         self,
@@ -160,9 +182,6 @@ class VLLMRolloutEngine:
         from contextlib import nullcontext
 
         import torch
-
-        # Clear training memory before loading weights into vLLM
-        torch.cuda.empty_cache()
 
         # Unwrap DDP/Accelerate if needed
         unwrapped = peft_model
@@ -211,8 +230,8 @@ class VLLMRolloutEngine:
 
             unwrapped.unmerge_adapter()
 
-        # Reset prefix cache since weights changed — cached KV states
-        # from previous weights are invalid.
+        # Reset prefix cache — cached KV states from previous weights
+        # are invalid after weight sync.
         self.llm.reset_prefix_cache()
         logger.info(f"Updated vLLM weights ({n_loaded} params synced)")
 
