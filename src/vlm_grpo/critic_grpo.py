@@ -966,31 +966,20 @@ class SelfReflectionGRPOTrainer:
         resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
 
-        # Compute frac_reward_zero_std: fraction of K-groups where all
-        # trajectories got identical rewards (zero variance → zero learning signal).
-        # This is the key metric TRL tracks for detecting dead batches.
+        # Compute frac_reward_zero_std for BOTH response and feedback rewards:
+        # fraction of K-groups where all trajectories got identical rewards
+        # (zero variance → zero learning signal). Key TRL diagnostic metric.
         n_groups = len(resp_rewards_t) // k
-        n_zero_std_groups = 0
+        n_resp_zero = 0
+        n_fb_zero = 0
         for gi in range(n_groups):
-            group = resp_rewards_t[gi * k : (gi + 1) * k]
-            if group.std().item() < 1e-8:
-                n_zero_std_groups += 1
-        frac_reward_zero_std = n_zero_std_groups / max(n_groups, 1)
-
-        # Compute completion length stats from rollout results
-        a1_lens = []
-        f1_lens = []
-        a2_lens = []
-        for result in rollout_results:
-            for a1 in result.answer1s:
-                a1_lens.append(len(a1.split()))
-            for f1 in result.feedbacks:
-                f1_lens.append(len(f1.split()))
-            for a2 in result.answer2s:
-                a2_lens.append(len(a2.split()))
-        avg_a1_len = sum(a1_lens) / max(len(a1_lens), 1)
-        avg_f1_len = sum(f1_lens) / max(len(f1_lens), 1)
-        avg_a2_len = sum(a2_lens) / max(len(a2_lens), 1)
+            s, e = gi * k, (gi + 1) * k
+            if resp_rewards_t[s:e].std().item() < 1e-4:
+                n_resp_zero += 1
+            if fb_rewards_t[s:e].std().item() < 1e-4:
+                n_fb_zero += 1
+        frac_resp_zero_std = n_resp_zero / max(n_groups, 1)
+        frac_fb_zero_std = n_fb_zero / max(n_groups, 1)
 
         # Step 4: Pre-tokenize once, then compute old/ref log-probs in mini-batches.
         #
@@ -1011,6 +1000,16 @@ class SelfReflectionGRPOTrainer:
         a1_pretok = self._preprocess_trajectory_texts([t["a1_full"] for t in trajectory_data], imgs)
         a2_pretok = self._preprocess_trajectory_texts([t["a2_full"] for t in trajectory_data], imgs)
         f1_pretok = self._preprocess_trajectory_texts([t["f1_full"] for t in trajectory_data], imgs)
+
+        # Completion token lengths from pre-tokenized data (token count, not word count).
+        # full_lens - prompt_lens = number of completion tokens per trajectory.
+        # Tracks length hacking where wrong answers grow longer (Dr. GRPO key finding).
+        a1_toks = [f - p for f, p in zip(a1_pretok["full_lens"], a1_pretok["prompt_lens"])]
+        f1_toks = [f - p for f, p in zip(f1_pretok["full_lens"], f1_pretok["prompt_lens"])]
+        a2_toks = [f - p for f, p in zip(a2_pretok["full_lens"], a2_pretok["prompt_lens"])]
+        avg_a1_toks = sum(a1_toks) / max(len(a1_toks), 1)
+        avg_f1_toks = sum(f1_toks) / max(len(f1_toks), 1)
+        avg_a2_toks = sum(a2_toks) / max(len(a2_toks), 1)
 
         logger.info(f"  Computing old/ref log-probs for {n_traj} trajectories...")
 
@@ -1078,6 +1077,11 @@ class SelfReflectionGRPOTrainer:
         total_kl_loss = 0.0
         n_traj_inner = n_traj
 
+        # Reset entropy accumulators — token-weighted average across all
+        # training mini-batches (not old/ref passes).
+        self._entropy_sum = 0.0
+        self._entropy_tokens = 0
+
         for inner_epoch in range(num_inner):
             self.optimizer.zero_grad()
             epoch_resp_loss = 0.0
@@ -1099,7 +1103,11 @@ class SelfReflectionGRPOTrainer:
                 mb_end = min(mb_start + inner_mini_bs, n_traj_inner)
 
                 mb_a1_lps, mb_a2_lps, mb_fb_lps = self._forward_from_pretokenized_multi(
-                    [a1_pretok, a2_pretok, f1_pretok], inner_model, mb_start, mb_end
+                    [a1_pretok, a2_pretok, f1_pretok],
+                    inner_model,
+                    mb_start,
+                    mb_end,
+                    accumulate_entropy=True,
                 )
 
                 # Token-level GRPO loss (standard formulation).
@@ -1225,8 +1233,9 @@ class SelfReflectionGRPOTrainer:
         resp_adv_abs_mean = resp_advantages.abs().mean().item()
         n_zero_adv = (resp_advantages == 0).sum().item()
 
-        # Entropy from the last training forward pass (set by _forward_from_pretokenized_multi)
-        entropy = getattr(self, "_last_entropy", 0.0)
+        # Token-weighted entropy from training forward passes (accumulated
+        # across all inner-loop mini-batches, NOT from old/ref log-prob passes).
+        entropy = self._entropy_sum / self._entropy_tokens if self._entropy_tokens > 0 else 0.0
 
         logger.info(
             f"  Inner epochs done: resp_loss={total_resp_loss / num_inner:.4f}, "
@@ -1236,8 +1245,9 @@ class SelfReflectionGRPOTrainer:
             f"resp_adv_mean={resp_adv_abs_mean:.4f}, "
             f"zero_adv={n_zero_adv}/{len(resp_advantages)}, "
             f"entropy={entropy:.3f}, "
-            f"frac_zero_std={frac_reward_zero_std:.2f}, "
-            f"len_a1={avg_a1_len:.0f}/f1={avg_f1_len:.0f}/a2={avg_a2_len:.0f}"
+            f"frac_zero_std_resp={frac_resp_zero_std:.2f}, "
+            f"frac_zero_std_fb={frac_fb_zero_std:.2f}, "
+            f"tok_a1={avg_a1_toks:.0f}/f1={avg_f1_toks:.0f}/a2={avg_a2_toks:.0f}"
         )
 
         if self.scheduler is not None:
@@ -1525,6 +1535,7 @@ class SelfReflectionGRPOTrainer:
         model: Any,
         mb_start: int = 0,
         mb_end: Optional[int] = None,
+        accumulate_entropy: bool = False,
     ) -> list[list[Any]]:
         """Single forward pass for multiple pretokenized trajectory sets.
 
@@ -1538,6 +1549,10 @@ class SelfReflectionGRPOTrainer:
             model: Model to run the forward pass on.
             mb_start: Mini-batch start index.
             mb_end: Mini-batch end index (default: full slice for each set).
+            accumulate_entropy: If True, accumulate per-token entropy into
+                self._entropy_tokens and self._entropy_sum for the caller
+                to compute a token-weighted average. Only set True during the
+                training inner loop, NOT during old/ref log-prob passes.
 
         Returns:
             List of len(pretok_list) lists, each containing scalar log-prob
@@ -1590,7 +1605,6 @@ class SelfReflectionGRPOTrainer:
 
         total_len = batch_inputs["input_ids"].shape[1]
         all_lps: list[Any] = []
-        all_entropies: list[float] = []
         for i in range(n):
             pad_len = total_len - all_full_lens[i]
             real_prompt_start = pad_len + all_prompt_lens[i]
@@ -1602,14 +1616,15 @@ class SelfReflectionGRPOTrainer:
             all_lps.append(
                 token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
             )
-            # Per-token entropy: -sum(p * log(p)) averaged over completion tokens.
-            # Tracks output diversity — collapse below ln(2)≈0.693 signals
-            # premature convergence (GTPO arXiv:2508.03772, DAPO arXiv:2503.14476).
-            token_entropy = -(lp.exp() * lp).sum(dim=-1).mean().item()
-            all_entropies.append(token_entropy)
-
-        # Store batch-averaged entropy for the caller to read.
-        self._last_entropy = sum(all_entropies) / len(all_entropies) if all_entropies else 0.0
+            # Accumulate per-token entropy only during training forward passes.
+            # Token-weighted: each token contributes equally (matches TRL's
+            # masked_batch_mean). entropy = -sum(p * log(p)) per token.
+            # Collapse below ln(2)≈0.693 signals diversity loss (GTPO, DAPO).
+            if accumulate_entropy and lp.shape[0] > 0:
+                n_tokens = lp.shape[0]
+                token_entropy_sum = -(lp.exp() * lp).sum(dim=-1).sum().item()
+                self._entropy_sum += token_entropy_sum
+                self._entropy_tokens += n_tokens
 
         result: list[list[Any]] = []
         offset = 0
