@@ -447,7 +447,7 @@ class SelfReflectionConfig:
     max_pixels: int = 401408
     min_pixels: int = 200704
     num_inner_epochs: int = 4
-    inner_mini_batch_size: int = 8
+    inner_mini_batch_size: int = 4
     debug: bool = False
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     sanity_check_samples: int = 0
