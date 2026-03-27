@@ -104,6 +104,10 @@ class VLLMRolloutEngine:
             dtype="bfloat16",
             seed=seed,
             max_num_batched_tokens=4096,
+            # Disable multimodal feature caching — sleep(level=2) frees
+            # cached image tensors but leaves stale hash references,
+            # causing AssertionError on the next generate() call.
+            disable_mm_preprocessor_cache=True,
         )
         logger.info(
             f"vLLM engine ready: gpu_mem={gpu_memory_utilization}, "
