@@ -99,7 +99,7 @@ spec:
 
         # GRPO core
         - name: K_SAMPLES
-          value: "8"
+          value: "4"
         - name: LOSS_TYPE
           value: "dr_grpo"
         - name: KL_COEFF
