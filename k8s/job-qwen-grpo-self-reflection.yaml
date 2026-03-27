@@ -41,13 +41,10 @@ spec:
           cd /workspace/vlm-self-reflection-RL
           pip install -e . 2>&1 | tail -3
 
-          # Run training (DeepSpeed ZeRO-3 + vLLM colocate)
-          # DeepSpeed is required for vLLM's external_launcher backend
-          accelerate launch --config_file /workspace/vlm-self-reflection-RL/k8s/deepspeed_zero3.yaml train_self_reflection.py \
+          # Run training (multi-GPU via accelerate)
+          accelerate launch --num_processes=${NUM_GPUS:-4} train_self_reflection.py \
             --model_id "${MODEL_ID}" \
             --model_type qwen2vl \
-            --use_vllm \
-            --vllm_gpu_memory_utilization 0.40 \
             --dataset_path "${DATASET_PATH}" \
             --val_dataset_path "${VAL_DATASET_PATH}" \
             --output_dir "${OUTPUT_DIR}" \
@@ -207,9 +204,8 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
-        # Must be empty to avoid conflict with vLLM memory pool
         - name: PYTORCH_CUDA_ALLOC_CONF
-          value: ""
+          value: "expandable_segments:True"
         - name: WANDB_PROJECT
           value: "vlm-self-reflection-grpo"
 
