@@ -855,7 +855,7 @@ class SelfReflectionGRPOTrainer:
         # This shares GPU memory between vLLM and the training model.
         # Reference: https://docs.vllm.ai/en/latest/features/sleep_mode/
         if self.vllm_engine is not None:
-            self.vllm_engine.update_weights_from_peft(gen_model)
+            self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
             self.vllm_engine.wake_up()
 
         rollout_results = generate_self_reflection_rollout(

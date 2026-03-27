@@ -112,16 +112,32 @@ class VLLMRolloutEngine:
         """Wake vLLM up, reloading weights to GPU."""
         self.llm.wake_up()
 
-    def update_weights_from_peft(self, peft_model: Any) -> None:
+    def update_weights_from_peft(
+        self,
+        peft_model: Any,
+        accelerator: Any = None,
+    ) -> None:
         """Merge LoRA adapter weights and load into vLLM.
 
         Temporarily merges the LoRA adapter into the base weights,
-        extracts the merged state dict, loads into vLLM, then
-        unmerges to restore the PEFT model for training.
+        extracts the merged state dict, strips the PEFT parameter name
+        prefixes (``base_model.model.``, ``.base_layer``), skips
+        adapter-only parameters (``lora_``, ``original_module``), and
+        loads the result into vLLM.
+
+        For DeepSpeed ZeRO-3, all sharded parameters are gathered
+        before merge/load so that each rank sees the full tensors.
+
+        Follows the same weight-sync logic as TRL ``VLLMGeneration.sync_weights``.
 
         Args:
             peft_model: PEFT model with LoRA adapter (may be DDP-wrapped)
+            accelerator: Optional Accelerate ``Accelerator`` instance. When
+                provided, DeepSpeed ZeRO-3 sharded parameters are gathered
+                automatically before the merge/load cycle.
         """
+        from contextlib import nullcontext
+
         import torch
 
         # Unwrap DDP/Accelerate if needed
@@ -129,18 +145,49 @@ class VLLMRolloutEngine:
         if hasattr(peft_model, "module"):
             unwrapped = peft_model.module
 
-        named_params = []
-        with torch.no_grad():
+        # Detect DeepSpeed ZeRO-3: parameters are sharded across GPUs and
+        # must be gathered before we can merge adapters or read full tensors.
+        gather_ctx = nullcontext
+        if accelerator is not None:
+            ds_plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+            if ds_plugin is not None and ds_plugin.zero_stage == 3:
+                import deepspeed
+
+                gather_ctx = deepspeed.zero.GatheredParameters
+
+        # Determine the PEFT adapter prefix so we can skip adapter-only params.
+        # For LoRA this is "lora_" (e.g. lora_A, lora_B).
+        peft_prefix = getattr(unwrapped, "prefix", "lora_")
+
+        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+
+        n_loaded = 0
+        with torch.no_grad(), gather_ctx(list(unwrapped.parameters())):
             unwrapped.merge_adapter()
+
             for name, param in unwrapped.named_parameters():
-                named_params.append((name, param.data))
+                # Strip the PEFT wrapper prefixes to recover original HF names.
+                # PEFT wraps: base_model.model.<original_name>[.base_layer]
+                name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+
+                # Skip adapter-only parameters (lora_A, lora_B, etc.) —
+                # they don't exist in the base model / vLLM.
+                if peft_prefix in name:
+                    continue
+
+                # Skip modules_to_save bookkeeping parameters.
+                if "original_module" in name:
+                    continue
+
+                # Also strip any modules_to_save wrapper prefix.
+                name = name.replace("modules_to_save.default.", "")
+
+                llm_model.load_weights([(name, param.data)])
+                n_loaded += 1
+
             unwrapped.unmerge_adapter()
 
-        # Load merged weights into vLLM's model
-        self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
-            named_params
-        )
-        logger.info(f"Updated vLLM weights ({len(named_params)} params)")
+        logger.info(f"Updated vLLM weights ({n_loaded} params synced)")
 
     def generate_batch(
         self,
