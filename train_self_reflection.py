@@ -424,9 +424,12 @@ def main() -> None:
         f"Process {accelerator.process_index}: samples {start}-{end} ({len(train_dataset)} samples)"
     )
 
-    # Initialize vLLM engine if requested
+    # Initialize vLLM engine ONLY on rank 0 to avoid NCCL port conflicts.
+    # Rank 0 generates all completions and broadcasts to other ranks.
+    # This is the standard pattern used by TRL's GRPOTrainer server mode.
+    # Reference: https://huggingface.co/docs/trl/main/en/vllm_integration
     vllm_engine = None
-    if args.use_vllm:
+    if args.use_vllm and accelerator.is_main_process:
         from vlm_grpo.vllm_rollout import VLLMRolloutEngine
 
         vllm_engine = VLLMRolloutEngine(
@@ -437,9 +440,8 @@ def main() -> None:
             max_pixels=args.max_pixels,
             min_pixels=args.min_pixels,
         )
-        # Start asleep — wake only during rollout
         vllm_engine.sleep()
-        logger.info("vLLM rollout engine initialized (sleeping)")
+        logger.info("vLLM rollout engine initialized on rank 0 (sleeping)")
 
     # Create trainer
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer

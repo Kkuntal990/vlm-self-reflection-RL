@@ -69,6 +69,8 @@ spec:
             --lora_r ${LORA_R:-64} \
             --lora_alpha ${LORA_ALPHA:-128} \
             --freeze_vision_tower \
+            --use_vllm \
+            --vllm_gpu_memory_utilization 0.40 \
             --max_pixels ${MAX_PIXELS:-401408} \
             --min_pixels ${MIN_PIXELS:-200704} \
             --w_a1_correctness ${W_A1_CORRECTNESS:-1.0} \
