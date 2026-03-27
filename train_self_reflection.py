@@ -175,6 +175,8 @@ def parse_args() -> argparse.Namespace:
 
     # Feedback reward weights
     parser.add_argument("--w_downstream", type=float, default=2.0)
+    parser.add_argument("--w_correction_bonus", type=float, default=0.5)
+    parser.add_argument("--w_calibration", type=float, default=0.2)
     parser.add_argument("--w_fb_format", type=float, default=0.15)
 
     # Logging and checkpointing
@@ -242,6 +244,8 @@ def main() -> None:
     )
     feedback_weights = FeedbackRewardWeights(
         w_downstream=args.w_downstream,
+        w_correction_bonus=args.w_correction_bonus,
+        w_calibration=args.w_calibration,
         w_format=args.w_fb_format,
     )
     rollout_config = RolloutConfig(

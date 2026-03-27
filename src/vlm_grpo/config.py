@@ -364,14 +364,24 @@ class FeedbackRewardWeights:
     """Weights for feedback reward (applied to F1 log-prob).
 
     reward_fb = w_downstream * R_downstream
+              + w_correction_bonus * R_correction_bonus
+              + w_calibration * R_calibration
               + w_format * R_format
 
     Attributes:
         w_downstream: Weight for downstream-aware reward (dominant)
+        w_correction_bonus: Weight for SCoRe-style correction delta
+            (arXiv:2409.12917). R = a2_correct - a1_correct.
+        w_calibration: Weight for calibration tiebreaker (keyword-based
+            assessment of whether F1 correctly identifies A1 correctness).
+            Kept small to avoid formulaic language but breaks reward ties
+            across K trajectories since feedback text varies.
         w_format: Weight for format compliance
     """
 
     w_downstream: float = 2.0
+    w_correction_bonus: float = 0.5
+    w_calibration: float = 0.2
     w_format: float = 0.15
 
     def to_dict(self) -> dict:

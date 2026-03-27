@@ -891,12 +891,15 @@ def compute_feedback_reward_breakdown(
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
-    Evaluates feedback quality using outcome-based signals:
-    downstream-aware (did F1 help A2?) and format (is F1 substantive?).
-
-    Calibration (keyword-based assessment of A1) is intentionally omitted:
-    it forces formulaic language and is redundant with downstream reward
-    which directly measures whether feedback improved the answer.
+    Four components:
+    1. Downstream-aware (did F1 help A2?) — 4 discrete values
+    2. SCoRe correction bonus (arXiv:2409.12917) — rewards the delta
+       between A2 and A1 correctness. Breaks RR/WW ties.
+    3. Calibration — keyword-based assessment of whether F1 correctly
+       identifies A1 correctness. Kept at small weight as a tiebreaker
+       since feedback TEXT varies across K trajectories even when
+       correctness outcomes are identical.
+    4. Format — is F1 substantive?
 
     Args:
         feedback_text: Feedback text from the critic
@@ -910,6 +913,8 @@ def compute_feedback_reward_breakdown(
     Returns:
         TrajectoryFeedbackRewardBreakdown with all component scores
     """
+    from vlm_grpo.rewards.feedback import compute_feedback_calibration_reward
+
     # Verify A1 and A2 ONCE (downstream needs both)
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
     a2_result = verify_answer(a2_text, ground_truth, answer_type)
@@ -928,12 +933,26 @@ def compute_feedback_reward_breakdown(
     else:
         r_downstream = 2.0 if a2_correct else -1.0
 
+    # SCoRe correction bonus (arXiv:2409.12917): rewards the improvement
+    # delta. WR: +1.0, RW: -1.0, RR/WW: 0.0. Breaks degeneracy between
+    # "did nothing" (RR/WW) vs "helped/hurt" (WR/RW).
+    r_correction_bonus = float(a2_correct) - float(a1_correct)
+
+    # Calibration tiebreaker: varies across K trajectories because each
+    # generates different feedback TEXT even for the same correctness outcome.
+    # Produces 7 discrete values from keyword patterns in the feedback.
+    r_calibration = compute_feedback_calibration_reward(feedback_text, a1_correct)
+
     components = {
         "downstream": r_downstream,
+        "correction_bonus": r_correction_bonus,
+        "calibration": r_calibration,
         "format": r_format,
     }
     weighted_components = {
         "downstream": r_downstream * weights.w_downstream,
+        "correction_bonus": r_correction_bonus * weights.w_correction_bonus,
+        "calibration": r_calibration * weights.w_calibration,
         "format": r_format * weights.w_format,
     }
     total_reward = sum(weighted_components.values())
