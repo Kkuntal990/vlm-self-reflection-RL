@@ -1231,7 +1231,9 @@ class SelfReflectionGRPOTrainer:
         # Log advantage statistics to detect the std=0 problem
         # (all K trajectories getting identical rewards → zero advantages → zero gradients)
         resp_adv_abs_mean = resp_advantages.abs().mean().item()
+        fb_adv_abs_mean = fb_advantages.abs().mean().item()
         n_zero_adv = (resp_advantages == 0).sum().item()
+        n_zero_fb_adv = (fb_advantages == 0).sum().item()
 
         # Token-weighted entropy from training forward passes (accumulated
         # across all inner-loop mini-batches, NOT from old/ref log-prob passes).
@@ -1240,14 +1242,12 @@ class SelfReflectionGRPOTrainer:
         logger.info(
             f"  Inner epochs done: resp_loss={total_resp_loss / num_inner:.4f}, "
             f"fb_loss={total_fb_loss / num_inner:.4f}, "
-            f"kl_loss={total_kl_loss / num_inner:.4f}, "
             f"grad_norm={grad_norm:.4f}, "
-            f"resp_adv_mean={resp_adv_abs_mean:.4f}, "
-            f"zero_adv={n_zero_adv}/{len(resp_advantages)}, "
+            f"resp_adv={resp_adv_abs_mean:.4f}(z={n_zero_adv}/{len(resp_advantages)}), "
+            f"fb_adv={fb_adv_abs_mean:.4f}(z={n_zero_fb_adv}/{len(fb_advantages)}), "
             f"entropy={entropy:.3f}, "
-            f"frac_zero_std_resp={frac_resp_zero_std:.2f}, "
-            f"frac_zero_std_fb={frac_fb_zero_std:.2f}, "
-            f"tok_a1={avg_a1_toks:.0f}/f1={avg_f1_toks:.0f}/a2={avg_a2_toks:.0f}"
+            f"frac_zero_std={frac_resp_zero_std:.2f}/{frac_fb_zero_std:.2f}, "
+            f"tok={avg_a1_toks:.0f}/{avg_f1_toks:.0f}/{avg_a2_toks:.0f}"
         )
 
         if self.scheduler is not None:
