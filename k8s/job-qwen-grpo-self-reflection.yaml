@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-self-reflection-v2
+  name: qwen-grpo-self-reflection-v3
 spec:
   backoffLimit: 0
   template:
@@ -42,9 +42,7 @@ spec:
           pip install -e . 2>&1 | tail -3
 
           # Run training (multi-GPU DDP + vLLM colocate)
-          # Using DDP instead of DeepSpeed ZeRO-3 because ZeRO-3 causes
-          # cross-GPU memory allocation with vLLM external_launcher.
-          # With LoRA, ZeRO-3 saves minimal memory (optimizer states are tiny).
+          # Tee all output to a log file on PVC for post-mortem analysis.
           accelerate launch \
             --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
             --num_processes=${NUM_GPUS:-4} \
@@ -90,7 +88,8 @@ spec:
             --w_fb_format ${W_FB_FORMAT:-0.15} \
             --logging_steps ${LOGGING_STEPS:-10} \
             --save_steps ${SAVE_STEPS:-500} \
-            --seed ${SEED:-42}
+            --seed ${SEED:-42} \
+            2>&1 | tee "${OUTPUT_DIR}/training.log"
 
           echo "=== Training complete ==="
 
@@ -103,7 +102,7 @@ spec:
         - name: VAL_DATASET_PATH
           value: ""
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_sr_v1"
+          value: "/outputs/grpo_qwen_sr_v2"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -139,7 +138,7 @@ spec:
 
         # Optimization
         - name: LEARNING_RATE
-          value: "1e-6"
+          value: "5e-6"
         - name: BATCH_SIZE
           value: "4"
         - name: GRAD_ACC

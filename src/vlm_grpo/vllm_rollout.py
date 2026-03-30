@@ -203,32 +203,36 @@ class VLLMRolloutEngine:
         peft_prefix = getattr(unwrapped, "prefix", "lora_")
 
         llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        assert hasattr(llm_model, "load_weights"), (
+            f"vLLM internal model path broken: {type(llm_model)} has no load_weights(). "
+            "Update the attribute path for your vLLM version."
+        )
 
         n_loaded = 0
         with torch.no_grad(), gather_ctx(list(unwrapped.parameters())):
             unwrapped.merge_adapter()
+            try:
+                for name, param in unwrapped.named_parameters():
+                    # Strip the PEFT wrapper prefixes to recover original HF names.
+                    # PEFT wraps: base_model.model.<original_name>[.base_layer]
+                    name = name.removeprefix("base_model.model.").replace(".base_layer", "")
 
-            for name, param in unwrapped.named_parameters():
-                # Strip the PEFT wrapper prefixes to recover original HF names.
-                # PEFT wraps: base_model.model.<original_name>[.base_layer]
-                name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                    # Skip adapter-only parameters (lora_A, lora_B, etc.) —
+                    # they don't exist in the base model / vLLM.
+                    if peft_prefix in name:
+                        continue
 
-                # Skip adapter-only parameters (lora_A, lora_B, etc.) —
-                # they don't exist in the base model / vLLM.
-                if peft_prefix in name:
-                    continue
+                    # Skip modules_to_save bookkeeping parameters.
+                    if "original_module" in name:
+                        continue
 
-                # Skip modules_to_save bookkeeping parameters.
-                if "original_module" in name:
-                    continue
+                    # Also strip any modules_to_save wrapper prefix.
+                    name = name.replace("modules_to_save.default.", "")
 
-                # Also strip any modules_to_save wrapper prefix.
-                name = name.replace("modules_to_save.default.", "")
-
-                llm_model.load_weights([(name, param.data)])
-                n_loaded += 1
-
-            unwrapped.unmerge_adapter()
+                    llm_model.load_weights([(name, param.data)])
+                    n_loaded += 1
+            finally:
+                unwrapped.unmerge_adapter()
 
         # Reset prefix cache — cached KV states from previous weights
         # are invalid after weight sync.

@@ -392,10 +392,21 @@ def main() -> None:
     if not args.no_peft:
         from peft import LoraConfig, get_peft_model
 
-        # Qwen2.5-VL: use all-linear targets (PEFT auto-excludes frozen params)
-        # LLaVA: use explicit target modules
+        # Qwen2.5-VL: target language model linear layers only.
+        # "all-linear" includes frozen vision tower (PEFT creates adapters
+        # with LoRA_B=0 that never receive gradients — wastes 350MB + compute).
+        # Explicit list targets all LM attention + MLP layers.
+        # LLaVA: use explicit target modules from config.
         if model_type == "qwen2vl":
-            target_modules = "all-linear"
+            target_modules = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
         else:
             target_modules = config.lora_target_modules
 
