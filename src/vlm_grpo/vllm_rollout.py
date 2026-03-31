@@ -139,13 +139,6 @@ class VLLMRolloutEngine:
 
         torch.cuda.empty_cache()
         self.llm.wake_up(tags=["weights"])
-        # Workaround for vLLM issue #29341: weights may not reload
-        # properly after sleep level 2. Since we overwrite weights
-        # via load_weights() anyway, this is a safety net.
-        try:
-            self.llm.collective_rpc("reload_weights")
-        except (NotImplementedError, AttributeError):
-            pass
 
     def wake_up_for_generation(self) -> None:
         """Wake up KV cache memory (step 2 of 2).

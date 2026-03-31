@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-self-reflection-v3
+  name: qwen-grpo-self-reflection-v4-35k
 spec:
   backoffLimit: 0
   template:
@@ -105,7 +105,7 @@ spec:
         - name: VAL_DATASET_PATH
           value: ""
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_sr_v2"
+          value: "/outputs/grpo_qwen_sr_v2_35k"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -123,7 +123,7 @@ spec:
 
         # Generation
         - name: MAX_SAMPLES
-          value: "15000"
+          value: "35000"
         - name: MAX_COMPLETION_LENGTH
           value: "512"
         - name: A1_MAX_COMPLETION
