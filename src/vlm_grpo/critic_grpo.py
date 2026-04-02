@@ -788,6 +788,17 @@ class SelfReflectionGRPOTrainer:
                 ):
                     self._save_checkpoint(output_dir / f"checkpoint-{self.global_step}")
 
+                # Periodic vLLM engine restart to avoid refcount crash.
+                # vLLM's sleep/wake cycle has a CPython refcount leak
+                # (issue #20431) that causes SIGABRT after ~1000 cycles.
+                # Destroying and recreating the engine resets the refcount.
+                if (
+                    self.vllm_engine is not None
+                    and self.global_step > 0
+                    and self.global_step % 800 == 0
+                ):
+                    self._restart_vllm_engine()
+
             avg_loss = epoch_loss / max(epoch_steps, 1)
             logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
 
@@ -1833,3 +1844,47 @@ class SelfReflectionGRPOTrainer:
             json.dump(self.config.to_dict(), f, indent=2)
 
         logger.info(f"Saved checkpoint to {path}")
+
+    def _restart_vllm_engine(self) -> None:
+        """Destroy and recreate vLLM engine to reset CPython refcount.
+
+        vLLM's sleep/wake cycle has a refcount leak (issue #20431) that
+        causes SIGABRT after ~1000 cycles. Periodic restart resets the
+        leak. Takes ~30-60s for cold start.
+        """
+        import gc
+
+        logger.info(
+            f"Restarting vLLM engine at step {self.global_step} "
+            "(periodic refcount leak workaround)..."
+        )
+        # Destroy old engine
+        old_engine = self.vllm_engine
+        model_id = old_engine.model_id
+        processor = old_engine.processor
+        # Extract constructor args from the old LLM instance
+        old_llm = old_engine.llm
+        gpu_mem = old_llm.llm_engine.model_config.gpu_memory_utilization
+
+        del old_engine.llm
+        del old_engine
+        gc.collect()
+
+        import torch
+
+        torch.cuda.empty_cache()
+
+        # Recreate engine
+        from vlm_grpo.vllm_rollout import VLLMRolloutEngine
+
+        self.vllm_engine = VLLMRolloutEngine(
+            model_id=model_id,
+            processor=processor,
+            gpu_memory_utilization=gpu_mem,
+            max_model_len=2048,
+            max_pixels=getattr(self.config, "max_pixels", 401408),
+            min_pixels=getattr(self.config, "min_pixels", 200704),
+            seed=self.accelerator.process_index if self.accelerator else 0,
+        )
+        self.vllm_engine.sleep()
+        logger.info("vLLM engine restarted successfully")

@@ -392,21 +392,15 @@ def main() -> None:
     if not args.no_peft:
         from peft import LoraConfig, get_peft_model
 
-        # Qwen2.5-VL: target language model linear layers only.
-        # "all-linear" includes frozen vision tower (PEFT creates adapters
-        # with LoRA_B=0 that never receive gradients — wastes 350MB + compute).
-        # Explicit list targets all LM attention + MLP layers.
+        # Qwen2.5-VL: use all-linear targets. PEFT auto-excludes frozen
+        # vision tower params (requires_grad=False), but includes the
+        # visual merger MLP which bridges vision→language. Removing the
+        # merger from LoRA targets caused entropy collapse (v6 runs) due
+        # to higher effective lr per param. The dead vision LoRA_B params
+        # (~350MB) are acceptable overhead for training stability.
         # LLaVA: use explicit target modules from config.
         if model_type == "qwen2vl":
-            target_modules = [
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ]
+            target_modules = "all-linear"
         else:
             target_modules = config.lora_target_modules
 

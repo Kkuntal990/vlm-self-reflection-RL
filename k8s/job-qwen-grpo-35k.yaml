@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-sr-v5-35k-base
+  name: qwen-grpo-sr-v7-35k-base
 spec:
   backoffLimit: 0
   template:
@@ -105,7 +105,7 @@ spec:
         - name: VAL_DATASET_PATH
           value: ""
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_sr_v2_35k"
+          value: "/outputs/grpo_qwen_sr_v3_35k"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -141,7 +141,7 @@ spec:
 
         # Optimization
         - name: LEARNING_RATE
-          value: "5e-6"
+          value: "1e-6"
         - name: BATCH_SIZE
           value: "4"
         - name: GRAD_ACC
@@ -240,12 +240,12 @@ spec:
         resources:
           limits:
             nvidia.com/a100: "4"
-            memory: "128Gi"
-            cpu: "8"
+            memory: "196Gi"
+            cpu: "12"
           requests:
             nvidia.com/a100: "4"
-            memory: "128Gi"
-            cpu: "8"
+            memory: "196Gi"
+            cpu: "12"
 
         volumeMounts:
         - name: cache
