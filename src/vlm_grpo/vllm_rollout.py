@@ -119,12 +119,20 @@ class VLLMRolloutEngine:
         )
 
     def sleep(self) -> None:
-        """Put vLLM to sleep, freeing ALL GPU memory for training.
+        """Put vLLM to sleep, offloading weights to CPU for training.
 
-        Level 2 sleep discards both model weights and KV cache,
-        freeing all GPU memory. Matches TRL colocate pattern.
+        Uses level 1 (CPU offload) instead of level 2 (full discard)
+        to avoid vLLM refcount corruption bug that causes SIGABRT after
+        ~1000 sleep/wake cycles with level 2.
+        Bug: vLLM issues #20431, #16993, #24879, #33625.
+        Tradeoff: ~16-24 GB extra CPU RAM, slightly slower wake (~3s).
         """
-        self.llm.sleep(level=2)
+        import gc
+
+        # Force GC before sleep to reduce dangling Python refs that
+        # accelerate the refcount drift in vLLM's C extensions.
+        gc.collect()
+        self.llm.sleep(level=1)
 
     def wake_up_for_weights(self) -> None:
         """Wake up weight memory only (step 1 of 2).

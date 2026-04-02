@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-sr-v4-35k-from-sft-v2
+  name: qwen-grpo-sr-v5-35k-sftv2
 spec:
   backoffLimit: 0
   template:
@@ -225,6 +225,12 @@ spec:
         # vLLM manages its own memory pool — expandable_segments conflicts
         - name: PYTORCH_CUDA_ALLOC_CONF
           value: ""
+        # Disable vLLM usage stats background thread — races with sleep/wake
+        # and contributes to refcount corruption (vLLM issue #20431)
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        - name: DO_NOT_TRACK
+          value: "1"
         # Required for external_launcher mode (prevents child process spawning)
         - name: VLLM_ENABLE_V1_MULTIPROCESSING
           value: "0"
