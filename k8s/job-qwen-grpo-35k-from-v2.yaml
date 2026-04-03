@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-sr-v7-35k-sftv2
+  name: qwen-grpo-sr-v8-35k-sftv2
 spec:
   backoffLimit: 0
   template:
@@ -92,7 +92,8 @@ spec:
             --logging_steps ${LOGGING_STEPS:-10} \
             --save_steps ${SAVE_STEPS:-500} \
             --seed ${SEED:-42} \
-            2>&1 | tee "${OUTPUT_DIR}/training.log"
+            ${RESUME_CHECKPOINT:+--resume_from_checkpoint "$RESUME_CHECKPOINT"} \
+            2>&1 | tee -a "${OUTPUT_DIR}/training.log"
 
           echo "=== Training complete ==="
 
@@ -120,6 +121,8 @@ spec:
           value: "0.2"
         - name: INNER_EPOCHS
           value: "1"
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_sr_sftv2_v3_35k/checkpoint-500"
 
         # Generation
         - name: MAX_SAMPLES

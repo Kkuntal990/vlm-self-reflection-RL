@@ -1867,9 +1867,7 @@ class SelfReflectionGRPOTrainer:
         old_engine = self.vllm_engine
         model_id = old_engine.model_id
         processor = old_engine.processor
-        # Extract constructor args from the old LLM instance
-        old_llm = old_engine.llm
-        gpu_mem = old_llm.llm_engine.model_config.gpu_memory_utilization
+        gpu_mem = old_engine.gpu_memory_utilization
 
         del old_engine.llm
         del old_engine

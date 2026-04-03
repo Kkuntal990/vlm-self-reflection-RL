@@ -83,6 +83,7 @@ class VLLMRolloutEngine:
 
         self.processor = processor
         self.model_id = model_id
+        self.gpu_memory_utilization = gpu_memory_utilization
 
         logger.info(f"Initializing vLLM engine: {model_id}")
         self.llm = LLM(
