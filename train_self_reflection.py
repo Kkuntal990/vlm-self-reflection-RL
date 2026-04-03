@@ -184,6 +184,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--val_check_interval", type=int, default=500)
 
+    # Resume from checkpoint
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default="",
+        help="Path to checkpoint dir to resume from (e.g. /outputs/.../checkpoint-500). "
+        "Loads LoRA adapter weights + optimizer state, skips already-processed samples.",
+    )
+
     # Debug
     parser.add_argument(
         "--debug", action="store_true", help="Print generated trajectories and reward breakdowns"
@@ -465,6 +474,52 @@ def main() -> None:
         # main process is still loading weights asynchronously.
         accelerator.wait_for_everyone()
 
+    # Resume from checkpoint: load LoRA adapter + optimizer state + skip samples
+    resume_step = 0
+    if args.resume_from_checkpoint:
+        from pathlib import Path
+
+        ckpt_path = Path(args.resume_from_checkpoint)
+        logger.info(f"Resuming from checkpoint: {ckpt_path}")
+
+        # Load LoRA adapter weights into the PEFT model
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        adapter_path = ckpt_path / "adapter_model.safetensors"
+        if adapter_path.exists():
+            adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
+            unwrapped = accelerator.unwrap_model(model)
+            set_peft_model_state_dict(unwrapped, adapter_state)
+            logger.info(f"Loaded LoRA adapter from {adapter_path}")
+        else:
+            logger.warning(f"No adapter_model.safetensors found at {ckpt_path}")
+
+        # Load optimizer state if saved
+        optim_path = ckpt_path / "optimizer.pt"
+        if optim_path.exists():
+            optim_state = torch.load(str(optim_path), map_location=str(accelerator.device))
+            optimizer.load_state_dict(optim_state)
+            logger.info(f"Loaded optimizer state from {optim_path}")
+
+        # Extract step number from checkpoint dir name (e.g. "checkpoint-500" → 500)
+        ckpt_name = ckpt_path.name
+        if ckpt_name.startswith("checkpoint-"):
+            resume_step = int(ckpt_name.split("-")[1])
+            logger.info(f"Resuming from step {resume_step}")
+
+        # Skip already-processed samples. Each step processes batch_size samples,
+        # and the dataset was already sharded per-process.
+        samples_done = resume_step * config.rollout.batch_size
+        if samples_done > 0 and samples_done < len(train_dataset):
+            train_dataset = train_dataset[samples_done:]
+            logger.info(
+                f"Skipped {samples_done} already-processed samples, {len(train_dataset)} remaining"
+            )
+        elif samples_done >= len(train_dataset):
+            logger.info("All samples already processed in this checkpoint. Nothing to train.")
+            return
+
     # Create trainer
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
 
@@ -478,12 +533,19 @@ def main() -> None:
         vllm_engine=vllm_engine,
     )
 
+    # Set global_step to resume point so logging/checkpointing continues correctly
+    if resume_step > 0:
+        trainer.global_step = resume_step
+        logger.info(f"Trainer global_step set to {resume_step}")
+
     # Train
     logger.info("Starting self-reflection GRPO training...")
     logger.info("  Two-reward design: response (A1+A2) + feedback (F1)")
     logger.info("  Single LoRA adapter, shared parameter updates")
     if vllm_engine:
         logger.info("  vLLM rollout acceleration: ENABLED")
+    if resume_step > 0:
+        logger.info(f"  Resuming from step {resume_step}")
     trainer.train(train_dataset, val_dataset)
 
 

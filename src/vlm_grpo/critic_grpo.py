@@ -1825,11 +1825,13 @@ class SelfReflectionGRPOTrainer:
         return self.patience_counter >= es_config.patience
 
     def _save_checkpoint(self, path: Path) -> None:
-        """Save model checkpoint.
+        """Save model checkpoint + optimizer state for resume.
 
         Args:
             path: Directory to save to
         """
+        import torch
+
         path.mkdir(parents=True, exist_ok=True)
         unwrapped = (
             self.accelerator.unwrap_model(self.model)
@@ -1838,6 +1840,9 @@ class SelfReflectionGRPOTrainer:
         )
         unwrapped.save_pretrained(path)
         self.processor.save_pretrained(path)
+
+        # Save optimizer state for resume
+        torch.save(self.optimizer.state_dict(), path / "optimizer.pt")
 
         config_path = path / "training_config.json"
         with open(config_path, "w") as f:
