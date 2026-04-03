@@ -86,7 +86,6 @@ spec:
             --w_a2_format ${W_A2_FORMAT:-0.15} \
             --w_minimal_edit ${W_MINIMAL_EDIT:-0.3} \
             --w_downstream ${W_DOWNSTREAM:-2.0} \
-            --w_correction_bonus ${W_CORRECTION_BONUS:-0.5} \
             --w_calibration ${W_CALIBRATION:-0.2} \
             --w_fb_format ${W_FB_FORMAT:-0.15} \
             --logging_steps ${LOGGING_STEPS:-10} \
@@ -185,8 +184,6 @@ spec:
         # Feedback reward weights
         - name: W_DOWNSTREAM
           value: "2.0"
-        - name: W_CORRECTION_BONUS
-          value: "0.5"
         - name: W_CALIBRATION
           value: "0.2"
         - name: W_FB_FORMAT

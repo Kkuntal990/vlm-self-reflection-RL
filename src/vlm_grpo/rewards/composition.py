@@ -933,25 +933,20 @@ def compute_feedback_reward_breakdown(
     else:
         r_downstream = 2.0 if a2_correct else -1.0
 
-    # SCoRe correction bonus (arXiv:2409.12917): rewards the improvement
-    # delta. WR: +1.0, RW: -1.0, RR/WW: 0.0. Breaks degeneracy between
-    # "did nothing" (RR/WW) vs "helped/hurt" (WR/RW).
-    r_correction_bonus = float(a2_correct) - float(a1_correct)
-
     # Calibration tiebreaker: varies across K trajectories because each
     # generates different feedback TEXT even for the same correctness outcome.
     # Produces 7 discrete values from keyword patterns in the feedback.
+    # This is the key variance-breaking component — downstream alone has
+    # only 4 discrete values, causing 50-75% zero-variance K-groups.
     r_calibration = compute_feedback_calibration_reward(feedback_text, a1_correct)
 
     components = {
         "downstream": r_downstream,
-        "correction_bonus": r_correction_bonus,
         "calibration": r_calibration,
         "format": r_format,
     }
     weighted_components = {
         "downstream": r_downstream * weights.w_downstream,
-        "correction_bonus": r_correction_bonus * weights.w_correction_bonus,
         "calibration": r_calibration * weights.w_calibration,
         "format": r_format * weights.w_format,
     }
