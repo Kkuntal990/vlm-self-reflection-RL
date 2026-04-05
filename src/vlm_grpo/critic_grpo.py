@@ -851,9 +851,11 @@ class SelfReflectionGRPOTrainer:
 
         model_type = getattr(self.config, "model_type", "llava")
 
-        # Sync LoRA-merged weights to vLLM before generation.
-        # No sleep/wake — vLLM stays resident to avoid refcount crash.
+        # vLLM sleep/wake cycle: wake → sync weights → generate → sleep.
+        # The refcount leak (~1000 cycles) is handled by frequent
+        # checkpointing (every 500 steps) + auto-resume on crash.
         if self.vllm_engine is not None:
+            self.vllm_engine.wake_up()
             self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
 
         rollout_results = generate_self_reflection_rollout(
@@ -868,6 +870,10 @@ class SelfReflectionGRPOTrainer:
             vllm_engine=self.vllm_engine,
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
+
+        # Put vLLM to sleep to free GPU memory for training
+        if self.vllm_engine is not None:
+            self.vllm_engine.sleep()
 
         # Re-enable gradient checkpointing for the training forward passes
         if had_grad_ckpt:

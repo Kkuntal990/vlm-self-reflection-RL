@@ -162,7 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vllm_gpu_memory_utilization",
         type=float,
-        default=0.15,
+        default=0.30,
         help="Fraction of GPU memory for vLLM KV cache (no sleep mode: 0.15)",
     )
 
@@ -170,13 +170,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_a1_correctness", type=float, default=1.0)
     parser.add_argument("--w_a2_correctness", type=float, default=1.0)
     parser.add_argument("--w_no_regression", type=float, default=2.0)
-    parser.add_argument("--w_a2_format", type=float, default=0.15)
+    parser.add_argument("--w_a2_format", type=float, default=0.30)
     parser.add_argument("--w_minimal_edit", type=float, default=0.3)
 
     # Feedback reward weights
     parser.add_argument("--w_downstream", type=float, default=2.0)
     parser.add_argument("--w_calibration", type=float, default=0.2)
-    parser.add_argument("--w_fb_format", type=float, default=0.15)
+    parser.add_argument("--w_fb_format", type=float, default=0.30)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -466,7 +466,8 @@ def main() -> None:
             min_pixels=args.min_pixels,
             seed=accelerator.process_index,
         )
-        logger.info(f"vLLM engine initialized on rank {accelerator.process_index} (no sleep mode)")
+        vllm_engine.sleep()
+        logger.info(f"vLLM engine initialized on rank {accelerator.process_index} (sleeping)")
         # Sync all ranks before continuing — prevents DeepSpeed hangs when
         # main process is still loading weights asynchronously.
         accelerator.wait_for_everyone()
