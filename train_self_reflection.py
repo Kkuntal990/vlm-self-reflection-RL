@@ -162,8 +162,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vllm_gpu_memory_utilization",
         type=float,
-        default=0.30,
-        help="Fraction of GPU memory for vLLM KV cache (TRL default: 0.3)",
+        default=0.15,
+        help="Fraction of GPU memory for vLLM KV cache (no sleep mode: 0.15)",
     )
 
     # Response reward weights

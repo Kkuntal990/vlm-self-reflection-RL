@@ -13,12 +13,12 @@ SIGABRT after ~1000 cycles. Every workaround failed:
   - gc.collect(): slows but doesn't prevent
   - Engine restart: "Sleep mode can only be used for one instance"
 
-Instead, vLLM runs with a small KV cache (gpu_memory_utilization=0.05)
+Instead, vLLM runs with a small KV cache (gpu_memory_utilization=0.15)
 that stays resident alongside the training model. Memory budget:
   vLLM model:     14 GiB (always resident)
-  vLLM KV cache:   3 GiB (0.05 * ~66 GiB)
+  vLLM KV cache:  ~8 GiB (0.15 of available after model load)
   Training model: 14 GiB (DDP)
-  Available:     ~47 GiB (enough for gradient checkpointing)
+  Available:     ~42 GiB (enough for gradient checkpointing)
 
 The lifecycle per training step is simply:
     1. update_weights_from_peft() — sync LoRA-merged weights
@@ -55,7 +55,7 @@ class VLLMRolloutEngine:
         self,
         model_id: str,
         processor: Any,
-        gpu_memory_utilization: float = 0.05,
+        gpu_memory_utilization: float = 0.15,
         max_model_len: int = 2048,
         max_pixels: int = 401408,
         min_pixels: int = 200704,
