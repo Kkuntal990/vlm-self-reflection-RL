@@ -57,7 +57,7 @@ spec:
             --output_dir "${OUTPUT_DIR}" \
             --image_base_dir "${IMAGE_BASE_DIR}" \
             --use_vllm \
-            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.30} \
+            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.10} \
             --max_samples ${MAX_SAMPLES:-0} \
             --k_samples ${K_SAMPLES:-8} \
             --max_completion_length ${MAX_COMPLETION_LENGTH:-512} \
@@ -160,7 +160,7 @@ spec:
 
         # vLLM acceleration
         - name: VLLM_GPU_MEM
-          value: "0.30"
+          value: "0.10"
         - name: GIT_BRANCH
           value: "feature/vllm-deepspeed"
 
@@ -178,7 +178,7 @@ spec:
         - name: W_NO_REGRESSION
           value: "2.0"
         - name: W_A2_FORMAT
-          value: "0.30"
+          value: "0.10"
         - name: W_MINIMAL_EDIT
           value: "0.3"
 
@@ -188,7 +188,7 @@ spec:
         - name: W_CALIBRATION
           value: "0.2"
         - name: W_FB_FORMAT
-          value: "0.30"
+          value: "0.10"
 
         # Logging
         - name: LOGGING_STEPS

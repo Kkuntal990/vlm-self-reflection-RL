@@ -47,7 +47,7 @@ class VLLMRolloutEngine:
         self,
         model_id: str,
         processor: Any,
-        gpu_memory_utilization: float = 0.30,
+        gpu_memory_utilization: float = 0.10,
         max_model_len: int = 2048,
         max_pixels: int = 401408,
         min_pixels: int = 200704,

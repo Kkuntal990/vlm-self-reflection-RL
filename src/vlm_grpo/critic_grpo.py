@@ -851,11 +851,22 @@ class SelfReflectionGRPOTrainer:
 
         model_type = getattr(self.config, "model_type", "llava")
 
-        # vLLM sleep/wake cycle: wake → sync weights → generate → sleep.
-        # The refcount leak (~1000 cycles) is handled by frequent
-        # checkpointing (every 500 steps) + auto-resume on crash.
+        # vLLM sleep/wake cycle with reduced frequency to avoid refcount
+        # crash. The crash happens after ~1186 cycles per vLLM instance.
+        # By sleeping every 2 steps instead of every step, we halve the
+        # cycle count and can complete 35K training (2187 steps/rank)
+        # within the ~1186 cycle budget: 2187/2 = 1093 < 1186.
+        #
+        # On non-sleep steps, vLLM stays awake during training — its KV
+        # cache (~6 GiB with gpu_mem=0.10) stays allocated but unused.
         if self.vllm_engine is not None:
-            self.vllm_engine.wake_up()
+            should_sleep = self.global_step % 2 == 1  # sleep on odd steps
+            if not hasattr(self, "_vllm_awake"):
+                self._vllm_awake = False
+
+            if not self._vllm_awake:
+                self.vllm_engine.wake_up()
+                self._vllm_awake = True
             self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
 
         rollout_results = generate_self_reflection_rollout(
@@ -871,9 +882,10 @@ class SelfReflectionGRPOTrainer:
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
 
-        # Put vLLM to sleep to free GPU memory for training
-        if self.vllm_engine is not None:
+        # Sleep only every 2 steps to halve the cycle count
+        if self.vllm_engine is not None and should_sleep:
             self.vllm_engine.sleep()
+            self._vllm_awake = False
 
         # Re-enable gradient checkpointing for the training forward passes
         if had_grad_ckpt:
