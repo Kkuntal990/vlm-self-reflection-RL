@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-sr-v8-35k-base
+  name: qwen-grpo-sr-v10-35k-base
 spec:
   backoffLimit: 0
   template:
@@ -120,6 +120,8 @@ spec:
           value: "0.2"
         - name: INNER_EPOCHS
           value: "1"
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_sr_v3_35k/checkpoint-500"
 
         # Generation
         - name: MAX_SAMPLES
