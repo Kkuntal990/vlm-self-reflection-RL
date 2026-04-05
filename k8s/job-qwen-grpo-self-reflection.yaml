@@ -57,7 +57,7 @@ spec:
             --output_dir "${OUTPUT_DIR}" \
             --image_base_dir "${IMAGE_BASE_DIR}" \
             --use_vllm \
-            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.30} \
+            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.05} \
             --max_samples ${MAX_SAMPLES:-0} \
             --k_samples ${K_SAMPLES:-8} \
             --max_completion_length ${MAX_COMPLETION_LENGTH:-512} \
@@ -158,7 +158,7 @@ spec:
 
         # vLLM acceleration
         - name: VLLM_GPU_MEM
-          value: "0.30"
+          value: "0.05"
         - name: GIT_BRANCH
           value: "feature/vllm-deepspeed"
 

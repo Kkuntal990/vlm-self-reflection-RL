@@ -466,8 +466,7 @@ def main() -> None:
             min_pixels=args.min_pixels,
             seed=accelerator.process_index,
         )
-        vllm_engine.sleep()
-        logger.info(f"vLLM engine initialized on rank {accelerator.process_index} (sleeping)")
+        logger.info(f"vLLM engine initialized on rank {accelerator.process_index} (no sleep mode)")
         # Sync all ranks before continuing — prevents DeepSpeed hangs when
         # main process is still loading weights asynchronously.
         accelerator.wait_for_everyone()

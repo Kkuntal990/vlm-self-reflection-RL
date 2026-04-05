@@ -3,26 +3,31 @@
 vLLM-accelerated rollout engine for self-reflection GRPO.
 
 Replaces HuggingFace model.generate() with vLLM offline inference
-for 3-5x faster rollout generation. Uses sleep mode to share GPU
-memory between generation (vLLM) and training (HF model).
+for 3-5x faster rollout generation.
 
-The sequential A1 -> F1 -> A2 dependency is handled with three
-separate batched vLLM generate() calls per rollout step.
+**No sleep mode.** vLLM's sleep/wake cycle has an unfixed CPython
+refcount leak (issues #20431, #16993, #24879, #33625) that causes
+SIGABRT after ~1000 cycles. Every workaround failed:
+  - sleep(level=2): crash at ~1000 cycles
+  - sleep(level=1): same crash
+  - gc.collect(): slows but doesn't prevent
+  - Engine restart: "Sleep mode can only be used for one instance"
 
-The sleep/wake/sync lifecycle per training step follows the TRL
-VLLMGeneration colocate pattern exactly:
-    1. wake_up_for_weights()     — allocate weight memory on GPU
-    2. update_weights_from_peft()— sync LoRA-merged weights to vLLM
-    3. wake_up_for_generation()  — allocate KV cache memory
-    4. generate_batch() x3       — A1, F1, A2 inference
-    5. sleep()                   — free ALL GPU memory for training
+Instead, vLLM runs with a small KV cache (gpu_memory_utilization=0.05)
+that stays resident alongside the training model. Memory budget:
+  vLLM model:     14 GiB (always resident)
+  vLLM KV cache:   3 GiB (0.05 * ~66 GiB)
+  Training model: 14 GiB (DDP)
+  Available:     ~47 GiB (enough for gradient checkpointing)
+
+The lifecycle per training step is simply:
+    1. update_weights_from_peft() — sync LoRA-merged weights
+    2. generate_batch() x3        — A1, F1, A2 inference
+    (no sleep, no wake, no crash)
 
 References:
-    - TRL VLLMGeneration: trl/generation/vllm_generation.py
-    - vLLM sleep mode: https://docs.vllm.ai/en/latest/features/sleep_mode/
+    - vLLM sleep mode bugs: #20431, #16993, #24879, #33625
     - TRL colocate blog: https://huggingface.co/blog/vllm-colocate
-    - vLLM issue #26195: MM cache stale refs after sleep
-    - verl issue #1361: disable_mm_preprocessor_cache deprecation
 """
 
 import logging
@@ -41,19 +46,16 @@ logger = logging.getLogger(__name__)
 class VLLMRolloutEngine:
     """vLLM-backed rollout engine for self-reflection trajectories.
 
-    Manages a vLLM LLM instance that sleeps during training and wakes
-    for rollout generation. Supports Qwen2.5-VL multimodal inputs.
-
-    The sleep/wake cycle ensures GPU memory is shared:
-    - During generation: vLLM uses ~20-24 GB for model + KV cache
-    - During training: vLLM sleeps (0 GB), HF model uses full GPU budget
+    vLLM stays resident on GPU with a small KV cache. No sleep/wake
+    cycle — avoids the refcount crash that affects all vLLM versions
+    since 0.8.0. Weight sync happens via load_weights() each step.
     """
 
     def __init__(
         self,
         model_id: str,
         processor: Any,
-        gpu_memory_utilization: float = 0.30,
+        gpu_memory_utilization: float = 0.05,
         max_model_len: int = 2048,
         max_pixels: int = 401408,
         min_pixels: int = 200704,
@@ -66,7 +68,8 @@ class VLLMRolloutEngine:
         Args:
             model_id: HuggingFace model ID or local checkpoint path
             processor: HuggingFace processor (for chat template formatting)
-            gpu_memory_utilization: Fraction of GPU memory for vLLM KV cache
+            gpu_memory_utilization: Fraction of GPU memory for vLLM KV cache.
+                Default 0.05 (~3 GiB) — small to leave room for training.
             max_model_len: Maximum total sequence length (prompt + completion)
             max_pixels: Max pixels per image (Qwen2.5-VL dynamic resolution)
             min_pixels: Min pixels per image
@@ -78,14 +81,16 @@ class VLLMRolloutEngine:
 
         # Required for external_launcher mode — prevents vLLM from spawning
         # child processes that conflict with accelerate/DeepSpeed.
-        # Reference: TRL VLLMGeneration, vLLM ExecutorWithExternalLauncher
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # Disable usage stats background thread (races with weight sync).
+        os.environ["VLLM_NO_USAGE_STATS"] = "1"
+        os.environ["DO_NOT_TRACK"] = "1"
 
         self.processor = processor
         self.model_id = model_id
         self.gpu_memory_utilization = gpu_memory_utilization
 
-        logger.info(f"Initializing vLLM engine: {model_id}")
+        logger.info(f"Initializing vLLM engine (no sleep mode): {model_id}")
         self.llm = LLM(
             model=model_id,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -93,69 +98,22 @@ class VLLMRolloutEngine:
             trust_remote_code=True,
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
-            # Join the existing torch.distributed process group instead of
-            # spawning new NCCL workers. Required for compatibility with
-            # accelerate/DeepSpeed multi-GPU training.
-            # Reference: https://huggingface.co/blog/vllm-colocate
             distributed_executor_backend="external_launcher",
             mm_processor_kwargs={
                 "min_pixels": min_pixels,
                 "max_pixels": max_pixels,
             },
-            enable_sleep_mode=True,
+            # No sleep mode — avoids CPython refcount crash.
+            enable_sleep_mode=False,
             dtype="bfloat16",
             seed=seed,
             max_num_batched_tokens=4096,
-            # Disable multimodal preprocessor cache. sleep(level=2) frees
-            # cached image feature tensors but leaves stale hash references,
-            # causing AssertionError on the next generate() call.
-            # Use mm_processor_cache_gb (stable API, vLLM ≥0.10.2) instead of
-            # the deprecated disable_mm_preprocessor_cache (removed in ≥0.13).
-            # Reference: vLLM issue #26195, verl issue #1361
             mm_processor_cache_gb=0,
         )
         logger.info(
             f"vLLM engine ready: gpu_mem={gpu_memory_utilization}, "
             f"max_len={max_model_len}, tp={tensor_parallel_size}"
         )
-
-    def sleep(self) -> None:
-        """Put vLLM to sleep, offloading weights to CPU for training.
-
-        Uses level 1 (CPU offload) instead of level 2 (full discard)
-        to avoid vLLM refcount corruption bug that causes SIGABRT after
-        ~1000 sleep/wake cycles with level 2.
-        Bug: vLLM issues #20431, #16993, #24879, #33625.
-        Tradeoff: ~16-24 GB extra CPU RAM, slightly slower wake (~3s).
-        """
-        import gc
-
-        # Force GC before sleep to reduce dangling Python refs that
-        # accelerate the refcount drift in vLLM's C extensions.
-        gc.collect()
-        self.llm.sleep(level=1)
-
-    def wake_up_for_weights(self) -> None:
-        """Wake up weight memory only (step 1 of 2).
-
-        Frees fragmented training memory, then allocates GPU space for
-        model weights. Call update_weights_from_peft() next, then
-        wake_up_for_generation() before generating.
-
-        Matches TRL: ``wake_up(tags=["weights"])`` then ``collective_rpc``.
-        """
-        import torch
-
-        torch.cuda.empty_cache()
-        self.llm.wake_up(tags=["weights"])
-
-    def wake_up_for_generation(self) -> None:
-        """Wake up KV cache memory (step 2 of 2).
-
-        Call this AFTER update_weights_from_peft() and BEFORE
-        generate_batch(). Allocates the KV cache blocks.
-        """
-        self.llm.wake_up(tags=["kv_cache"])
 
     def update_weights_from_peft(
         self,
@@ -165,21 +123,11 @@ class VLLMRolloutEngine:
         """Merge LoRA adapter weights and load into vLLM.
 
         Temporarily merges the LoRA adapter into the base weights,
-        extracts the merged state dict, strips the PEFT parameter name
-        prefixes (``base_model.model.``, ``.base_layer``), skips
-        adapter-only parameters (``lora_``, ``original_module``), and
-        loads the result into vLLM.
-
-        For DeepSpeed ZeRO-3, all sharded parameters are gathered
-        before merge/load so that each rank sees the full tensors.
-
-        Follows the same weight-sync logic as TRL ``VLLMGeneration.sync_weights``.
+        strips PEFT prefixes, and loads into vLLM via load_weights().
 
         Args:
             peft_model: PEFT model with LoRA adapter (may be DDP-wrapped)
-            accelerator: Optional Accelerate ``Accelerator`` instance. When
-                provided, DeepSpeed ZeRO-3 sharded parameters are gathered
-                automatically before the merge/load cycle.
+            accelerator: Optional Accelerate Accelerator for ZeRO-3 gather.
         """
         from contextlib import nullcontext
 
@@ -190,8 +138,7 @@ class VLLMRolloutEngine:
         if hasattr(peft_model, "module"):
             unwrapped = peft_model.module
 
-        # Detect DeepSpeed ZeRO-3: parameters are sharded across GPUs and
-        # must be gathered before we can merge adapters or read full tensors.
+        # Detect DeepSpeed ZeRO-3
         gather_ctx = nullcontext
         if accelerator is not None:
             ds_plugin = getattr(accelerator.state, "deepspeed_plugin", None)
@@ -200,10 +147,7 @@ class VLLMRolloutEngine:
 
                 gather_ctx = deepspeed.zero.GatheredParameters
 
-        # Determine the PEFT adapter prefix so we can skip adapter-only params.
-        # For LoRA this is "lora_" (e.g. lora_A, lora_B).
         peft_prefix = getattr(unwrapped, "prefix", "lora_")
-
         llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
         assert hasattr(llm_model, "load_weights"), (
             f"vLLM internal model path broken: {type(llm_model)} has no load_weights(). "
@@ -215,29 +159,17 @@ class VLLMRolloutEngine:
             unwrapped.merge_adapter()
             try:
                 for name, param in unwrapped.named_parameters():
-                    # Strip the PEFT wrapper prefixes to recover original HF names.
-                    # PEFT wraps: base_model.model.<original_name>[.base_layer]
                     name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-
-                    # Skip adapter-only parameters (lora_A, lora_B, etc.) —
-                    # they don't exist in the base model / vLLM.
                     if peft_prefix in name:
                         continue
-
-                    # Skip modules_to_save bookkeeping parameters.
                     if "original_module" in name:
                         continue
-
-                    # Also strip any modules_to_save wrapper prefix.
                     name = name.replace("modules_to_save.default.", "")
-
                     llm_model.load_weights([(name, param.data)])
                     n_loaded += 1
             finally:
                 unwrapped.unmerge_adapter()
 
-        # Reset prefix cache — cached KV states from previous weights
-        # are invalid after weight sync.
         self.llm.reset_prefix_cache()
         logger.info(f"Updated vLLM weights ({n_loaded} params synced)")
 
@@ -251,11 +183,8 @@ class VLLMRolloutEngine:
     ) -> list[str]:
         """Generate completions for a batch of prompts with images.
 
-        Uses vLLM's continuous batching and PagedAttention for
-        high-throughput inference. Supports multimodal inputs.
-
         Args:
-            prompts: List of formatted prompt strings (from apply_chat_template)
+            prompts: List of formatted prompt strings
             images: List of PIL Images (or None), one per prompt
             max_new_tokens: Maximum tokens per completion
             temperature: Sampling temperature (0 = greedy)
@@ -273,7 +202,6 @@ class VLLMRolloutEngine:
             max_tokens=max_new_tokens,
         )
 
-        # Build vLLM inputs with multimodal data
         vllm_inputs = []
         for prompt, image in zip(prompts, images):
             inp: dict[str, Any] = {"prompt": prompt}
@@ -282,5 +210,4 @@ class VLLMRolloutEngine:
             vllm_inputs.append(inp)
 
         outputs = self.llm.generate(vllm_inputs, sampling_params)
-
         return [out.outputs[0].text.strip() for out in outputs]
