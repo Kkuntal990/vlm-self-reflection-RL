@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """
-K-sample rollout engine for two-trajectory GRPO training.
+Rollout engine for self-reflection GRPO training.
 
-Orchestrates the generation of K feedback (F1) and refined answer (A2)
-pairs for each training sample. Used by the critic's custom GRPO loop
-to compute downstream-aware rewards.
+Provides data structures for rollout results and orchestrates the
+generation of K self-reflection trajectories (A1 -> F1 -> A2) per
+training sample.
 
 The rollout pipeline for each sample:
-1. Build critic prompt → Generate K F1 completions (temperature sampling)
-2. For each F1, build refiner prompt → Generate A2 (greedy)
-3. Compute critic rewards from (F1, A2, ground_truth) pairs
+1. Generate K initial answers (A1) with temperature sampling
+2. For each A1, generate feedback (F1) with temperature sampling
+3. For each (A1, F1), generate refined answer (A2) with greedy decoding
+4. Compute two reward signals per trajectory: response and feedback
 
 All generation runs under torch.no_grad() to save memory.
 
 Usage:
-    from vlm_grpo.rollout import RolloutEngine, CriticRolloutResult
+    from vlm_grpo.rollout import (
+        SelfReflectionRolloutResult,
+        generate_self_reflection_rollout,
+        compute_self_reflection_metrics,
+    )
 
-    engine = RolloutEngine(model, processor, config)
-    results = engine.generate_critic_rollout(samples)
+    results = generate_self_reflection_rollout(
+        model, processor, samples, config,
+        response_weights, feedback_weights,
+    )
 """
 
 import logging
@@ -25,7 +32,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from vlm_grpo.config import CriticRewardWeights, RolloutConfig
+from vlm_grpo.config import RolloutConfig
 from vlm_grpo.prompts import (
     build_critic_prompt,
     build_initial_answer_prompt,
@@ -35,7 +42,6 @@ from vlm_grpo.rewards.composition import (
     CriticRewardBreakdown,
     TrajectoryFeedbackRewardBreakdown,
     TrajectoryResponseRewardBreakdown,
-    compute_critic_reward_breakdown,
     compute_feedback_reward_breakdown,
     compute_response_reward_breakdown,
 )
@@ -133,265 +139,6 @@ class RefinerRolloutResult:
 
 
 # =============================================================================
-# Rollout Engine
-# =============================================================================
-
-
-class RolloutEngine:
-    """Orchestrates K-sample rollout for two-trajectory GRPO.
-
-    Generates K feedback and A2 pairs per sample using the model's
-    generate() method. All generation runs under torch.no_grad().
-
-    The engine is model-agnostic: it requires a model and processor
-    that support the HuggingFace generate() interface.
-    """
-
-    def __init__(
-        self,
-        model: Any,
-        processor: Any,
-        config: RolloutConfig,
-        reward_weights: CriticRewardWeights,
-        device: str = "cuda",
-        model_type: str = "llava",
-    ) -> None:
-        """Initialize the rollout engine.
-
-        Args:
-            model: HuggingFace model with generate() method
-            processor: Tokenizer/processor for the model
-            config: Rollout configuration
-            reward_weights: Critic reward weights for scoring
-            device: Device for generation
-            model_type: Model family ("llava" or "qwen2vl")
-        """
-        self.model = model
-        self.processor = processor
-        self.config = config
-        self.reward_weights = reward_weights
-        self.device = device
-        self.model_type = model_type
-
-    def generate_critic_rollout(
-        self,
-        samples: list[dict],
-    ) -> list[CriticRolloutResult]:
-        """Generate K F1+A2 pairs for each sample and compute rewards.
-
-        For each sample:
-        1. Build critic prompt → generate K F1 completions with temperature sampling
-        2. For each F1, build refiner prompt → generate A2 with greedy decoding
-        3. Compute critic rewards from (F1, A2, ground_truth)
-
-        All generation runs under torch.no_grad().
-
-        Args:
-            samples: List of dataset sample dicts with fields: question,
-                image_path, ground_truth, answer1, answer_type, choices,
-                dataset_name, a1_is_correct
-
-        Returns:
-            List of CriticRolloutResult, one per sample
-        """
-        # Lazy import for heavy ML libraries
-        import torch
-
-        results = []
-        batch_size = self.config.batch_size
-        k = self.config.k_samples
-
-        for batch_start in range(0, len(samples), batch_size):
-            batch = samples[batch_start : batch_start + batch_size]
-
-            for sample in batch:
-                question = sample.get("question", "").replace("<image>", "").strip()
-                image_path = sample.get("image_path", "")
-                ground_truth = sample.get("ground_truth", "")
-                answer1 = sample.get("answer1", "")
-                answer_type = sample.get("answer_type", "open")
-                choices_str = sample.get("choices", "")
-                dataset_name = sample.get("dataset_name", "unknown")
-                a1_is_correct = sample.get("a1_is_correct", True)
-                sample_index = sample.get("sample_index", batch_start)
-                image = sample.get("image")
-
-                result = CriticRolloutResult(
-                    sample_index=sample_index,
-                    question=question,
-                    image_path=image_path,
-                    ground_truth=ground_truth,
-                    answer1=answer1,
-                    answer_type=answer_type,
-                    choices=choices_str,
-                    dataset_name=dataset_name,
-                    a1_is_correct=a1_is_correct,
-                )
-
-                # Step 1: Generate K feedbacks
-                with torch.no_grad():
-                    feedbacks = self._generate_k_feedbacks(
-                        question=question,
-                        answer1=answer1,
-                        answer_type=answer_type,
-                        choices=choices_str,
-                        image=image,
-                        k=k,
-                    )
-
-                # Step 2: For each feedback, generate A2
-                answer2s = []
-                with torch.no_grad():
-                    for f1 in feedbacks:
-                        a2 = self._generate_a2(
-                            question=question,
-                            answer1=answer1,
-                            feedback1=f1,
-                            answer_type=answer_type,
-                            choices=choices_str,
-                            image=image,
-                        )
-                        answer2s.append(a2)
-
-                # Step 3: Compute rewards
-                rewards = []
-                breakdowns = []
-                for f1, a2 in zip(feedbacks, answer2s):
-                    bd = compute_critic_reward_breakdown(
-                        feedback_text=f1,
-                        a2_text=a2,
-                        ground_truth=ground_truth,
-                        answer1=answer1,
-                        a1_is_correct=a1_is_correct,
-                        answer_type=answer_type,
-                        choices=choices_str,
-                        weights=self.reward_weights,
-                    )
-                    rewards.append(bd.total_reward)
-                    breakdowns.append(bd)
-
-                result.feedbacks = feedbacks
-                result.answer2s = answer2s
-                result.rewards = rewards
-                result.reward_breakdowns = breakdowns
-                results.append(result)
-
-            processed = min(batch_start + batch_size, len(samples))
-            logger.info(f"Rollout progress: {processed}/{len(samples)} samples")
-
-        return results
-
-    def _generate_k_feedbacks(
-        self,
-        question: str,
-        answer1: str,
-        answer_type: str,
-        choices: str,
-        image: Any,
-        k: int,
-    ) -> list[str]:
-        """Generate K feedback completions for a single sample.
-
-        Uses temperature sampling for diversity.
-
-        Args:
-            question: Visual question text
-            answer1: Initial answer
-            answer_type: Answer type
-            choices: MCQ choices
-            image: PIL Image
-            k: Number of completions
-
-        Returns:
-            List of K feedback text strings
-        """
-
-        messages = build_critic_prompt(
-            question, answer1, answer_type, choices, model_type=self.model_type
-        )
-
-        # Build input from messages using the processor
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-
-        # Re-inject <image> if template stripped it from non-user roles (LLaVA only)
-        if self.model_type != "qwen2vl" and image is not None and "<image>" not in text:
-            text = "<image>\n" + text
-
-        if image is not None:
-            inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
-        else:
-            inputs = self.processor(text=text, return_tensors="pt").to(self.device)
-
-        feedbacks = []
-        for _ in range(k):
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.config.max_completion_length,
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                do_sample=True,
-            )
-            # Decode only the generated tokens
-            generated_ids = outputs[0][inputs["input_ids"].shape[1] :]
-            text_out = self.processor.decode(generated_ids, skip_special_tokens=True)
-            feedbacks.append(text_out.strip())
-
-        return feedbacks
-
-    def _generate_a2(
-        self,
-        question: str,
-        answer1: str,
-        feedback1: str,
-        answer_type: str,
-        choices: str,
-        image: Any,
-    ) -> str:
-        """Generate a single A2 completion for a (question, A1, F1) triple.
-
-        Uses greedy decoding for deterministic A2.
-
-        Args:
-            question: Visual question text
-            answer1: Initial answer
-            feedback1: Feedback from the critic
-            answer_type: Answer type
-            choices: MCQ choices
-            image: PIL Image
-
-        Returns:
-            A2 text string
-        """
-
-        messages = build_refiner_prompt(question, answer1, feedback1, answer_type, choices)
-
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-
-        if image is not None:
-            inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
-        else:
-            inputs = self.processor(text=text, return_tensors="pt").to(self.device)
-
-        temp = self.config.a2_temperature
-        do_sample = temp > 0
-
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=self.config.max_completion_length,
-            temperature=temp if do_sample else None,
-            do_sample=do_sample,
-        )
-
-        generated_ids = outputs[0][inputs["input_ids"].shape[1] :]
-        text_out = self.processor.decode(generated_ids, skip_special_tokens=True)
-        return text_out.strip()
-
-
-# =============================================================================
 # Rollout Metrics Computation
 # =============================================================================
 
@@ -405,7 +152,7 @@ def compute_rollout_metrics(
         results: List of CriticRolloutResult from generate_critic_rollout
 
     Returns:
-        Dict of metric name → value
+        Dict of metric name -> value
     """
     if not results:
         return {}
@@ -502,82 +249,6 @@ class SelfReflectionRolloutResult:
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
-
-
-def _generate_completions(
-    model: Any,
-    processor: Any,
-    messages: list[dict],
-    image: Any,
-    device: str,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    k: int,
-    model_type: str = "llava",
-) -> list[str]:
-    """Generate K completions for given messages.
-
-    Args:
-        model: HuggingFace model with generate() method
-        processor: Tokenizer/processor for the model
-        messages: Conversation messages
-        image: PIL Image (or None)
-        device: Device string
-        max_new_tokens: Maximum tokens per generation
-        temperature: Sampling temperature
-        top_p: Top-p sampling
-        k: Number of completions
-        model_type: Model family ("llava" or "qwen2vl")
-
-    Returns:
-        List of K text completions
-    """
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    # Re-inject <image> token for LLaVA when template strips it from
-    # non-user roles. Qwen2.5-VL handles images natively.
-    if model_type != "qwen2vl" and image is not None and "<image>" not in text:
-        text = "<image>\n" + text
-
-    if image is not None:
-        inputs = processor(text=text, images=image, return_tensors="pt").to(device)
-    else:
-        inputs = processor(text=text, return_tensors="pt").to(device)
-
-    do_sample = temperature > 0
-    prompt_len = inputs["input_ids"].shape[1]
-
-    if k == 1:
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature if do_sample else None,
-            top_p=top_p if do_sample else None,
-            do_sample=do_sample,
-        )
-        return [processor.decode(outputs[0][prompt_len:], skip_special_tokens=True).strip()]
-
-    # TRL-style: expand the single prompt k times along the batch dim so all
-    # k completions are generated in one parallel model.generate() call.
-    batched_inputs = {
-        key: val.expand(k, *val.shape[1:]).contiguous() for key, val in inputs.items()
-    }
-    logger.info(
-        f"[generate A1] batch={batched_inputs['input_ids'].shape[0]} "
-        f"seq_len={batched_inputs['input_ids'].shape[1]}"
-    )
-    outputs = model.generate(
-        **batched_inputs,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature if do_sample else None,
-        top_p=top_p if do_sample else None,
-        do_sample=do_sample,
-    )
-    return [
-        processor.decode(outputs[i][prompt_len:], skip_special_tokens=True).strip()
-        for i in range(k)
-    ]
 
 
 def _generate_batch_completions(
@@ -731,7 +402,7 @@ def generate_self_reflection_rollout(
             chunk_size = chunk_end - chunk_start
 
             # Step 1: Generate K A1s for every sample in the chunk.
-            # repeat_interleave: [q0]*k + [q1]*k + ... → chunk_size*k prompts
+            # repeat_interleave: [q0]*k + [q1]*k + ... -> chunk_size*k prompts
             a1_prompts = [build_initial_answer_prompt(q) for q in chunk_qs for _ in range(k)]
             imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
 

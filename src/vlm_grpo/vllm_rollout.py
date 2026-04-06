@@ -6,20 +6,23 @@ Replaces HuggingFace model.generate() with vLLM offline inference
 for 3-5x faster rollout generation. Uses sleep mode for GPU memory
 sharing between vLLM (generation) and HF model (training).
 
-vLLM's sleep/wake has a known refcount leak (~1000 cycles to crash,
-issues #20431, #16993, #24879). Without sleep mode, two 7B models
-can't coexist on 80 GiB GPU. Strategy: frequent checkpointing
-(every 500 steps) + auto-resume on crash.
-
 The lifecycle per training step:
-    1. wake_up()                 — restore vLLM to GPU
-    2. update_weights_from_peft()— sync LoRA-merged weights
-    3. generate_batch() x3       — A1, F1, A2 inference
-    4. sleep()                   — free GPU memory for training
+    1. wake_up_for_weights()      -- restore model weights to GPU
+    2. update_weights_from_peft() -- sync LoRA-merged weights
+    3. wake_up_for_generation()   -- restore KV cache for inference
+    4. generate_batch() x3        -- A1, F1, A2 inference
+    5. sleep()                    -- free GPU memory for training
+
+With enable_sleep_mode=True and gpu_memory_utilization=0.50, vLLM
+claims half the GPU during generation and fully releases it during
+sleep(level=1). The selective wake_up(tags=["weights"]) /
+wake_up(tags=["kv_cache"]) pattern avoids the refcount crash that
+affects wake_up() without tags (vLLM issues #20431, #16993, #24879).
 
 References:
-    - vLLM sleep mode bugs: #20431, #16993, #24879, #33625
-    - TRL colocate blog: https://huggingface.co/blog/vllm-colocate
+    - vLLM sleep mode: https://docs.vllm.ai/en/latest/features/sleep_mode/
+    - TRL VLLMGeneration: https://github.com/huggingface/trl
+    - vLLM PR #22724: selective wake_up tags
 """
 
 import logging
@@ -38,16 +41,16 @@ logger = logging.getLogger(__name__)
 class VLLMRolloutEngine:
     """vLLM-backed rollout engine for self-reflection trajectories.
 
-    vLLM stays resident on GPU with a small KV cache. No sleep/wake
-    cycle — avoids the refcount crash that affects all vLLM versions
-    since 0.8.0. Weight sync happens via load_weights() each step.
+    Uses sleep mode with selective wake_up tags for safe GPU memory
+    sharing between vLLM (generation) and HF model (training).
+    Weight sync happens via load_weights() each step.
     """
 
     def __init__(
         self,
         model_id: str,
         processor: Any,
-        gpu_memory_utilization: float = 0.30,
+        gpu_memory_utilization: float = 0.50,
         max_model_len: int = 2048,
         max_pixels: int = 401408,
         min_pixels: int = 200704,
@@ -61,7 +64,8 @@ class VLLMRolloutEngine:
             model_id: HuggingFace model ID or local checkpoint path
             processor: HuggingFace processor (for chat template formatting)
             gpu_memory_utilization: Fraction of GPU memory for vLLM KV cache.
-                Default 0.05 (~3 GiB) — small to leave room for training.
+                With sleep mode enabled, this memory is fully released during
+                training (sleep level=1 frees both weights and KV cache).
             max_model_len: Maximum total sequence length (prompt + completion)
             max_pixels: Max pixels per image (Qwen2.5-VL dynamic resolution)
             min_pixels: Min pixels per image
@@ -71,7 +75,7 @@ class VLLMRolloutEngine:
         """
         from vllm import LLM
 
-        # Required for external_launcher mode — prevents vLLM from spawning
+        # Required for external_launcher mode -- prevents vLLM from spawning
         # child processes that conflict with accelerate/DeepSpeed.
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Disable usage stats background thread (races with weight sync).
@@ -82,7 +86,7 @@ class VLLMRolloutEngine:
         self.model_id = model_id
         self.gpu_memory_utilization = gpu_memory_utilization
 
-        logger.info(f"Initializing vLLM engine (no sleep mode): {model_id}")
+        logger.info(f"Initializing vLLM engine (sleep mode enabled): {model_id}")
         self.llm = LLM(
             model=model_id,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -95,9 +99,6 @@ class VLLMRolloutEngine:
                 "min_pixels": min_pixels,
                 "max_pixels": max_pixels,
             },
-            # Sleep mode required — without it, two 7B models can't coexist
-            # on 80 GiB GPU. The refcount leak (~1000 cycles) is handled by
-            # frequent checkpointing (every 500 steps) + auto-resume.
             enable_sleep_mode=True,
             dtype="bfloat16",
             seed=seed,
@@ -110,18 +111,34 @@ class VLLMRolloutEngine:
         )
 
     def sleep(self) -> None:
-        """Put vLLM to sleep, freeing GPU memory for training."""
+        """Put vLLM to sleep, freeing GPU memory for training.
+
+        Uses level=1 to free both model weights and KV cache memory,
+        giving the HF training model full GPU access.
+        """
         import gc
 
         gc.collect()
         self.llm.sleep(level=1)
 
-    def wake_up(self) -> None:
-        """Wake vLLM up for generation."""
+    def wake_up_for_weights(self) -> None:
+        """Selectively wake vLLM to accept weight updates.
+
+        Only restores the model weight tensors to GPU. KV cache stays
+        deallocated, saving memory during the weight sync phase.
+        """
         import torch
 
         torch.cuda.empty_cache()
-        self.llm.wake_up()
+        self.llm.wake_up(tags=["weights"])
+
+    def wake_up_for_generation(self) -> None:
+        """Selectively wake vLLM KV cache for inference.
+
+        Called after weight sync. Restores KV cache allocations so
+        generate() can run.
+        """
+        self.llm.wake_up(tags=["kv_cache"])
 
     def update_weights_from_peft(
         self,

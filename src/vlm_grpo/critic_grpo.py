@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 """
-Custom GRPO training loop for the critic model.
+SelfReflectionGRPOTrainer: two-reward GRPO for VLM self-reflection.
 
-Implements Group Relative Policy Optimization for the critic role in
-two-trajectory self-reflection training. The critic generates feedback (F1)
-and is trained with downstream-aware rewards based on how the resulting
-refined answer (A2) turns out.
+Single model generates the full chain: A1 -> F1 -> A2. Two separate
+GRPO updates per step:
+  - Response update: advantage from response reward on log_prob(A1) + log_prob(A2)
+  - Feedback update: advantage from feedback reward on log_prob(F1)
 
-This module provides a custom training loop because TRL's standard
-GRPOTrainer cannot handle downstream-aware rewards (which require
-generating A2 to evaluate F1).
+Both updates share the same LoRA adapter. The conversation flow matches
+the inference script (self_reflective_inference_v2.py) exactly:
+  A1: System=VL_ASSISTANT, User=[image]+question
+  F1: System=CRITIC, Assistant=[image]+question (flipped), User=A1
+  A2: System=VL_ASSISTANT, User=[image]+question, Asst=A1, User=F1 (raw)
 
-GRPO loss:
-    L = -E[min(r(θ)*A, clip(r(θ), 1-ε, 1+ε)*A)] + β*KL(π_θ || π_ref)
-    where r(θ) = π_θ(F1|prompt) / π_old(F1|prompt)
+GRPO loss (per-token, clipped surrogate):
+    L = -E[min(r(theta)*A, clip(r(theta), 1-eps, 1+eps)*A)] + beta*KL
+    where r(theta) = exp(log_pi_theta - log_pi_old) per token
     and A = group-normalized advantage
 
 Usage:
-    from vlm_grpo.critic_grpo import CriticGRPOTrainer
+    from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
 
-    trainer = CriticGRPOTrainer(
-        model=model, ref_model=ref_model, processor=processor,
-        config=config, rollout_engine=engine,
+    trainer = SelfReflectionGRPOTrainer(
+        model=model, ref_model=None, processor=processor,
+        config=config, optimizer=optimizer, accelerator=accelerator,
+        vllm_engine=vllm_engine,
     )
     trainer.train(train_dataset, val_dataset)
 """
@@ -36,542 +39,12 @@ from typing import Any, Optional
 
 from tqdm import tqdm
 
-from vlm_grpo.config import (
-    TwoTrajectoryConfig,
-)
-from vlm_grpo.rollout import (
-    RolloutEngine,
-    compute_rollout_metrics,
-)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class CriticTrainStepResult:
-    """Result of a single critic training step.
-
-    Attributes:
-        loss: Total loss value
-        policy_loss: Clipped policy gradient loss
-        kl_loss: KL divergence from reference model
-        reward_mean: Mean reward across the batch
-        reward_std: Standard deviation of rewards
-        rollout_metrics: Dict of rollout statistics
-        global_step: Current global training step
-    """
-
-    loss: float
-    policy_loss: float
-    kl_loss: float
-    reward_mean: float
-    reward_std: float
-    rollout_metrics: dict[str, float]
-    global_step: int
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for logging."""
-        return asdict(self)
-
-
-class CriticGRPOTrainer:
-    """Custom GRPO trainer for critic with downstream-aware rewards.
-
-    Implements the full training loop:
-    1. ROLLOUT: Generate K F1+A2 pairs per sample
-    2. REWARD: Compute critic rewards from (F1, A2, ground_truth)
-    3. ADVANTAGE: Group-relative normalization within K samples
-    4. LOSS: Clipped policy gradient + KL divergence
-    5. BACKWARD + STEP: Update model parameters
-    """
-
-    def __init__(
-        self,
-        model: Any,
-        ref_model: Any,
-        processor: Any,
-        config: TwoTrajectoryConfig,
-        rollout_engine: RolloutEngine,
-        optimizer: Optional[Any] = None,
-        scheduler: Optional[Any] = None,
-    ) -> None:
-        """Initialize the critic GRPO trainer.
-
-        Uses lazy imports for heavy ML libraries.
-
-        Args:
-            model: The critic policy model (with LoRA adapter)
-            ref_model: Frozen reference model for KL regularization
-            processor: Tokenizer/processor for the model
-            config: Two-trajectory training configuration
-            rollout_engine: Pre-configured rollout engine
-            optimizer: Optional pre-configured optimizer
-            scheduler: Optional learning rate scheduler
-        """
-        # Lazy imports for heavy ML libraries
-        from torch.optim import AdamW
-
-        self.model = model
-        self.ref_model = ref_model
-        self.processor = processor
-        self.config = config
-        self.rollout_engine = rollout_engine
-        self.device = next(model.parameters()).device
-
-        # Optimizer
-        if optimizer is not None:
-            self.optimizer = optimizer
-        else:
-            self.optimizer = AdamW(
-                model.parameters(),
-                lr=config.learning_rate,
-                weight_decay=0.01,
-            )
-
-        self.scheduler = scheduler
-        self.global_step = 0
-        self.best_metric = float("inf") if config.early_stopping.mode == "min" else float("-inf")
-        self.patience_counter = 0
-
-    def train(
-        self,
-        train_dataset: list[dict],
-        val_dataset: Optional[list[dict]] = None,
-    ) -> dict[str, float]:
-        """Run the full critic GRPO training loop.
-
-        Args:
-            train_dataset: List of training sample dicts
-            val_dataset: Optional list of validation sample dicts
-
-        Returns:
-            Dict of final training metrics
-        """
-
-        config = self.config
-        batch_size = config.rollout.batch_size
-        num_epochs = config.num_train_epochs
-        grad_acc_steps = config.gradient_accumulation_steps
-        output_dir = Path(config.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        total_steps = (math.ceil(len(train_dataset) / batch_size) * num_epochs) // grad_acc_steps
-        logger.info(f"Starting critic GRPO training: {total_steps} optimization steps")
-        logger.info(f"  Epochs: {num_epochs}, Batch size: {batch_size}")
-        logger.info(f"  Gradient accumulation: {grad_acc_steps}")
-        logger.info(f"  Dataset size: {len(train_dataset)}")
-
-        all_metrics = {}
-        should_stop = False
-
-        for epoch in range(num_epochs):
-            if should_stop:
-                break
-
-            logger.info(f"=== Epoch {epoch + 1}/{num_epochs} ===")
-            epoch_loss = 0.0
-            epoch_steps = 0
-
-            # Process in batches
-            for batch_start in range(0, len(train_dataset), batch_size):
-                batch = train_dataset[batch_start : batch_start + batch_size]
-
-                step_result = self.train_step(batch)
-                epoch_loss += step_result.loss
-                epoch_steps += 1
-
-                # Log
-                if self.global_step % config.logging_steps == 0:
-                    logger.info(
-                        f"Step {self.global_step}: loss={step_result.loss:.4f}, "
-                        f"reward_mean={step_result.reward_mean:.3f}, "
-                        f"rw_rate={step_result.rollout_metrics.get('rollout/rw_rate', 0):.3f}"
-                    )
-
-                # Validate
-                if (
-                    val_dataset
-                    and config.val_check_interval > 0
-                    and self.global_step % config.val_check_interval == 0
-                    and self.global_step > 0
-                ):
-                    val_metrics = self.validate(val_dataset)
-                    all_metrics.update(val_metrics)
-                    logger.info(f"Validation: {val_metrics}")
-
-                    # Early stopping
-                    should_stop = self._check_early_stopping(val_metrics)
-                    if should_stop:
-                        logger.info("Early stopping triggered!")
-                        break
-
-                # Save checkpoint
-                if (
-                    config.save_steps > 0
-                    and self.global_step % config.save_steps == 0
-                    and self.global_step > 0
-                ):
-                    self._save_checkpoint(output_dir / f"checkpoint-{self.global_step}")
-
-            avg_loss = epoch_loss / max(epoch_steps, 1)
-            logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
-
-        # Final save
-        self._save_checkpoint(output_dir / "final")
-        logger.info(f"Training complete. Model saved to {output_dir / 'final'}")
-
-        return all_metrics
-
-    def train_step(self, batch: list[dict]) -> CriticTrainStepResult:
-        """Execute a single critic GRPO training step.
-
-        Steps:
-        1. ROLLOUT: Generate K F1s and A2s for each sample
-        2. REWARD: Compute downstream-aware critic rewards
-        3. ADVANTAGE: Group-relative normalization
-        4. LOSS: Clipped policy gradient + KL
-        5. BACKWARD + STEP
-
-        Args:
-            batch: List of sample dicts for this batch
-
-        Returns:
-            CriticTrainStepResult with loss and metrics
-        """
-        import torch
-
-        self.model.train()
-
-        # Step 1: Rollout (generates F1+A2, computes rewards)
-        rollout_results = self.rollout_engine.generate_critic_rollout(batch)
-        rollout_metrics = compute_rollout_metrics(rollout_results)
-
-        # Collect all (prompt, completion, reward) triples
-        all_rewards = []
-        all_log_probs = []
-        all_old_log_probs = []
-        all_ref_log_probs = []
-
-        for result in rollout_results:
-            k = len(result.feedbacks)
-            if k == 0:
-                continue
-
-            rewards_group = result.rewards
-            all_rewards.extend(rewards_group)
-
-            sample_image = (
-                result.image
-                if hasattr(result, "image")
-                else (batch[0].get("image") if batch else None)
-            )
-
-            # Compute log probabilities for each feedback
-            for f1 in result.feedbacks:
-                kwargs = dict(
-                    question=result.question,
-                    answer1=result.answer1,
-                    answer_type=result.answer_type,
-                    choices=result.choices,
-                    completion=f1,
-                    image=sample_image,
-                )
-                # π_old: log prob under current model weights, no grad (rollout snapshot)
-                with torch.no_grad():
-                    old_log_prob = self._compute_log_prob(**kwargs, model=self.model)
-                # π_θ: log prob under current model weights, with grad (for backprop)
-                log_prob = self._compute_log_prob(**kwargs, model=self.model)
-                # π_ref: log prob under frozen reference model
-                with torch.no_grad():
-                    ref_log_prob = self._compute_log_prob(**kwargs, model=self.ref_model)
-
-                all_log_probs.append(log_prob)
-                all_old_log_probs.append(old_log_prob)
-                all_ref_log_probs.append(ref_log_prob)
-
-        if not all_rewards:
-            self.global_step += 1
-            return CriticTrainStepResult(
-                loss=0.0,
-                policy_loss=0.0,
-                kl_loss=0.0,
-                reward_mean=0.0,
-                reward_std=0.0,
-                rollout_metrics=rollout_metrics,
-                global_step=self.global_step,
-            )
-
-        # Step 3: Group-relative advantage normalization
-        rewards_tensor = torch.tensor(all_rewards, device=self.device)
-        loss_type = getattr(self.config, "loss_type", "grpo")
-        advantages = self._compute_group_advantages(
-            rewards_tensor, self.config.rollout.k_samples, loss_type=loss_type
-        )
-
-        # Step 4: Compute GRPO loss
-        log_probs = torch.stack(all_log_probs)
-        old_log_probs = torch.stack(all_old_log_probs)
-        ref_log_probs = torch.stack(all_ref_log_probs)
-
-        # Policy ratio: r(θ) = π_θ(F1) / π_old(F1)
-        # π_old is the no-grad snapshot from before this backward pass
-        ratio = torch.exp(log_probs - old_log_probs)
-
-        # Clipped surrogate loss
-        clip_range = self.config.clip_range
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - clip_range, 1 + clip_range) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-
-        # KL divergence loss
-        kl = (log_probs - ref_log_probs).mean()
-        kl_loss = self.config.kl_coeff * kl
-
-        # Total loss
-        loss = policy_loss + kl_loss
-
-        # Step 5: Backward + step
-        loss.backward()
-
-        # Gradient accumulation
-        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            if self.scheduler is not None:
-                self.scheduler.step()
-
-        self.global_step += 1
-
-        return CriticTrainStepResult(
-            loss=loss.item(),
-            policy_loss=policy_loss.item(),
-            kl_loss=kl_loss.item(),
-            reward_mean=rewards_tensor.mean().item(),
-            reward_std=rewards_tensor.std().item(),
-            rollout_metrics=rollout_metrics,
-            global_step=self.global_step,
-        )
-
-    def validate(self, val_dataset: list[dict]) -> dict[str, float]:
-        """Run validation and return metrics.
-
-        Args:
-            val_dataset: List of validation sample dicts
-
-        Returns:
-            Dict of validation metrics
-        """
-        import torch
-
-        self.model.eval()
-        with torch.no_grad():
-            rollout_results = self.rollout_engine.generate_critic_rollout(val_dataset)
-
-        metrics = compute_rollout_metrics(rollout_results)
-        # Prefix with "val/"
-        val_metrics = {f"val/{k.split('/')[-1]}": v for k, v in metrics.items()}
-
-        self.model.train()
-        return val_metrics
-
-    def _compute_log_prob(
-        self,
-        question: str,
-        answer1: str,
-        answer_type: str,
-        choices: str,
-        completion: str,
-        image: Any,
-        model: Any,
-    ) -> Any:
-        """Compute log probability of a completion under a model.
-
-        Args:
-            question: Visual question
-            answer1: Initial answer
-            answer_type: Answer type
-            choices: MCQ choices
-            completion: The feedback text to score
-            image: PIL Image
-            model: The model to compute log probs with
-
-        Returns:
-            Scalar tensor of total log probability
-        """
-
-        messages = build_critic_prompt_with_completion(
-            question, answer1, answer_type, choices, completion
-        )
-
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-
-        # Re-inject <image> if template stripped it from non-user roles
-        if image is not None and "<image>" not in text:
-            text = "<image>\n" + text
-
-        if image is not None:
-            inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
-        else:
-            inputs = self.processor(text=text, return_tensors="pt").to(self.device)
-
-        outputs = model(**inputs, labels=inputs["input_ids"])
-
-        # outputs.loss is cross-entropy averaged over tokens
-        # Convert to total log prob: -loss * num_tokens
-        num_tokens = inputs["input_ids"].shape[1]
-        total_log_prob = -outputs.loss * num_tokens
-
-        return total_log_prob
-
-    def _compute_group_advantages(
-        self,
-        rewards: Any,
-        k: int,
-        loss_type: str = "grpo",
-    ) -> Any:
-        """Compute group-relative advantages for GRPO.
-
-        Normalizes rewards within each group of K samples.
-
-        Args:
-            rewards: Tensor of all rewards (shape: [N * K])
-            k: Group size
-            loss_type: GRPO variant. "grpo" uses std normalization,
-                "dr_grpo" uses only mean subtraction (removes length
-                and difficulty bias per arXiv:2503.20783).
-
-        Returns:
-            Tensor of advantages (same shape as rewards)
-        """
-        import torch
-
-        n_groups = len(rewards) // k
-        advantages = torch.zeros_like(rewards)
-
-        for i in range(n_groups):
-            start = i * k
-            end = start + k
-            group = rewards[start:end]
-
-            mean = group.mean()
-            if loss_type == "dr_grpo":
-                # Dr. GRPO: no std normalization (removes difficulty bias)
-                advantages[start:end] = group - mean
-            else:
-                # Vanilla GRPO: normalize by std
-                std = group.std()
-                if std > 0:
-                    advantages[start:end] = (group - mean) / (std + 1e-8)
-                else:
-                    advantages[start:end] = 0.0
-
-        # Handle remaining samples (if not divisible by k)
-        remaining = len(rewards) - n_groups * k
-        if remaining > 0:
-            start = n_groups * k
-            group = rewards[start:]
-            mean = group.mean()
-            if loss_type == "dr_grpo":
-                advantages[start:] = group - mean
-            else:
-                std = group.std()
-                if std > 0:
-                    advantages[start:] = (group - mean) / (std + 1e-8)
-
-        return advantages
-
-    def _check_early_stopping(self, val_metrics: dict[str, float]) -> bool:
-        """Check if training should stop based on validation metrics.
-
-        Args:
-            val_metrics: Dict of validation metrics
-
-        Returns:
-            True if training should stop
-        """
-        es_config = self.config.early_stopping
-        metric_key = es_config.metric
-        # Map metric key to val format
-        val_key = f"val/{metric_key.split('/')[-1]}"
-
-        if val_key not in val_metrics:
-            return False
-
-        current = val_metrics[val_key]
-
-        if es_config.mode == "min":
-            improved = current < (self.best_metric - es_config.min_delta)
-        else:
-            improved = current > (self.best_metric + es_config.min_delta)
-
-        if improved:
-            self.best_metric = current
-            self.patience_counter = 0
-        else:
-            self.patience_counter += 1
-
-        return self.patience_counter >= es_config.patience
-
-    def _save_checkpoint(self, path: Path) -> None:
-        """Save model checkpoint.
-
-        Args:
-            path: Directory to save to
-        """
-        path.mkdir(parents=True, exist_ok=True)
-        self.model.save_pretrained(path)
-        self.processor.save_pretrained(path)
-
-        # Save config
-        config_path = path / "training_config.json"
-        with open(config_path, "w") as f:
-            json.dump(self.config.to_dict(), f, indent=2)
-
-        logger.info(f"Saved checkpoint to {path}")
-
-
-def build_critic_prompt_with_completion(
-    question: str,
-    answer1: str,
-    answer_type: str,
-    choices: str,
-    completion: str,
-) -> list[dict]:
-    """Build critic prompt with completion appended for log prob computation.
-
-    Args:
-        question: Visual question
-        answer1: Initial answer
-        answer_type: Answer type
-        choices: MCQ choices
-        completion: The feedback text
-
-    Returns:
-        Full message list with assistant completion
-    """
-    from vlm_grpo.prompts import CRITIC_SYSTEM_PROMPT
-
-    messages = [
-        {
-            "role": "system",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": CRITIC_SYSTEM_PROMPT},
-            ],
-        },
-        {"role": "assistant", "content": [{"type": "text", "text": question}]},
-        {"role": "user", "content": [{"type": "text", "text": answer1}]},
-        {"role": "assistant", "content": [{"type": "text", "text": completion}]},
-    ]
-    return messages
 
 
 # =============================================================================
@@ -842,7 +315,7 @@ class SelfReflectionGRPOTrainer:
             else self.model
         )
 
-        # Disable gradient checkpointing during generation — it forces
+        # Disable gradient checkpointing during generation -- it forces
         # use_cache=False which breaks autoregressive KV caching and
         # produces garbage output.
         had_grad_ckpt = gen_model.is_gradient_checkpointing
@@ -851,23 +324,14 @@ class SelfReflectionGRPOTrainer:
 
         model_type = getattr(self.config, "model_type", "llava")
 
-        # vLLM sleep/wake cycle with reduced frequency to avoid refcount
-        # crash. The crash happens after ~1186 cycles per vLLM instance.
-        # By sleeping every 2 steps instead of every step, we halve the
-        # cycle count and can complete 35K training (2187 steps/rank)
-        # within the ~1186 cycle budget: 2187/2 = 1093 < 1186.
-        #
-        # On non-sleep steps, vLLM stays awake during training — its KV
-        # cache (~6 GiB with gpu_mem=0.10) stays allocated but unused.
+        # vLLM sleep/wake lifecycle: every step, wake for weights, sync,
+        # wake for generation, generate, then sleep. The selective
+        # wake_up(tags=...) pattern avoids the refcount crash that affects
+        # wake_up() without tags (vLLM issues #20431, #16993, #24879).
         if self.vllm_engine is not None:
-            should_sleep = self.global_step % 2 == 1  # sleep on odd steps
-            if not hasattr(self, "_vllm_awake"):
-                self._vllm_awake = False
-
-            if not self._vllm_awake:
-                self.vllm_engine.wake_up()
-                self._vllm_awake = True
+            self.vllm_engine.wake_up_for_weights()
             self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
+            self.vllm_engine.wake_up_for_generation()
 
         rollout_results = generate_self_reflection_rollout(
             model=gen_model,
@@ -882,10 +346,9 @@ class SelfReflectionGRPOTrainer:
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
 
-        # Sleep only every 2 steps to halve the cycle count
-        if self.vllm_engine is not None and should_sleep:
+        # Sleep every step to free GPU memory for training
+        if self.vllm_engine is not None:
             self.vllm_engine.sleep()
-            self._vllm_awake = False
 
         # Re-enable gradient checkpointing for the training forward passes
         if had_grad_ckpt:
@@ -976,7 +439,7 @@ class SelfReflectionGRPOTrainer:
 
         # Compute frac_reward_zero_std for BOTH response and feedback rewards:
         # fraction of K-groups where all trajectories got identical rewards
-        # (zero variance → zero learning signal). Key TRL diagnostic metric.
+        # (zero variance -> zero learning signal). Key TRL diagnostic metric.
         n_groups = len(resp_rewards_t) // k
         n_resp_zero = 0
         n_fb_zero = 0
@@ -994,7 +457,7 @@ class SelfReflectionGRPOTrainer:
         # Pre-tokenization caches apply_chat_template strings and prompt/full
         # token lengths so they are NOT recomputed on every inner epoch call.
         # Mini-batching (inner_mini_bs) prevents OOM from large logits tensors
-        # (64 × 1000 × 32000 × 2 bytes ≈ 4 GB for a full-batch forward pass).
+        # (64 x 1000 x 32000 x 2 bytes = 4 GB for a full-batch forward pass).
         unwrapped_model = (
             self.accelerator.unwrap_model(self.model)
             if self.accelerator is not None
@@ -1029,7 +492,7 @@ class SelfReflectionGRPOTrainer:
         ref_fb_lps_list: list[Any] = []
 
         with torch.no_grad():
-            # Combine a1/a2/f1 into one forward pass per mini-batch (3× fewer GPU ops)
+            # Combine a1/a2/f1 into one forward pass per mini-batch (3x fewer GPU ops)
             for mb_s in range(0, n_traj, inner_mini_bs):
                 mb_e = min(mb_s + inner_mini_bs, n_traj)
                 a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
@@ -1073,19 +536,19 @@ class SelfReflectionGRPOTrainer:
                 ref_resp_lps = None
                 ref_fb_lps = None
 
-        # No explicit cache clear — PyTorch reuses memory automatically.
+        # No explicit cache clear -- PyTorch reuses memory automatically.
 
         clip_range = self.config.clip_range
         num_inner = self.config.num_inner_epochs
 
-        # Step 5: Inner optimization epochs — use pre-tokenized data to skip
+        # Step 5: Inner optimization epochs -- use pre-tokenized data to skip
         # redundant apply_chat_template / tokenizer calls on every pass.
         total_resp_loss = 0.0
         total_fb_loss = 0.0
         total_kl_loss = 0.0
         n_traj_inner = n_traj
 
-        # Reset entropy accumulators — token-weighted average across all
+        # Reset entropy accumulators -- token-weighted average across all
         # training mini-batches (not old/ref passes).
         self._entropy_sum = 0.0
         self._entropy_tokens = 0
@@ -1225,7 +688,7 @@ class SelfReflectionGRPOTrainer:
             has_nan_grad = not math.isfinite(grad_norm)
             if has_nan_grad:
                 logger.warning(
-                    f"  [inner epoch {inner_epoch + 1}] NaN/inf gradient detected — "
+                    f"  [inner epoch {inner_epoch + 1}] NaN/inf gradient detected -- "
                     "skipping optimizer step to preserve model weights"
                 )
                 self.optimizer.zero_grad()
@@ -1237,7 +700,7 @@ class SelfReflectionGRPOTrainer:
             total_kl_loss += epoch_kl_loss
 
         # Log advantage statistics to detect the std=0 problem
-        # (all K trajectories getting identical rewards → zero advantages → zero gradients)
+        # (all K trajectories getting identical rewards -> zero advantages -> zero gradients)
         resp_adv_abs_mean = resp_advantages.abs().mean().item()
         fb_adv_abs_mean = fb_advantages.abs().mean().item()
         n_zero_adv = (resp_advantages == 0).sum().item()
@@ -1360,7 +823,7 @@ class SelfReflectionGRPOTrainer:
         full_text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
-        # Tokenize prompt text only (for computing prompt length — no image needed)
+        # Tokenize prompt text only (for computing prompt length -- no image needed)
         prompt_text = self.processor.apply_chat_template(
             prompt_messages, tokenize=False, add_generation_prompt=True
         )
@@ -1404,7 +867,7 @@ class SelfReflectionGRPOTrainer:
         if token_log_probs.numel() == 0:
             return torch.tensor(0.0, device=self.device)
 
-        # Sum over completion tokens — gives true log P(sequence).
+        # Sum over completion tokens -- gives true log P(sequence).
         # KL overflow is already handled by the clamp(min=-20, max=20) in the
         # training loop, so we don't need length-normalization here.
         return token_log_probs.sum()
@@ -1462,81 +925,6 @@ class SelfReflectionGRPOTrainer:
             "images": images,
         }
 
-    def _forward_from_pretokenized(
-        self,
-        pretok: dict,
-        model: Any,
-        mb_start: int = 0,
-        mb_end: Optional[int] = None,
-    ) -> list[Any]:
-        """Batched forward pass using pre-computed text strings and lengths.
-
-        Skips apply_chat_template and per-sequence tokenizer overhead.
-        Passes use_cache=False to prevent KV cache allocation during training.
-
-        Args:
-            pretok: Output of _preprocess_trajectory_texts
-            model: Model to run forward pass on
-            mb_start: Start index for mini-batch slice (default 0)
-            mb_end: End index for mini-batch slice (default: all)
-
-        Returns:
-            List of scalar log-prob tensors for the mini-batch slice
-        """
-        import torch
-        import torch.nn.functional as F
-
-        if mb_end is None:
-            mb_end = len(pretok["full_texts"])
-
-        full_texts = pretok["full_texts"][mb_start:mb_end]
-        prompt_lens = pretok["prompt_lens"][mb_start:mb_end]
-        full_lens = pretok["full_lens"][mb_start:mb_end]
-        imgs = pretok["images"][mb_start:mb_end]
-        n = len(full_texts)
-        has_image = any(img is not None for img in imgs)
-
-        orig_padding_side = self.processor.tokenizer.padding_side
-        self.processor.tokenizer.padding_side = "left"
-        try:
-            if has_image:
-                batch_inputs = self.processor(
-                    text=full_texts,
-                    images=imgs,
-                    return_tensors="pt",
-                    padding=True,
-                ).to(self.device)
-            else:
-                batch_inputs = self.processor(
-                    text=full_texts,
-                    return_tensors="pt",
-                    padding=True,
-                ).to(self.device)
-        finally:
-            self.processor.tokenizer.padding_side = orig_padding_side
-
-        outputs = model(**batch_inputs, use_cache=False)
-        logits = outputs.logits  # (n, padded_seq_len, vocab_size)
-
-        total_len = batch_inputs["input_ids"].shape[1]
-        log_probs_list = []
-        for i in range(n):
-            pad_len = total_len - full_lens[i]
-            real_prompt_start = pad_len + prompt_lens[i]
-            shift_logits = logits[i, real_prompt_start - 1 : -1, :]
-            shift_labels = batch_inputs["input_ids"][i, real_prompt_start:]
-            shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
-            lp = F.log_softmax(shift_logits, dim=-1)
-            token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            # Return per-token log-probs (not summed) for token-level GRPO loss.
-            # Standard GRPO (DeepSeekMath arXiv:2402.03300, TRL GRPOTrainer)
-            # computes per-token ratios for non-zero gradients with inner_epochs=1.
-            log_probs_list.append(
-                token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
-            )
-
-        return log_probs_list
-
     def _forward_from_pretokenized_multi(
         self,
         pretok_list: list[dict],
@@ -1549,7 +937,7 @@ class SelfReflectionGRPOTrainer:
 
         Concatenates sequences from all sets into one batch, runs one GPU
         forward pass, then splits results back per set. Reduces forward-pass
-        count (and CLIP vision encoder invocations) by len(pretok_list)×
+        count (and CLIP vision encoder invocations) by len(pretok_list)x
         compared to calling _forward_from_pretokenized separately for each set.
 
         Args:
@@ -1627,7 +1015,7 @@ class SelfReflectionGRPOTrainer:
             # Accumulate per-token entropy only during training forward passes.
             # Token-weighted: each token contributes equally (matches TRL's
             # masked_batch_mean). entropy = -sum(p * log(p)) per token.
-            # Collapse below ln(2)≈0.693 signals diversity loss (GTPO, DAPO).
+            # Collapse below ln(2)=0.693 signals diversity loss (GTPO, DAPO).
             if accumulate_entropy and lp.shape[0] > 0:
                 n_tokens = lp.shape[0]
                 token_entropy_sum = -(lp.exp() * lp).sum(dim=-1).sum().item()
@@ -1640,100 +1028,6 @@ class SelfReflectionGRPOTrainer:
             result.append(all_lps[offset : offset + size])
             offset += size
         return result
-
-    def _compute_log_probs_batched(
-        self,
-        messages_list: list[list[dict]],
-        images: list[Any],
-        model: Any,
-    ) -> list[Any]:
-        """Compute log probs for N sequences in one batched forward pass.
-
-        Sequences are left-padded to the same length. Per-sequence prompt
-        lengths are tracked so only completion tokens contribute to each
-        sequence's log prob sum. This replaces N sequential forward passes
-        with one batched call — the same efficiency pattern used by TRL.
-
-        Args:
-            messages_list: N full message lists (prompt + assistant completion)
-            images: N PIL Images (or Nones), one per sequence
-            model: The model to run the forward pass on
-
-        Returns:
-            List of N scalar tensors, each the total log prob over completion tokens
-        """
-        import torch
-        import torch.nn.functional as F
-
-        n = len(messages_list)
-        has_image = any(img is not None for img in images)
-
-        full_texts = []
-        prompt_lens = []
-        for messages in messages_list:
-            prompt_messages = messages[:-1]
-            full_text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False
-            )
-            prompt_text = self.processor.apply_chat_template(
-                prompt_messages, tokenize=False, add_generation_prompt=True
-            )
-            if has_image and "<image>" not in full_text:
-                full_text = "<image>\n" + full_text
-            if has_image and "<image>" not in prompt_text:
-                prompt_text = "<image>\n" + prompt_text
-            full_texts.append(full_text)
-            prompt_lens.append(
-                self.processor.tokenizer(prompt_text, return_tensors="pt")["input_ids"].shape[1]
-            )
-
-        # Full sequence lengths (unpadded) to compute left-pad offsets later
-        full_lens = [
-            self.processor.tokenizer(ft, return_tensors="pt")["input_ids"].shape[1]
-            for ft in full_texts
-        ]
-
-        # Left-pad so sequences can be batched for one forward pass
-        orig_padding_side = self.processor.tokenizer.padding_side
-        self.processor.tokenizer.padding_side = "left"
-        try:
-            if has_image:
-                batch_inputs = self.processor(
-                    text=full_texts,
-                    images=images,
-                    return_tensors="pt",
-                    padding=True,
-                ).to(self.device)
-            else:
-                batch_inputs = self.processor(
-                    text=full_texts,
-                    return_tensors="pt",
-                    padding=True,
-                ).to(self.device)
-        finally:
-            self.processor.tokenizer.padding_side = orig_padding_side
-
-        outputs = model(**batch_inputs, use_cache=False)
-        logits = outputs.logits  # (n, padded_seq_len, vocab_size)
-
-        total_len = batch_inputs["input_ids"].shape[1]
-        log_probs_list = []
-        for i in range(n):
-            pad_len = total_len - full_lens[i]
-            real_prompt_start = pad_len + prompt_lens[i]
-            shift_logits = logits[i, real_prompt_start - 1 : -1, :]
-            shift_labels = batch_inputs["input_ids"][i, real_prompt_start:]
-            shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
-            lp = F.log_softmax(shift_logits, dim=-1)
-            token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            # Return per-token log-probs (not summed) for token-level GRPO loss.
-            # Standard GRPO (DeepSeekMath arXiv:2402.03300, TRL GRPOTrainer)
-            # computes per-token ratios for non-zero gradients with inner_epochs=1.
-            log_probs_list.append(
-                token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
-            )
-
-        return log_probs_list
 
     def _compute_group_advantages(
         self,
