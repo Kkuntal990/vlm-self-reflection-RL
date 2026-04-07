@@ -97,15 +97,21 @@ def build_critic_prompt(
     choices: str = "",
     model_type: str = "llava",
 ) -> list[dict]:
-    """Build critic prompt for feedback generation.
+    """Build critic prompt for feedback generation with role-flipped conversation.
 
-    For LLaVA: uses role-flipped image-hoisting approach where image is
-    placed in the system message because LLaVA's apply_chat_template
-    does not reliably preserve <image> in non-user roles.
+    Roles are flipped so the model critiques "someone else's" answer:
+    - Assistant presents the question (+ image for Qwen2VL)
+    - User provides the answer to be critiqued
+    - Model generates feedback as the next assistant turn
 
-    For Qwen2.5-VL: uses natural conversation structure where the critic
-    sees the image+question as user input and A1 as assistant response.
-    Qwen's processor handles images natively in any role.
+    This matches the FIRE fire_feedback SFT training format and the
+    eval-time self_reflective_inference_v2.py conversation structure.
+
+    For LLaVA: image is hoisted to the system message because LLaVA's
+    apply_chat_template does not reliably preserve <image> in non-user roles.
+
+    For Qwen2.5-VL: image is placed in the assistant message since Qwen's
+    processor handles images natively in any role.
 
     Args:
         question: The visual question (cleaned, no <image> tag)
@@ -118,21 +124,21 @@ def build_critic_prompt(
         List of message dicts in conversational format
     """
     if model_type == "qwen2vl":
-        # Qwen2.5-VL: natural conversation structure, no image hoisting
+        # Qwen2.5-VL: role-flipped, image in assistant message (native support)
         messages = [
             {
                 "role": "system",
                 "content": [{"type": "text", "text": FEEDBACK_CRITIC_SYSTEM_PROMPT}],
             },
             {
-                "role": "user",
+                "role": "assistant",
                 "content": [
                     {"type": "image"},
                     {"type": "text", "text": question},
                 ],
             },
             {
-                "role": "assistant",
+                "role": "user",
                 "content": [{"type": "text", "text": answer1}],
             },
         ]
