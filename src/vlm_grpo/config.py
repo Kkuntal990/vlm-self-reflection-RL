@@ -87,10 +87,10 @@ class RolloutConfig:
     a1_max_completion_length: int = 200
     f1_max_completion_length: int = 512
     a2_max_completion_length: int = 200
-    temperature: float = 0.7
-    feedback_temperature: float = 0.9
+    temperature: float = 1.0
+    feedback_temperature: float = 1.0
     top_p: float = 0.9
-    a2_temperature: float = 0.0
+    a2_temperature: float = 1.0
     batch_size: int = 8
 
     def to_dict(self) -> dict:

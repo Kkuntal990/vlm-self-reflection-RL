@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-sr-v16-35k-base
+  name: qwen-grpo-sr-v22-35k-base
 spec:
   backoffLimit: 0
   template:
@@ -105,7 +105,7 @@ spec:
         - name: VAL_DATASET_PATH
           value: ""
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_sr_v7_35k"
+          value: "/outputs/grpo_qwen_sr_v8_35k"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -120,6 +120,8 @@ spec:
           value: "0.2"
         - name: INNER_EPOCHS
           value: "1"
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_sr_v8_35k/checkpoint-1750"
         # Generation
         - name: MAX_SAMPLES
           value: "35000"
