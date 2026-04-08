@@ -235,6 +235,13 @@ spec:
           value: "0"
         - name: WANDB_PROJECT
           value: "vlm-self-reflection-grpo"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-api-key
+              key: key
+        - name: WANDB_RUN_NAME
+          value: "grpo-base-35k-t1.0"
 
         resources:
           limits:

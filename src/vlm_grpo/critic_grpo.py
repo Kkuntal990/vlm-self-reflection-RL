@@ -147,6 +147,7 @@ class SelfReflectionGRPOTrainer:
 
         self.scheduler = scheduler
         self.global_step = 0
+        self.wandb_run = None  # Set by train_self_reflection.py after init
         self.best_metric = float("inf") if config.early_stopping.mode == "min" else float("-inf")
         self.patience_counter = 0
 
@@ -235,6 +236,90 @@ class SelfReflectionGRPOTrainer:
                         f"fb_reward={step_result.feedback_reward_mean:.3f}, "
                         f"rw_rate={rw_rate:.3f}"
                     )
+
+                # wandb logging (every step, not just logging_steps)
+                if self.wandb_run is not None:
+                    metrics = step_result.rollout_metrics
+                    wandb_dict = {
+                        # Core losses
+                        "train/loss": step_result.loss,
+                        "train/resp_loss": step_result.response_loss,
+                        "train/fb_loss": step_result.feedback_loss,
+                        "train/kl_loss": step_result.kl_loss,
+                        # Rewards
+                        "reward/resp_mean": step_result.response_reward_mean,
+                        "reward/fb_mean": step_result.feedback_reward_mean,
+                        "reward/resp_std": step_result.rollout_metrics.get(
+                            "sr/response_reward_std", 0
+                        ),
+                        "reward/fb_std": step_result.rollout_metrics.get(
+                            "sr/feedback_reward_std", 0
+                        ),
+                        # Accuracy
+                        "accuracy/a1": metrics.get("sr/a1_accuracy", 0),
+                        "accuracy/a2": metrics.get("sr/a2_accuracy", 0),
+                        # Transition rates
+                        "transitions/rr_rate": metrics.get("sr/rr_rate", 0),
+                        "transitions/rw_rate": rw_rate,
+                        "transitions/wr_rate": metrics.get("sr/wr_rate", 0),
+                        "transitions/ww_rate": metrics.get("sr/ww_rate", 0),
+                        # Training stability
+                        "stability/entropy": step_result.rollout_metrics.get(
+                            "sr/entropy", 0
+                        ),
+                        "stability/grad_norm": step_result.rollout_metrics.get(
+                            "sr/grad_norm", 0
+                        ),
+                        "stability/frac_zero_std_resp": step_result.rollout_metrics.get(
+                            "sr/frac_zero_std_resp", 0
+                        ),
+                        "stability/frac_zero_std_fb": step_result.rollout_metrics.get(
+                            "sr/frac_zero_std_fb", 0
+                        ),
+                        "stability/resp_clip_frac": step_result.rollout_metrics.get(
+                            "sr/resp_clip_frac", 0
+                        ),
+                        "stability/fb_clip_frac": step_result.rollout_metrics.get(
+                            "sr/fb_clip_frac", 0
+                        ),
+                        # Advantages
+                        "advantages/resp_abs_mean": step_result.rollout_metrics.get(
+                            "sr/resp_adv_abs_mean", 0
+                        ),
+                        "advantages/fb_abs_mean": step_result.rollout_metrics.get(
+                            "sr/fb_adv_abs_mean", 0
+                        ),
+                        # Token lengths
+                        "lengths/a1_tokens": step_result.rollout_metrics.get(
+                            "sr/avg_a1_tokens", 0
+                        ),
+                        "lengths/f1_tokens": step_result.rollout_metrics.get(
+                            "sr/avg_f1_tokens", 0
+                        ),
+                        "lengths/a2_tokens": step_result.rollout_metrics.get(
+                            "sr/avg_a2_tokens", 0
+                        ),
+                        # Feedback quality
+                        "feedback/format_valid_rate": metrics.get(
+                            "sr/feedback_format_valid_rate", 0
+                        ),
+                    }
+                    # Add reward component breakdown if available
+                    for key in [
+                        "sr/resp_a1_correctness_mean",
+                        "sr/resp_a2_correctness_mean",
+                        "sr/resp_no_regression_mean",
+                        "sr/resp_a2_format_mean",
+                        "sr/resp_minimal_edit_mean",
+                        "sr/fb_downstream_mean",
+                        "sr/fb_calibration_mean",
+                        "sr/fb_format_mean",
+                    ]:
+                        if key in metrics:
+                            wandb_key = "components/" + key.split("/")[-1]
+                            wandb_dict[wandb_key] = metrics[key]
+
+                    self.wandb_run.log(wandb_dict, step=self.global_step)
 
                 # Validate
                 if (
@@ -552,6 +637,11 @@ class SelfReflectionGRPOTrainer:
         # training mini-batches (not old/ref passes).
         self._entropy_sum = 0.0
         self._entropy_tokens = 0
+        # Reset clip fraction accumulators
+        self._resp_clipped_tokens = 0
+        self._resp_total_tokens = 0
+        self._fb_clipped_tokens = 0
+        self._fb_total_tokens = 0
 
         for inner_epoch in range(num_inner):
             self.optimizer.zero_grad()
@@ -615,21 +705,30 @@ class SelfReflectionGRPOTrainer:
                     # Response: per-token clipped surrogate, advantage broadcasts
                     resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
                     resp_ratio = torch.exp(resp_log_ratio)
+                    resp_clipped_ratio = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
                     resp_surr1 = resp_ratio * resp_advantages[ti]
-                    resp_surr2 = (
-                        torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
-                        * resp_advantages[ti]
-                    )
+                    resp_surr2 = resp_clipped_ratio * resp_advantages[ti]
                     traj_resp_loss = -torch.min(resp_surr1, resp_surr2).mean()
+
+                    # Track clip fraction
+                    self._resp_total_tokens += resp_ratio.numel()
+                    self._resp_clipped_tokens += (
+                        (resp_ratio != resp_clipped_ratio).sum().item()
+                    )
 
                     # Feedback: per-token clipped surrogate
                     fb_log_ratio = torch.clamp(fb_ratio_raw, min=-20.0, max=20.0)
                     fb_ratio = torch.exp(fb_log_ratio)
+                    fb_clipped_ratio = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
                     fb_surr1 = fb_ratio * fb_advantages[ti]
-                    fb_surr2 = (
-                        torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range) * fb_advantages[ti]
-                    )
+                    fb_surr2 = fb_clipped_ratio * fb_advantages[ti]
                     traj_fb_loss = -torch.min(fb_surr1, fb_surr2).mean()
+
+                    # Track clip fraction
+                    self._fb_total_tokens += fb_ratio.numel()
+                    self._fb_clipped_tokens += (
+                        (fb_ratio != fb_clipped_ratio).sum().item()
+                    )
 
                     # KL loss (per-token, averaged)
                     if self.config.kl_coeff > 0 and ref_resp_lps is not None:
@@ -710,6 +809,14 @@ class SelfReflectionGRPOTrainer:
         # across all inner-loop mini-batches, NOT from old/ref log-prob passes).
         entropy = self._entropy_sum / self._entropy_tokens if self._entropy_tokens > 0 else 0.0
 
+        # Compute clip fraction: fraction of tokens where ratio was clipped
+        resp_clip_frac = (
+            self._resp_clipped_tokens / max(self._resp_total_tokens, 1)
+        )
+        fb_clip_frac = (
+            self._fb_clipped_tokens / max(self._fb_total_tokens, 1)
+        )
+
         logger.info(
             f"  Inner epochs done: resp_loss={total_resp_loss / num_inner:.4f}, "
             f"fb_loss={total_fb_loss / num_inner:.4f}, "
@@ -718,8 +825,49 @@ class SelfReflectionGRPOTrainer:
             f"fb_adv={fb_adv_abs_mean:.4f}(z={n_zero_fb_adv}/{len(fb_advantages)}), "
             f"entropy={entropy:.3f}, "
             f"frac_zero_std={frac_resp_zero_std:.2f}/{frac_fb_zero_std:.2f}, "
+            f"clip_frac={resp_clip_frac:.3f}/{fb_clip_frac:.3f}, "
             f"tok={avg_a1_toks:.0f}/{avg_f1_toks:.0f}/{avg_a2_toks:.0f}"
         )
+
+        # Inject training-only metrics into rollout_metrics for wandb
+        rollout_metrics["sr/entropy"] = entropy
+        rollout_metrics["sr/grad_norm"] = grad_norm
+        rollout_metrics["sr/frac_zero_std_resp"] = frac_resp_zero_std
+        rollout_metrics["sr/frac_zero_std_fb"] = frac_fb_zero_std
+        rollout_metrics["sr/resp_adv_abs_mean"] = resp_adv_abs_mean
+        rollout_metrics["sr/fb_adv_abs_mean"] = fb_adv_abs_mean
+        rollout_metrics["sr/resp_clip_frac"] = resp_clip_frac
+        rollout_metrics["sr/fb_clip_frac"] = fb_clip_frac
+        rollout_metrics["sr/avg_a1_tokens"] = avg_a1_toks
+        rollout_metrics["sr/avg_f1_tokens"] = avg_f1_toks
+        rollout_metrics["sr/avg_a2_tokens"] = avg_a2_toks
+        rollout_metrics["sr/response_reward_std"] = resp_rewards_t.std().item()
+        rollout_metrics["sr/feedback_reward_std"] = fb_rewards_t.std().item()
+
+        # Reward component breakdown (averaged across trajectories)
+        for result in rollout_results:
+            if result.response_breakdowns:
+                for bd in result.response_breakdowns:
+                    for comp_name, comp_val in bd.weighted_components.items():
+                        key = f"sr/resp_{comp_name}_mean"
+                        rollout_metrics.setdefault(key, [])
+                        rollout_metrics[key].append(comp_val)
+            if result.feedback_breakdowns:
+                for bd in result.feedback_breakdowns:
+                    for comp_name, comp_val in bd.weighted_components.items():
+                        key = f"sr/fb_{comp_name}_mean"
+                        rollout_metrics.setdefault(key, [])
+                        rollout_metrics[key].append(comp_val)
+        # Average the component lists
+        for key in list(rollout_metrics.keys()):
+            if key.startswith("sr/resp_") and key.endswith("_mean"):
+                val = rollout_metrics[key]
+                if isinstance(val, list) and val:
+                    rollout_metrics[key] = sum(val) / len(val)
+            if key.startswith("sr/fb_") and key.endswith("_mean"):
+                val = rollout_metrics[key]
+                if isinstance(val, list) and val:
+                    rollout_metrics[key] = sum(val) / len(val)
 
         if self.scheduler is not None:
             self.scheduler.step()
@@ -790,6 +938,10 @@ class SelfReflectionGRPOTrainer:
 
         metrics = compute_self_reflection_metrics(rollout_results)
         val_metrics = {f"val/{k.split('/')[-1]}": v for k, v in metrics.items()}
+
+        # Log validation metrics to wandb
+        if self.wandb_run is not None:
+            self.wandb_run.log(val_metrics, step=self.global_step)
 
         self.model.train()
         return val_metrics

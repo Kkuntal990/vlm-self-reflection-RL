@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-sr-v23-35k-sftv2
+  name: qwen-grpo-sr-v25-35k-sftv2
 spec:
   backoffLimit: 0
   template:
@@ -115,7 +115,7 @@ spec:
         - name: LOSS_TYPE
           value: "dr_grpo"
         - name: KL_COEFF
-          value: "0.0"
+          value: "0.02"
         - name: CLIP_RANGE
           value: "0.2"
         - name: INNER_EPOCHS
@@ -138,7 +138,7 @@ spec:
         - name: FEEDBACK_TEMPERATURE
           value: "1.0"
         - name: A2_TEMPERATURE
-          value: "0.3"
+          value: "1.0"
 
         # Optimization
         - name: LEARNING_RATE
@@ -235,6 +235,13 @@ spec:
           value: "0"
         - name: WANDB_PROJECT
           value: "vlm-self-reflection-grpo"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-api-key
+              key: key
+        - name: WANDB_RUN_NAME
+          value: "grpo-sftv2-35k-t1.0"
 
         resources:
           limits:

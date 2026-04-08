@@ -583,10 +583,12 @@ def compute_self_reflection_metrics(
                 else:
                     ww_count += 1
 
+    a2_correct_count = rr_count + wr_count
     n = max(total, 1)
     return {
         "sr/total_trajectories": float(total),
         "sr/a1_accuracy": a1_correct_count / n,
+        "sr/a2_accuracy": a2_correct_count / n,
         "sr/rr_rate": rr_count / n,
         "sr/rw_rate": rw_count / n,
         "sr/wr_rate": wr_count / n,

@@ -536,6 +536,50 @@ def main() -> None:
         trainer.global_step = resume_step
         logger.info(f"Trainer global_step set to {resume_step}")
 
+    # Initialize wandb on main process
+    if accelerator.is_main_process:
+        import os
+
+        import wandb
+
+        wandb_project = os.environ.get("WANDB_PROJECT", "vlm-self-reflection-grpo")
+        wandb_run_name = os.environ.get("WANDB_RUN_NAME", None)
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name,
+            config={
+                "model_id": args.model_id,
+                "model_type": model_type,
+                "dataset_path": args.dataset_path,
+                "max_samples": args.max_samples,
+                "k_samples": args.k_samples,
+                "loss_type": args.loss_type,
+                "learning_rate": args.learning_rate,
+                "kl_coeff": args.kl_coeff,
+                "clip_range": args.clip_range,
+                "num_inner_epochs": args.num_inner_epochs,
+                "temperature": args.temperature,
+                "feedback_temperature": args.feedback_temperature,
+                "a2_temperature": args.a2_temperature,
+                "a1_max_completion_length": args.a1_max_completion_length,
+                "f1_max_completion_length": args.f1_max_completion_length,
+                "a2_max_completion_length": args.a2_max_completion_length,
+                "per_device_train_batch_size": args.per_device_train_batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "num_gpus": accelerator.num_processes,
+                "response_weights": response_weights.to_dict(),
+                "feedback_weights": feedback_weights.to_dict(),
+                "seed": args.seed,
+            },
+            resume="allow" if resume_step > 0 else None,
+        )
+        trainer.wandb_run = wandb.run
+        logger.info(f"wandb initialized: {wandb.run.url}")
+    else:
+        trainer.wandb_run = None
+
     # Train
     logger.info("Starting self-reflection GRPO training...")
     logger.info("  Two-reward design: response (A1+A2) + feedback (F1)")
@@ -545,6 +589,10 @@ def main() -> None:
     if resume_step > 0:
         logger.info(f"  Resuming from step {resume_step}")
     trainer.train(train_dataset, val_dataset)
+
+    # Finish wandb
+    if accelerator.is_main_process:
+        wandb.finish()
 
 
 def _run_sanity_check(
