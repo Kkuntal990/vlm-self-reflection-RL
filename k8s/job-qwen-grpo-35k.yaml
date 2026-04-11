@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-sr-v22-35k-base
+  name: qwen-grpo-sr-v34-20k-base
 spec:
   backoffLimit: 0
   template:
@@ -105,7 +105,7 @@ spec:
         - name: VAL_DATASET_PATH
           value: ""
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_sr_v8_35k"
+          value: "/outputs/grpo_qwen_sr_v9_20k"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -115,16 +115,16 @@ spec:
         - name: LOSS_TYPE
           value: "dr_grpo"
         - name: KL_COEFF
-          value: "0.0"
+          value: "0.02"
         - name: CLIP_RANGE
           value: "0.2"
         - name: INNER_EPOCHS
           value: "1"
         - name: RESUME_CHECKPOINT
-          value: "/outputs/grpo_qwen_sr_v8_35k/checkpoint-1750"
+          value: "/outputs/grpo_qwen_sr_v9_20k/checkpoint-2250"
         # Generation
         - name: MAX_SAMPLES
-          value: "35000"
+          value: "20000"
         - name: MAX_COMPLETION_LENGTH
           value: "512"
         - name: A1_MAX_COMPLETION
@@ -138,15 +138,15 @@ spec:
         - name: FEEDBACK_TEMPERATURE
           value: "1.0"
         - name: A2_TEMPERATURE
-          value: "0.3"
+          value: "1.0"
 
         # Optimization
         - name: LEARNING_RATE
           value: "1e-6"
         - name: BATCH_SIZE
-          value: "4"
-        - name: GRAD_ACC
           value: "2"
+        - name: GRAD_ACC
+          value: "4"
         - name: EPOCHS
           value: "1"
         - name: NUM_GPUS
@@ -241,7 +241,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-base-35k-t1.0"
+          value: "grpo-base-20k-t1.0"
 
         resources:
           limits:
