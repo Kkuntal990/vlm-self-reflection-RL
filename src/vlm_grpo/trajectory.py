@@ -196,7 +196,9 @@ def extract_answer_from_text(
     Returns:
         Normalized answer string, or empty string if extraction failed
     """
-    text = text.strip()
+    # Extract from <answer> tags first to avoid matching stray letters
+    # in <think> sections (e.g., "reflectance." → false 'E' match)
+    text = extract_from_answer_tags(text)
     if not text:
         return ""
 

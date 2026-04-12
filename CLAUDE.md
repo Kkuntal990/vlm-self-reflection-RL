@@ -53,15 +53,15 @@ GRPO uses two separate reward signals per trajectory — one for response qualit
 
 - `a1_correctness`: Binary — is A1 correct? (+1 / -1)
 - `a2_correctness`: Binary for MCQ/YesNo/Numeric (+1 / -1), continuous for counting/open (2*score - 1)
-- `no_regression`: Did A2 maintain or improve on A1? Heaviest penalty for R→W (-3), highest reward for W→R (+2)
-- `a2_format`: Penalty-only — is A2 in the expected format? (0 / -1)
+- `no_regression`: Did A2 maintain or improve on A1? MCQ-aware: deterministic types RW=-2/WR=+3, open-ended RW=-3/WR=+2
+- `a2_format`: Without tags: penalty-only (0 / -1). With tags: +0.5 / -0.5 / -1.0
 - `minimal_edit`: Only when both A1 and A2 are correct — rewards keeping the answer stable (0 to +1)
 
 **Feedback Reward** = w_down * R_down + w_cal * R_cal + w_fmt * R_fmt
 
-- `downstream`: Did F1 lead to a correct A2? 4 discrete values based on A1→A2 transition (WR:+2, RR:+1, WW:-1, RW:-2)
+- `downstream`: Did F1 lead to a correct A2? MCQ-aware: deterministic RW=-1.5/WR=+3, open-ended RW=-2/WR=+2
 - `calibration`: Does F1 correctly assess A1's correctness? Keyword-based, 7 discrete values (-1 to +1). Key variance-breaker — without it, downstream alone causes 50-75% zero-variance K-groups
-- `fb_format`: Three-tier — empty/short (-2), vague (-1), substantive (+1)
+- `fb_format`: De-coupled from calibration (pure word count): empty/<3 words=-2, 3-6 words=-1, >6 words=0
 
 #### Reward Components
 
@@ -71,20 +71,57 @@ GRPO uses two separate reward signals per trajectory — one for response qualit
 |-----------|-----------|-------|
 | a1_correctness | {-1, +1} | Binary correct/wrong |
 | a2_correctness | [-1, +1] | Binary for MCQ/YesNo/Numeric; continuous for counting/open |
-| no_regression | {-3, 0, +1, +2} | RW:-3, WW:0, RR:+1, WR:+2 |
-| a2_format | {-1, 0} | Penalty-only (0=valid, -1=invalid) |
+| no_regression | {-3..+3} | Deterministic: RW:-2, WW:0, RR:+1, WR:+3. Open: RW:-3, WW:0, RR:+1, WR:+2 |
+| a2_format | {-1..+0.5} | No tags: 0/-1. With tags: +0.5 (valid), -0.5 (bad inner), -1.0 (no tags) |
 | minimal_edit | [0, +1] | `max(1 - 0.5*edit_dist, 0)`, only when both A1 and A2 correct |
 
 **Feedback Reward:**
 
 | Component | Raw Range | Logic |
 |-----------|-----------|-------|
-| downstream | {-2, -1, +1, +2} | RW:-2, WW:-1, RR:+1, WR:+2; 0 if empty feedback |
+| downstream | {-2..+3} | Deterministic: RW:-1.5, WW:-1, RR:+1, WR:+3. Open: RW:-2, WW:-1, RR:+1, WR:+2 |
 | calibration | [-1, +1] | 7 discrete values from keyword matching (positive/negative/mixed/doubt/neutral) |
-| fb_format | {-2, -1, +1} | empty/short:-2, vague:-1, substantive:+1 |
+| fb_format | {-2, -1, 0} | Pure word count (de-coupled from calibration): <3:-2, 3-6:-1, >6:0 |
 
 ### Prompt Mismatch Warning
 The balanced_70k dataset's `messages` contain a system prompt with `Thought: [reasoning] / Answer: [final answer]` format. This is NOT the prompt used during GRPO training. GRPO hardcodes its own prompts in `prompts.py`. If you switch to using the dataset's messages, the prompt format will change.
+
+## Current Experiment: LIVR 9K MCQ with Think/Answer Tags
+
+**Job**: `qwen-grpo-livr-9k-think-tags` on pod `vlm-jupyter-eval2` (4x A100-80GB)
+**K8s YAML**: `k8s/job-qwen-grpo-livr-9k.yaml`
+**Branch**: `feature/vllm-deepspeed` (commit `2fc4dd2`)
+**Started**: 2026-04-11, ~2250 samples/process, ~34s/sample
+
+### Dataset: LIVR Perception MCQ (9K)
+- **Path**: `/outputs/livr_data/livr_perception_mcq.jsonl`
+- **Construction scripts**: `scripts/livr/build_*.py` (9 tasks, 1000 each)
+- 9 tasks: Counting, Jigsaw, ObjLoc, VisCorr, ArtStyle, SemCorr, FunCorr, RelReflect, VisSim
+- All MCQ with ground truth in `(A)` format (matches BLINK eval)
+- `answer_type=mcq` only, `VLM_USE_LLM_JUDGE=0` (deterministic matching sufficient)
+
+### Think/Answer Tags (`--use_think_answer_tags`)
+- A1/A2 system prompt includes tag format instruction (`VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS`)
+- Expected output: `<think>reasoning</think><answer>(A)</answer>`
+- F1 (critic) is freeform — no tags
+- Tag format reward: +0.5 (valid tags + valid inner), -0.5 (tags but bad inner), -1.0 (no tags)
+- `w_a2_format` auto-raised to 0.5 when tags enabled
+
+### MCQ-Aware Reward Asymmetry
+Deterministic types (MCQ/YesNo/Numeric) use different no-regression and downstream values than open-ended:
+- **No-regression**: RR=+1, RW=-2, WR=+3, WW=0 (less punitive regression, more rewarding correction)
+- **Downstream**: RR=+1, RW=-1.5, WR=+3, WW=-1
+- **Feedback format**: De-coupled from calibration — pure word count only (0/<3/-2, 3-6/-1, >6/0)
+
+### Key Training Config
+- K=8 samples, batch=2, grad_acc=2 (effective batch=16), lr=1e-6, dr_grpo loss
+- LoRA r=64 alpha=128, max_completion=256, feedback_temp=0.7, a2_temp=1.0
+- vLLM colocate with sleep mode, gpu_mem=0.50
+- save_steps=250 (in global_step, not samples — first checkpoint ~sample 500)
+
+### Known Issues
+- Model puts verbose text inside `<answer>` tags (e.g., `(B) full text` instead of `(B)`), causing a2_format=-0.5. Expected to improve with training.
+- Relative reflectance task: model struggles consistently (COCO luminance proxy may be too hard)
 
 ## How to Run
 
