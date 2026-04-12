@@ -174,6 +174,7 @@ class FeedbackRewardWeights:
     w_downstream: float = 2.0
     w_calibration: float = 0.2
     w_format: float = 0.15
+    w_tag_penalty: float = 0.5
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

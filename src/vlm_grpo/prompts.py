@@ -50,7 +50,8 @@ FEEDBACK_CRITIC_SYSTEM_PROMPT = (
     "and the conversation history of the user's answers and prior feedback, "
     "provide constructive feedback on the user's latest answer identifying "
     "what is correct, what is incorrect, and how to improve. Ground your "
-    "feedback in what is visible in the image."
+    "feedback in what is visible in the image. "
+    "Write your feedback as plain text. Do NOT use XML tags."
 )
 
 # System prompt variant with think/answer tag instructions.
