@@ -183,6 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_downstream", type=float, default=2.0)
     parser.add_argument("--w_calibration", type=float, default=0.2)
     parser.add_argument("--w_fb_format", type=float, default=0.15)
+    parser.add_argument("--w_fb_tag_penalty", type=float, default=0.0)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -268,6 +269,7 @@ def main() -> None:
         w_downstream=args.w_downstream,
         w_calibration=args.w_calibration,
         w_format=args.w_fb_format,
+        w_tag_penalty=args.w_fb_tag_penalty,
     )
     rollout_config = RolloutConfig(
         k_samples=args.k_samples,

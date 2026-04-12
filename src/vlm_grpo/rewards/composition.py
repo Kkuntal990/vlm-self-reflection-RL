@@ -293,6 +293,31 @@ def compute_critic_format_reward(feedback_text: str) -> float:
     return 0.0
 
 
+# Pattern for detecting think/answer tag leakage in F1 outputs.
+# The critic prompt has no tag instructions — tags here indicate
+# behavioral contamination from A1/A2 tag training.
+_F1_TAG_LEAKAGE_PATTERN = re.compile(r"</?(?:think|answer)>", re.IGNORECASE)
+
+
+def compute_f1_tag_penalty(feedback_text: str) -> float:
+    """Penalty for F1 using think/answer tags (role contamination).
+
+    The critic system prompt does not instruct tag usage. When F1 generates
+    <think>/<answer> tags, it's behavioral leakage from A1/A2 training that
+    wastes tokens on internal reasoning instead of direct feedback, producing
+    worse downstream outcomes (27.7% R→R vs 43.5% for plain F1).
+
+    Args:
+        feedback_text: Feedback text from the critic
+
+    Returns:
+        -2.0 if any think/answer tags found, 0.0 otherwise
+    """
+    if _F1_TAG_LEAKAGE_PATTERN.search(feedback_text):
+        return -2.0
+    return 0.0
+
+
 def compute_critic_reward_breakdown(
     feedback_text: str,
     a2_text: str,
@@ -1048,15 +1073,22 @@ def compute_feedback_reward_breakdown(
     # only 4 discrete values, causing 50-75% zero-variance K-groups.
     r_calibration = compute_feedback_calibration_reward(feedback_text, a1_correct)
 
+    # Tag leakage penalty: punish F1 that uses <think>/<answer> tags
+    # from A1/A2 training. Only applied when w_tag_penalty > 0.
+    r_tag_penalty = compute_f1_tag_penalty(feedback_text)
+
     components = {
         "downstream": r_downstream,
         "calibration": r_calibration,
         "format": r_format,
+        "tag_penalty": r_tag_penalty,
     }
+    w_tag = getattr(weights, "w_tag_penalty", 0.0)
     weighted_components = {
         "downstream": r_downstream * weights.w_downstream,
         "calibration": r_calibration * weights.w_calibration,
         "format": r_format * weights.w_format,
+        "tag_penalty": r_tag_penalty * w_tag,
     }
     total_reward = sum(weighted_components.values())
 

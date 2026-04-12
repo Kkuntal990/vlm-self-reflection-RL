@@ -119,6 +119,14 @@ Deterministic types (MCQ/YesNo/Numeric) use different no-regression and downstre
 - vLLM colocate with sleep mode, gpu_mem=0.50
 - save_steps=250 (in global_step, not samples — first checkpoint ~sample 500)
 
+### F1 Tag Leakage Fix (v2)
+- **Problem**: Think tags leak from A1/A2 into F1 (0.3% → 38% by step 500) despite critic prompt having no tag instructions
+- Think-tagged F1 produces worse outcomes: R→R drops from 43.5% to 27.7%
+- **Fix**: `compute_f1_tag_penalty()` in `composition.py` — returns -2.0 when F1 contains `<think>/<answer>` tags
+- Weight `w_fb_tag_penalty=0.5` → effective -1.0 penalty per tagged F1
+- Critic system prompt also strengthened with "Do NOT use XML tags"
+- v2 job resumes from v1 checkpoint-250, writes to `/outputs/grpo_qwen_livr_v2/`
+
 ### Known Issues
 - Model puts verbose text inside `<answer>` tags (e.g., `(B) full text` instead of `(B)`), causing a2_format=-0.5. Expected to improve with training.
 - Relative reflectance task: model struggles consistently (COCO luminance proxy may be too hard)
