@@ -294,18 +294,28 @@ def _check_substring_containment(pred: str, gt: str) -> bool:
 
 
 def _extract_answer_portion(text: str) -> str:
-    """Extract the answer from text that may have Thought/Answer format.
+    """Extract the answer from text with Thought/Answer or think/answer tag format.
 
-    If the text follows "Thought: ... Answer: ..." format, extracts just the
-    answer portion. Otherwise returns the text as-is. Uses the LAST "Answer:"
-    match to handle rare double-tag cases.
+    Tries extraction in order:
+    1. <answer>...</answer> XML tags (SRPO/R1-style)
+    2. "Thought: ... Answer: ..." text format (legacy SFT format)
+    3. Falls back to full text as-is
 
     Args:
-        text: Raw text possibly containing Thought/Answer wrapper
+        text: Raw text possibly containing answer wrappers
 
     Returns:
         Extracted answer string
     """
+    # Try <answer>...</answer> tags first (handles both cases)
+    from vlm_grpo.trajectory import extract_from_answer_tags
+
+    tag_result = extract_from_answer_tags(text)
+    if tag_result != text.strip():
+        # Tags were found and content extracted
+        return tag_result
+
+    # Try legacy "Answer:" format
     matches = list(re.finditer(r"Answer:\s*(.*?)(?=\nThought:|\Z)", text, re.DOTALL))
     if matches:
         answer = matches[-1].group(1).strip()

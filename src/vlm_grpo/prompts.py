@@ -53,6 +53,20 @@ FEEDBACK_CRITIC_SYSTEM_PROMPT = (
     "feedback in what is visible in the image."
 )
 
+# System prompt variant with think/answer tag instructions.
+# Used for A1 and A2 generation when use_think_answer_tags=True.
+VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS = (
+    "You are a helpful vision-language assistant. You should produce accurate, "
+    "detailed, and grounded answers based on the image and the user's instructions. "
+    "When given feedback, critique, or scores, revise your response to improve "
+    "correctness, specificity, and completeness.\n\n"
+    "Always structure your response as: first explain your visual reasoning "
+    "inside <think> tags, then give your final answer inside <answer> tags.\n"
+    "Example: <think>I see a cat in the top-left corner.</think>"
+    "<answer>(A)</answer>"
+)
+
+
 # Backward-compatible aliases
 REFINER_SYSTEM_PROMPT = VL_ASSISTANT_SYSTEM_PROMPT
 CRITIC_SYSTEM_PROMPT = FEEDBACK_CRITIC_SYSTEM_PROMPT
@@ -62,23 +76,32 @@ CRITIC_SYSTEM_PROMPT = FEEDBACK_CRITIC_SYSTEM_PROMPT
 # =============================================================================
 
 
-def build_initial_answer_prompt(question: str) -> list[dict]:
+def build_initial_answer_prompt(
+    question: str,
+    use_think_answer_tags: bool = False,
+) -> list[dict]:
     """Build prompt for initial answer (A1) generation.
 
     Matches inference script Turn 0:
         System: VL assistant prompt
-        User: [image] + question
+        User: [image] + question [+ tag instruction if enabled]
 
     Args:
         question: The visual question (cleaned, no <image> tag)
+        use_think_answer_tags: If True, append tag format instruction
 
     Returns:
         List of message dicts for A1 generation
     """
+    system_prompt = (
+        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS if use_think_answer_tags
+        else VL_ASSISTANT_SYSTEM_PROMPT
+    )
+
     return [
         {
             "role": "system",
-            "content": [{"type": "text", "text": VL_ASSISTANT_SYSTEM_PROMPT}],
+            "content": [{"type": "text", "text": system_prompt}],
         },
         {
             "role": "user",
@@ -171,6 +194,7 @@ def build_refiner_prompt(
     feedback1: str,
     answer_type: str = "open",
     choices: str = "",
+    use_think_answer_tags: bool = False,
 ) -> list[dict]:
     """Build refiner prompt for answer refinement (A2).
 
@@ -178,7 +202,7 @@ def build_refiner_prompt(
         System: VL assistant prompt
         User: [image] + question
         Assistant: answer1
-        User: feedback1  (raw, no format-forcing instructions)
+        User: feedback1 [+ tag instruction if enabled]
 
     The model generates A2 as the assistant.
 
@@ -188,14 +212,19 @@ def build_refiner_prompt(
         feedback1: Raw feedback from the critic (passed as-is)
         answer_type: Expected answer type (unused, kept for API compat)
         choices: Optional MCQ choices (unused, kept for API compat)
+        use_think_answer_tags: If True, append tag format instruction to feedback
 
     Returns:
         List of message dicts in conversational format
     """
+    system_prompt = (
+        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS if use_think_answer_tags
+        else VL_ASSISTANT_SYSTEM_PROMPT
+    )
     messages = [
         {
             "role": "system",
-            "content": [{"type": "text", "text": VL_ASSISTANT_SYSTEM_PROMPT}],
+            "content": [{"type": "text", "text": system_prompt}],
         },
         {
             "role": "user",

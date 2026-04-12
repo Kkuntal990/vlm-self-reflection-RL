@@ -5,6 +5,8 @@ from vlm_grpo.trajectory import (
     detect_hedging,
     extract_answer_from_text,
     extract_completion_text,
+    extract_from_answer_tags,
+    has_think_answer_tags,
 )
 
 # =============================================================================
@@ -150,3 +152,59 @@ class TestDetectHedging:
 
     def test_it_could_be(self) -> None:
         assert detect_hedging("It could be yes") is True
+
+
+# =============================================================================
+# Think/Answer tag extraction tests
+# =============================================================================
+
+
+class TestExtractFromAnswerTags:
+    """Tests for extract_from_answer_tags."""
+
+    def test_extracts_from_tags(self) -> None:
+        text = "<think>The cat is top-left.</think><answer>(A)</answer>"
+        assert extract_from_answer_tags(text) == "(A)"
+
+    def test_extracts_multiline(self) -> None:
+        text = "<think>Looking at the image,\nthe object is in box C.</think>\n<answer>(C)</answer>"
+        assert extract_from_answer_tags(text) == "(C)"
+
+    def test_fallback_no_tags(self) -> None:
+        """Without tags, returns original text."""
+        assert extract_from_answer_tags("(B)") == "(B)"
+
+    def test_fallback_bare_letter(self) -> None:
+        assert extract_from_answer_tags("A") == "A"
+
+    def test_strips_whitespace_inside(self) -> None:
+        text = "<think>reason</think><answer>  (B)  </answer>"
+        assert extract_from_answer_tags(text) == "(B)"
+
+    def test_case_insensitive(self) -> None:
+        text = "<Think>reason</Think><Answer>(A)</Answer>"
+        assert extract_from_answer_tags(text) == "(A)"
+
+    def test_verbose_answer_inside_tags(self) -> None:
+        """If model puts verbose text in answer tags, we still extract it."""
+        text = "<think>reason</think><answer>The answer is (B)</answer>"
+        assert extract_from_answer_tags(text) == "The answer is (B)"
+
+
+class TestHasThinkAnswerTags:
+    """Tests for has_think_answer_tags."""
+
+    def test_both_present(self) -> None:
+        assert has_think_answer_tags("<think>x</think><answer>y</answer>") is True
+
+    def test_only_answer(self) -> None:
+        assert has_think_answer_tags("<answer>y</answer>") is False
+
+    def test_only_think(self) -> None:
+        assert has_think_answer_tags("<think>x</think>") is False
+
+    def test_no_tags(self) -> None:
+        assert has_think_answer_tags("(A)") is False
+
+    def test_bare_text(self) -> None:
+        assert has_think_answer_tags("") is False

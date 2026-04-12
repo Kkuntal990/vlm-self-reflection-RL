@@ -144,6 +144,12 @@ def parse_args() -> argparse.Namespace:
         "--freeze_vision_tower", action="store_true", help="Freeze vision encoder weights"
     )
     parser.add_argument("--max_pixels", type=int, default=401408, help="Max pixels per image")
+    parser.add_argument(
+        "--use_think_answer_tags",
+        action="store_true",
+        help="Use <think>...</think><answer>...</answer> tag format for A1/A2 generation. "
+        "Enables structured reasoning with format reward for tags.",
+    )
     parser.add_argument("--min_pixels", type=int, default=200704, help="Min pixels per image")
     parser.add_argument(
         "--loss_type",
@@ -243,11 +249,19 @@ def main() -> None:
         SelfReflectionConfig,
     )
 
+    # When think/answer tags enabled, increase format weight from 0.15 to 0.5
+    # so the model has positive incentive to use tags (range +0.5 to -1.0).
+    # User can still override explicitly with --w_a2_format.
+    w_a2_format = args.w_a2_format
+    if args.use_think_answer_tags and w_a2_format == 0.15:
+        w_a2_format = 0.5
+        logger.info("Auto-increased w_a2_format to 0.5 for think/answer tag mode")
+
     response_weights = ResponseRewardWeights(
         w_a1_correctness=args.w_a1_correctness,
         w_a2_correctness=args.w_a2_correctness,
         w_no_regression=args.w_no_regression,
-        w_a2_format=args.w_a2_format,
+        w_a2_format=w_a2_format,
         w_minimal_edit=args.w_minimal_edit,
     )
     feedback_weights = FeedbackRewardWeights(
@@ -265,6 +279,7 @@ def main() -> None:
         feedback_temperature=args.feedback_temperature,
         a2_temperature=args.a2_temperature,
         batch_size=args.rollout_batch_size or args.per_device_train_batch_size,
+        use_think_answer_tags=args.use_think_answer_tags,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,

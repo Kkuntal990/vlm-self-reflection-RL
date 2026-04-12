@@ -107,7 +107,7 @@ class TestDownstreamAwareReward:
         assert r == 1.0
 
     def test_rw_a1_correct(self) -> None:
-        """Bad feedback: A1 correct → A2 wrong (RW) → -2.0."""
+        """Bad feedback: A1 correct → A2 wrong (RW) → -1.5 (deterministic)."""
         r = compute_downstream_aware_reward(
             feedback_text="The answer is wrong, it should be B.",
             a2_extracted="B",
@@ -116,11 +116,11 @@ class TestDownstreamAwareReward:
             a1="A",
             a1_is_correct=True,
         )
-        assert r == -2.0
+        assert r == -1.5
 
     # full phase (A1 wrong)
     def test_wr_a1_wrong(self) -> None:
-        """Great feedback: A1 wrong → A2 correct (WR) → +3.0."""
+        """Great feedback: A1 wrong → A2 correct (WR) → +3.0 (deterministic)."""
         r = compute_downstream_aware_reward(
             feedback_text="The answer is incorrect, it should be A.",
             a2_extracted="A",
@@ -129,7 +129,7 @@ class TestDownstreamAwareReward:
             a1="B",
             a1_is_correct=False,
         )
-        assert r == 2.0
+        assert r == 3.0
 
     def test_ww_a1_wrong(self) -> None:
         """Failed feedback: A1 wrong → A2 wrong (WW) → -1.0."""
@@ -168,6 +168,7 @@ class TestDownstreamAwareReward:
         assert r == 1.0
 
     def test_yesno_wr(self) -> None:
+        """YesNo is deterministic type → WR = +3.0."""
         r = compute_downstream_aware_reward(
             feedback_text="The answer should be Yes.",
             a2_extracted="Yes",
@@ -176,7 +177,7 @@ class TestDownstreamAwareReward:
             a1="No",
             a1_is_correct=False,
         )
-        assert r == 2.0
+        assert r == 3.0
 
     def test_numeric_rr(self) -> None:
         r = compute_downstream_aware_reward(
