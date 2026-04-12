@@ -31,13 +31,19 @@ def compute_no_regression_reward(
 ) -> float:
     """R_no_regression: Penalize RW flips, reward WR fixes.
 
-    When A1 is correct (rw_first phase):
-        A2 correct (RR): +1.0
-        A2 wrong (RW):   -3.0 (heavy penalty)
+    Uses answer_type-aware values:
 
-    When A1 is wrong (full phase):
-        A2 correct (WR): +2.0 (reward fixing errors)
-        A2 wrong (WW):   0.0  (neutral)
+    For deterministic types (MCQ, YesNo, Numeric):
+        RR: +1.0, RW: -2.0, WR: +3.0, WW: 0.0
+        Rationale: changing a letter/word is cheap and the answer space
+        is small, so we reduce the RW penalty and increase WR reward
+        to encourage the model to attempt corrections via feedback.
+
+    For open-ended / counting:
+        RR: +1.0, RW: -3.0, WR: +2.0, WW: 0.0
+        Rationale: changing a correct freeform answer is expensive
+        (large answer space makes re-generating a correct answer hard),
+        so we keep the heavy RW penalty to protect correct answers.
 
     NOT gated by format: correctness is evaluated independently.
 
@@ -54,6 +60,13 @@ def compute_no_regression_reward(
     result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
     a2_correct = result.is_correct
 
+    # Deterministic types: encourage correction (lower RW penalty, higher WR reward)
+    if answer_type in DETERMINISTIC_TYPES:
+        if a1_is_correct:
+            return 1.0 if a2_correct else -2.0
+        return 3.0 if a2_correct else 0.0
+
+    # Open-ended / counting: protect correct answers (heavy RW penalty)
     if a1_is_correct:
         if a2_correct:
             return 1.0  # RR: maintained correctness

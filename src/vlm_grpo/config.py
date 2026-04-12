@@ -92,6 +92,7 @@ class RolloutConfig:
     top_p: float = 0.9
     a2_temperature: float = 1.0
     batch_size: int = 8
+    use_think_answer_tags: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

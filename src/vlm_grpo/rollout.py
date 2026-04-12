@@ -403,7 +403,11 @@ def generate_self_reflection_rollout(
 
             # Step 1: Generate K A1s for every sample in the chunk.
             # repeat_interleave: [q0]*k + [q1]*k + ... -> chunk_size*k prompts
-            a1_prompts = [build_initial_answer_prompt(q) for q in chunk_qs for _ in range(k)]
+            use_tags = config.use_think_answer_tags
+            a1_prompts = [
+                build_initial_answer_prompt(q, use_think_answer_tags=use_tags)
+                for q in chunk_qs for _ in range(k)
+            ]
             imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
 
             # Route generation through vLLM (if available) or HF generate.
@@ -458,7 +462,10 @@ def generate_self_reflection_rollout(
 
             # Step 3: Generate A2 for each trajectory.
             a2_prompts = [
-                build_refiner_prompt(chunk_qs[i], chunk_a1s[i * k + j], chunk_f1s[i * k + j])
+                build_refiner_prompt(
+                    chunk_qs[i], chunk_a1s[i * k + j], chunk_f1s[i * k + j],
+                    use_think_answer_tags=use_tags,
+                )
                 for i in range(chunk_size)
                 for j in range(k)
             ]
@@ -515,6 +522,7 @@ def generate_self_reflection_rollout(
                 answer_type=answer_types[i],
                 choices=choices_list[i],
                 weights=response_weights,
+                use_think_answer_tags=config.use_think_answer_tags,
             )
             fb_bd = compute_feedback_reward_breakdown(
                 feedback_text=f1,

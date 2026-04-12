@@ -17,6 +17,10 @@ Usage:
 
 import re
 
+# Tag extraction patterns for <think>...</think><answer>...</answer> format
+_ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
+_THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IGNORECASE)
+
 # Answer extraction patterns (case-insensitive for a-f / A-F)
 _MCQ_LETTER_PATTERN = re.compile(r"[A-Fa-f]")
 _MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.)\s*$")
@@ -130,6 +134,41 @@ def normalize_answer(text: str) -> str:
     elif text.endswith(")"):
         text = text[:-1].strip()
     return text
+
+
+def extract_from_answer_tags(text: str) -> str:
+    """Extract content from <answer>...</answer> tags.
+
+    If <answer> tags are found, returns the inner content.
+    If no tags found, returns the original text unchanged (fallback).
+
+    This enables a clean fallback: when use_think_answer_tags=False,
+    calling this function is a no-op since raw answers don't contain tags.
+
+    Args:
+        text: Raw model output, possibly containing <think> and <answer> tags.
+
+    Returns:
+        Content inside <answer> tags, or original text if no tags found.
+    """
+    match = _ANSWER_TAG_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+
+def has_think_answer_tags(text: str) -> bool:
+    """Check whether text contains both <think> and <answer> tags.
+
+    Used by the format reward to verify the model followed the tag format.
+
+    Args:
+        text: Raw model output.
+
+    Returns:
+        True if both <think> and <answer> tags are present.
+    """
+    return bool(_THINK_TAG_PATTERN.search(text) and _ANSWER_TAG_PATTERN.search(text))
 
 
 def extract_answer_from_text(

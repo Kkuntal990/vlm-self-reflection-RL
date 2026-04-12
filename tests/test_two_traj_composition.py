@@ -85,7 +85,7 @@ class TestCriticRewardBreakdown:
             weights=CriticRewardWeights(),
         )
         assert bd.a2_correct is True
-        assert bd.format_valid is True
+        assert bd.format_valid is True  # 8 words > 6 → format=0.0 → valid
         assert bd.components["downstream"] == 1.0
         assert "calibration" not in bd.components
         assert bd.total_reward > 0
@@ -103,7 +103,7 @@ class TestCriticRewardBreakdown:
             weights=CriticRewardWeights(),
         )
         assert bd.a2_correct is False
-        assert bd.components["downstream"] == -2.0
+        assert bd.components["downstream"] == -1.5  # deterministic type
         assert bd.total_reward < 0
 
     def test_empty_feedback_penalized(self) -> None:
@@ -135,8 +135,8 @@ class TestCriticRewardBreakdown:
         )
         assert bd.components["format"] == -2.0
 
-    def test_stance_keyword_plus_one(self) -> None:
-        """3-word feedback with stance keyword → +1.0."""
+    def test_short_feedback_penalized(self) -> None:
+        """3-word feedback → -1.0 (too terse, regardless of keywords)."""
         bd = compute_critic_reward_breakdown(
             feedback_text="Answer is correct.",
             a2_text="A",
@@ -147,7 +147,7 @@ class TestCriticRewardBreakdown:
             choices="",
             weights=CriticRewardWeights(),
         )
-        assert bd.components["format"] == 1.0
+        assert bd.components["format"] == -1.0
 
     def test_weak_feedback_minus_one(self) -> None:
         """3-4 words, no stance keyword → -1.0."""
@@ -163,10 +163,10 @@ class TestCriticRewardBreakdown:
         )
         assert bd.components["format"] == -1.0
 
-    def test_five_words_plus_one(self) -> None:
-        """>=5 words even without stance keyword → +1.0."""
+    def test_seven_plus_words_zero(self) -> None:
+        """>6 words → 0.0 (acceptable structure, penalty-only)."""
         bd = compute_critic_reward_breakdown(
-            feedback_text="I think you might want to reconsider.",
+            feedback_text="I think you might want to reconsider this answer.",
             a2_text="A",
             ground_truth="A",
             answer1="A",
@@ -175,7 +175,7 @@ class TestCriticRewardBreakdown:
             choices="",
             weights=CriticRewardWeights(),
         )
-        assert bd.components["format"] == 1.0
+        assert bd.components["format"] == 0.0
 
     def test_to_dict(self) -> None:
         bd = compute_critic_reward_breakdown(
@@ -229,7 +229,7 @@ class TestRefinerRewardBreakdown:
             weights=RefinerRewardWeights(),
         )
         assert bd.a2_correct is False
-        assert bd.components["no_regression"] == -3.0
+        assert bd.components["no_regression"] == -2.0  # deterministic type
         assert bd.total_reward < 0
 
     def test_to_dict(self) -> None:
@@ -287,7 +287,7 @@ class TestRefinerTRLFunctions:
         )
         assert len(rewards) == 2
         assert rewards[0] == 1.0  # RR
-        assert rewards[1] == -3.0  # RW
+        assert rewards[1] == -2.0  # RW (deterministic type)
 
     def test_minimal_edit_reward_fn(self) -> None:
         rewards = refiner_minimal_edit_reward_fn(
@@ -369,38 +369,38 @@ class TestCriticFormatCJK:
     """Tests for CJK support in critic format reward."""
 
     def test_chinese_substantive_feedback(self) -> None:
-        """Chinese feedback with many characters should get +1.0."""
-        feedback = "答案是正确的，与图像匹配。"
-        assert compute_critic_format_reward(feedback) == 1.0
+        """Chinese feedback with many characters (>6 units) → 0.0."""
+        feedback = "答案是正确的，与图像匹配。"  # 10 CJK chars
+        assert compute_critic_format_reward(feedback) == 0.0
 
     def test_chinese_with_stance_keyword(self) -> None:
-        """Chinese feedback with stance keyword should get +1.0."""
-        feedback = "答案正确"  # 4 chars with 正确
-        assert compute_critic_format_reward(feedback) == 1.0
+        """Chinese 4-char feedback → -1.0 (too terse, pure word count)."""
+        feedback = "答案正确"  # 4 chars, ≤6
+        assert compute_critic_format_reward(feedback) == -1.0
 
     def test_chinese_short_no_stance(self) -> None:
-        """Very short Chinese without stance should get -2.0."""
+        """Very short Chinese → -2.0."""
         feedback = "好"  # 1 char
         assert compute_critic_format_reward(feedback) == -2.0
 
     def test_chinese_medium_no_stance(self) -> None:
-        """3-4 Chinese chars without stance keyword should get -1.0."""
-        feedback = "还可以吧"  # 4 chars, no stance keyword
+        """3-6 Chinese chars → -1.0."""
+        feedback = "还可以吧"  # 4 chars, ≤6
         assert compute_critic_format_reward(feedback) == -1.0
 
     def test_english_unchanged(self) -> None:
-        """English feedback still works correctly."""
-        assert compute_critic_format_reward("Answer is correct.") == 1.0
-        assert compute_critic_format_reward("OK") == -2.0
-        assert compute_critic_format_reward("Maybe try again.") == -1.0
+        """English feedback: pure word count, no keywords."""
+        assert compute_critic_format_reward("Answer is correct.") == -1.0  # 3 words, ≤6
+        assert compute_critic_format_reward("OK") == -2.0  # <3 words
+        assert compute_critic_format_reward("Maybe try again.") == -1.0  # 3 words, ≤6
 
     def test_real_chinese_feedback(self) -> None:
-        """Real Chinese feedback from training logs should get +1.0."""
+        """Real Chinese feedback from training logs (many chars) → 0.0."""
         feedback = (
             "你的回答是24，但这个答案是错误的。你需要考虑PA=12这个信息，"
             "因为这个长度给了我们一个比例关系。"
         )
-        assert compute_critic_format_reward(feedback) == 1.0
+        assert compute_critic_format_reward(feedback) == 0.0
 
 
 # =============================================================================

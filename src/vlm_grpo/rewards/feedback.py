@@ -112,15 +112,18 @@ def compute_downstream_aware_reward(
     """R_downstream: Judge F1 quality by the quality of A2 it produces.
 
     The critic is rewarded based on whether its feedback leads to a
-    correct refined answer.
+    correct refined answer. Uses answer_type-aware values.
 
-    When A1 is correct (rw_first phase):
-        A2 correct (RR): +1.0  (feedback maintained correctness)
-        A2 wrong (RW):   -2.0  (feedback caused regression)
+    For deterministic types (MCQ, YesNo, Numeric):
+        RR: +1.0, RW: -1.5, WR: +3.0, WW: -1.0
+        Rationale: small answer space makes correction feasible, so
+        we strongly reward corrective feedback (WR=+3.0) and reduce
+        the RW penalty to avoid training a "never criticize" policy.
 
-    When A1 is wrong (full phase):
-        A2 correct (WR): +2.0  (feedback fixed the error, 2:1 ratio with RR)
-        A2 wrong (WW):   -1.0  (feedback failed to help)
+    For open-ended / counting:
+        RR: +1.0, RW: -2.0, WR: +2.0, WW: -1.0
+        Rationale: large answer space makes correction harder, so
+        we keep the heavier RW penalty to protect correct answers.
 
     Returns 0.0 if feedback is empty.
 
@@ -136,11 +139,18 @@ def compute_downstream_aware_reward(
     Returns:
         Downstream-aware reward value
     """
+    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+
     if not feedback_text.strip():
         return 0.0
 
     result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
     a2_correct = result.is_correct
+
+    if answer_type in DETERMINISTIC_TYPES:
+        if a1_is_correct:
+            return 1.0 if a2_correct else -1.5
+        return 3.0 if a2_correct else -1.0
 
     if a1_is_correct:
         if a2_correct:

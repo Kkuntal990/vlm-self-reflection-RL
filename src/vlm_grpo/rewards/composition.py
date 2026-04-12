@@ -260,12 +260,16 @@ _CRITIC_FORMAT_STANCE_KEYWORDS: list[re.Pattern] = [
 
 
 def compute_critic_format_reward(feedback_text: str) -> float:
-    """R_format for critic: validate feedback format with stance detection.
+    """R_format for critic: pure structure check (no keyword overlap with calibration).
+
+    Penalty-only, based solely on word count. Stance keyword detection is
+    handled by calibration reward — keeping them separate avoids redundant
+    signals that reduce K-group variance.
 
     Three-tier scoring:
-        Empty or <3 units            → -2.0  (heavy penalty for safe empty)
-        3-4 units, no stance keyword → -1.0  (weak/vague feedback)
-        >=5 units OR stance keyword  → +1.0  (substantive feedback)
+        Empty or <3 units  → -2.0  (heavy penalty for safe empty)
+        3-6 units          → -1.0  (too terse for useful feedback)
+        >6 units           →  0.0  (acceptable structure)
 
     For CJK text, each character counts as one unit (≈ one word).
 
@@ -273,7 +277,7 @@ def compute_critic_format_reward(feedback_text: str) -> float:
         feedback_text: Feedback text from the critic
 
     Returns:
-        Format reward in {-2.0, -1.0, +1.0}
+        Format reward in {-2.0, -1.0, 0.0}
     """
     stripped = feedback_text.strip()
     if not stripped:
@@ -283,12 +287,10 @@ def compute_critic_format_reward(feedback_text: str) -> float:
     if word_count < 3:
         return -2.0
 
-    has_stance = any(p.search(stripped) for p in _CRITIC_FORMAT_STANCE_KEYWORDS)
+    if word_count <= 6:
+        return -1.0
 
-    if word_count >= 5 or has_stance:
-        return 1.0
-
-    return -1.0
+    return 0.0
 
 
 def compute_critic_reward_breakdown(
@@ -321,9 +323,9 @@ def compute_critic_reward_breakdown(
     # Extract normalized A2 answer
     a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
 
-    # Format reward
+    # Format reward (penalty-only: 0.0 = valid, negative = invalid)
     r_format = compute_critic_format_reward(feedback_text)
-    format_valid = r_format > 0
+    format_valid = r_format >= 0
 
     # Downstream-aware reward (pass raw text for MCQ answer text matching)
     r_downstream = compute_downstream_aware_reward(
@@ -375,6 +377,7 @@ def compute_refiner_reward_breakdown(
     answer_type: str,
     choices: str,
     weights: RefinerRewardWeights,
+    use_think_answer_tags: bool = False,
 ) -> RefinerRewardBreakdown:
     """Compute full reward breakdown for one refiner completion.
 
@@ -388,12 +391,15 @@ def compute_refiner_reward_breakdown(
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         choices: MCQ choices string (empty for non-MCQ)
         weights: Reward weight configuration
+        use_think_answer_tags: Whether to check for tag format
 
     Returns:
         RefinerRewardBreakdown with all component scores
     """
-    # Format reward (normalize-first, penalty-only, LLM fallback)
-    r_format = _compute_refiner_format_reward(a2_text, answer_type, ground_truth)
+    # Format reward
+    r_format = _compute_refiner_format_reward(
+        a2_text, answer_type, ground_truth, use_think_answer_tags
+    )
     format_valid = r_format >= 0
 
     # Extract A2 for correctness (liberal extraction, separate from format)
@@ -515,30 +521,108 @@ def _compute_refiner_format_reward(
     a2_text: str,
     answer_type: str,
     ground_truth: str = "",
+    use_think_answer_tags: bool = False,
 ) -> float:
-    """R_format for refiner: normalize-first, penalty-only format check.
+    """R_format for refiner: format compliance check.
 
-    Pipeline:
-        1. normalize_answer(a2_text) → strip, lowercase, remove trailing
-           punctuation, unwrap parens
-        2. Type-specific deterministic format check on normalized answer:
-           - MCQ: single letter a-f
-           - YesNo: "yes" or "no"
-           - Numeric: parseable number (int, float, fraction, percentage)
-           - Open: any non-empty text
-        3. LLM fallback: if deterministic check fails for MCQ/YesNo and
-           ground_truth is available and LLM judge is enabled, ask LLM
-           whether predicted answer has the same format as GT.
+    Two modes controlled by use_think_answer_tags:
 
-    Penalty-only: 0.0 when compliant, -1.0 when not.
+    **Tag mode** (use_think_answer_tags=True):
+        Checks for <think>...</think><answer>...</answer> structure.
+        Then validates the inner answer content by type.
+        - Both tags present + valid inner answer → 0.0
+        - Tags present but inner answer invalid → -0.5 (partial credit)
+        - Tags missing entirely → -1.0
+
+    **Bare mode** (use_think_answer_tags=False):
+        Original normalize-first pipeline:
+        1. normalize_answer(a2_text)
+        2. Type-specific check (MCQ=letter, YesNo=yes/no, etc.)
+        3. LLM fallback if deterministic check fails
+
+    Penalty-only: 0.0 when compliant, -1.0 (or -0.5) when not.
 
     Args:
         a2_text: Raw A2 text from the refiner
         answer_type: Expected answer type
         ground_truth: Ground truth answer (for LLM format fallback)
+        use_think_answer_tags: Whether to check for tag format
 
     Returns:
-        0.0 if format-compliant, -1.0 if not
+        0.0 if format-compliant, negative if not
+    """
+    if use_think_answer_tags:
+        return _compute_tag_format_reward(a2_text, answer_type, ground_truth)
+
+    return _compute_bare_format_reward(a2_text, answer_type, ground_truth)
+
+
+def _compute_tag_format_reward(
+    a2_text: str,
+    answer_type: str,
+    ground_truth: str = "",
+) -> float:
+    """Format reward for tag mode: check <think>+<answer> structure.
+
+    Wider range than bare mode to provide positive incentive for tags:
+        Both tags + valid inner answer → +0.5  (positive reward for compliance)
+        Tags present but inner answer invalid → -0.5  (partial credit)
+        Tags missing entirely → -1.0  (penalty)
+
+    With w_a2_format=0.5, this gives a 0.75 weighted swing (+0.25 to -0.5),
+    meaningful against the ~10-point total response reward range.
+
+    Args:
+        a2_text: Raw A2 text.
+        answer_type: Expected answer type.
+        ground_truth: Ground truth (unused, kept for API compat).
+
+    Returns:
+        +0.5 if fully compliant, -0.5 if tags present but answer invalid,
+        -1.0 if tags missing.
+    """
+    from vlm_grpo.trajectory import extract_from_answer_tags, has_think_answer_tags
+
+    if not has_think_answer_tags(a2_text):
+        return -1.0
+
+    # Tags present — check inner answer content
+    inner = extract_from_answer_tags(a2_text)
+    normalized = normalize_answer(inner)
+
+    if not normalized:
+        return -0.5
+
+    if answer_type == "mcq":
+        if len(normalized) != 1 or normalized not in "abcdef":
+            return -0.5
+    elif answer_type == "yesno":
+        if normalized not in ("yes", "no"):
+            return -0.5
+    elif answer_type == "numeric":
+        num_text = normalized.replace(",", "")
+        try:
+            float(num_text.rstrip("%").replace("/", "."))
+        except ValueError:
+            return -0.5
+
+    return 0.5
+
+
+def _compute_bare_format_reward(
+    a2_text: str,
+    answer_type: str,
+    ground_truth: str = "",
+) -> float:
+    """Original format reward: normalize-first, penalty-only.
+
+    Args:
+        a2_text: Raw A2 text.
+        answer_type: Expected answer type.
+        ground_truth: Ground truth (for LLM fallback).
+
+    Returns:
+        0.0 if compliant, -1.0 if not.
     """
     normalized = normalize_answer(a2_text)
 
@@ -791,6 +875,7 @@ def compute_response_reward_breakdown(
     answer_type: str,
     choices: str,
     weights: Any,
+    use_think_answer_tags: bool = False,
 ) -> TrajectoryResponseRewardBreakdown:
     """Compute response reward for a single trajectory.
 
@@ -804,6 +889,7 @@ def compute_response_reward_breakdown(
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         choices: MCQ choices string
         weights: ResponseRewardWeights instance
+        use_think_answer_tags: Whether to check for tag format
 
     Returns:
         TrajectoryResponseRewardBreakdown with all component scores
@@ -815,8 +901,10 @@ def compute_response_reward_breakdown(
     a1_correct = a1_result.is_correct
     a2_correct = a2_result.is_correct
 
-    # Format reward (normalize-first, penalty-only, LLM fallback)
-    r_a2_format = _compute_refiner_format_reward(a2_text, answer_type, ground_truth)
+    # Format reward
+    r_a2_format = _compute_refiner_format_reward(
+        a2_text, answer_type, ground_truth, use_think_answer_tags
+    )
     a2_format_valid = r_a2_format >= 0
 
     # Extract A2 for display
@@ -832,10 +920,21 @@ def compute_response_reward_breakdown(
         r_a2 = 1.0 if a2_correct else -1.0
 
     # No-regression reward (use pre-computed a1_correct, a2_correct)
-    if a1_correct:
-        r_no_reg = 1.0 if a2_correct else -3.0
+    # Deterministic types (MCQ/YesNo/Numeric): lower RW penalty, higher WR reward
+    # to encourage correction (small answer space makes changing cheap).
+    # Open-ended: heavy RW penalty to protect correct freeform answers.
+    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+
+    if answer_type in DETERMINISTIC_TYPES:
+        if a1_correct:
+            r_no_reg = 1.0 if a2_correct else -2.0
+        else:
+            r_no_reg = 3.0 if a2_correct else 0.0
     else:
-        r_no_reg = 2.0 if a2_correct else 0.0
+        if a1_correct:
+            r_no_reg = 1.0 if a2_correct else -3.0
+        else:
+            r_no_reg = 2.0 if a2_correct else 0.0
 
     # Minimal edit reward (only when both correct)
     if a1_correct and a2_correct:
@@ -921,17 +1020,26 @@ def compute_feedback_reward_breakdown(
     a1_correct = a1_result.is_correct
     a2_correct = a2_result.is_correct
 
-    # Feedback format reward
+    # Feedback format reward (penalty-only: 0.0 = valid, negative = invalid)
     r_format = compute_critic_format_reward(feedback_text)
-    format_valid = r_format > 0
+    format_valid = r_format >= 0
 
     # Downstream-aware reward (computed directly, no extra verify_answer call)
+    # For deterministic types: stronger WR reward to incentivize corrective feedback.
+    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+
     if not feedback_text.strip():
         r_downstream = 0.0
-    elif a1_correct:
-        r_downstream = 1.0 if a2_correct else -2.0
+    elif answer_type in DETERMINISTIC_TYPES:
+        if a1_correct:
+            r_downstream = 1.0 if a2_correct else -1.5
+        else:
+            r_downstream = 3.0 if a2_correct else -1.0
     else:
-        r_downstream = 2.0 if a2_correct else -1.0
+        if a1_correct:
+            r_downstream = 1.0 if a2_correct else -2.0
+        else:
+            r_downstream = 2.0 if a2_correct else -1.0
 
     # Calibration tiebreaker: varies across K trajectories because each
     # generates different feedback TEXT even for the same correctness outcome.
