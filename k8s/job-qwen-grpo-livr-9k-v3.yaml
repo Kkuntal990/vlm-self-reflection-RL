@@ -132,8 +132,6 @@ spec:
           value: "8"
         - name: LOSS_TYPE
           value: "dr_grpo"
-        - name: KL_COEFF
-          value: "0.0"
         - name: CLIP_RANGE
           value: "0.2"
         - name: INNER_EPOCHS
