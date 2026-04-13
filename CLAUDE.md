@@ -170,6 +170,14 @@ accelerate launch --config_file k8s/multi_gpu.yaml --num_processes=4 \
     --use_vllm --freeze_vision_tower
 ```
 
+## Experiment Log
+
+All experiments are tracked in `experiments.md`. After each experiment:
+1. Record final metrics table (early 10% vs late 10%): A1/A2 acc, WR, RW, entropy, rewards, F1 tag leak
+2. List what worked, what failed, and root cause (1-2 sentences each)
+3. Note artifacts (output dir, wandb run, k8s yaml, commit)
+4. Keep entries concise — no config tables if same as prior experiment (just note diffs)
+
 ## MUST Follow
 
 1. **Imports**: Standard library first, then third-party, then local. Alphabetized within groups.
