@@ -125,6 +125,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--kl_coeff", type=float, default=0.05)
+    parser.add_argument("--a1_kl_coeff", type=float, default=1.0)
+    parser.add_argument("--a2_kl_coeff", type=float, default=1.0)
+    parser.add_argument("--fb_kl_coeff", type=float, default=1.0)
+    parser.add_argument("--separate_turn_loss", action="store_true")
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument(
         "--num_inner_epochs",
@@ -302,6 +306,10 @@ def main() -> None:
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         kl_coeff=args.kl_coeff,
+        a1_kl_coeff=args.a1_kl_coeff,
+        a2_kl_coeff=args.a2_kl_coeff,
+        fb_kl_coeff=args.fb_kl_coeff,
+        separate_turn_loss=args.separate_turn_loss,
         clip_range=args.clip_range,
         loss_type=args.loss_type,
         freeze_vision_tower=args.freeze_vision_tower,

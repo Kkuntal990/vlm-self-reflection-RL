@@ -209,6 +209,10 @@ class SelfReflectionConfig:
         lora_alpha: LoRA alpha
         lora_target_modules: Target modules for LoRA
         kl_coeff: KL divergence coefficient for GRPO (0.0 disables KL)
+        a1_kl_coeff: KL multiplier for A1 turn (SCoRe-style anchor, relative to kl_coeff)
+        a2_kl_coeff: KL multiplier for A2 turn (relative to kl_coeff)
+        fb_kl_coeff: KL multiplier for F1 turn (relative to kl_coeff)
+        separate_turn_loss: If True, compute separate advantages for A1 vs A2
         clip_range: Policy ratio clipping range
         loss_type: GRPO loss variant ("grpo" or "dr_grpo")
         freeze_vision_tower: Whether to freeze the vision encoder
@@ -243,6 +247,10 @@ class SelfReflectionConfig:
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
     )
     kl_coeff: float = 0.05
+    a1_kl_coeff: float = 1.0
+    a2_kl_coeff: float = 1.0
+    fb_kl_coeff: float = 1.0
+    separate_turn_loss: bool = False
     clip_range: float = 0.2
     loss_type: str = "grpo"
     freeze_vision_tower: bool = False

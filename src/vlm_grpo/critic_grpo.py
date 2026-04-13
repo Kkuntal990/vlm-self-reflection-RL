@@ -519,7 +519,37 @@ class SelfReflectionGRPOTrainer:
         resp_rewards_t = torch.tensor(all_resp_rewards, device=self.device)
         fb_rewards_t = torch.tensor(all_fb_rewards, device=self.device)
         loss_type = getattr(self.config, "loss_type", "grpo")
-        resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
+        separate_turns = getattr(self.config, "separate_turn_loss", False)
+
+        if separate_turns:
+            # SCoRe-style: separate advantages for A1 and A2.
+            # A1 reward = a1_correctness only (so wrong A1 gets negative advantage).
+            # A2 reward = everything else (correctness, no_regression, format, edit).
+            a1_rewards_list = []
+            a2_rewards_list = []
+            for result in rollout_results:
+                for rb in result.response_breakdowns:
+                    w = self.config.response_weights
+                    a1_r = rb.weighted_components.get("a1_correctness", 0.0)
+                    a2_r = (
+                        rb.weighted_components.get("a2_correctness", 0.0)
+                        + rb.weighted_components.get("no_regression", 0.0)
+                        + rb.weighted_components.get("a2_format", 0.0)
+                        + rb.weighted_components.get("minimal_edit", 0.0)
+                    )
+                    a1_rewards_list.append(a1_r)
+                    a2_rewards_list.append(a2_r)
+            a1_rewards_t = torch.tensor(a1_rewards_list, device=self.device)
+            a2_rewards_t = torch.tensor(a2_rewards_list, device=self.device)
+            a1_advantages = self._compute_group_advantages(a1_rewards_t, k, loss_type=loss_type)
+            a2_advantages = self._compute_group_advantages(a2_rewards_t, k, loss_type=loss_type)
+            # Joint resp_advantages still used for logging/metrics
+            resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
+        else:
+            a1_advantages = None
+            a2_advantages = None
+            resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
+
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
 
         # Compute frac_reward_zero_std for BOTH response and feedback rewards:
@@ -608,16 +638,26 @@ class SelfReflectionGRPOTrainer:
                     unwrapped_model.enable_adapter_layers()
 
             # Per-token log-probs: keep as lists of variable-length tensors.
-            # For response, concatenate A1 and A2 tokens per trajectory.
+            if separate_turns:
+                # Separate A1 and A2 for per-turn loss
+                old_a1_lps = old_a1_lps_list
+                old_a2_lps = old_a2_lps_list
+            else:
+                old_a1_lps = None
+                old_a2_lps = None
             old_resp_lps = [torch.cat([a1, a2]) for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)]
             old_fb_lps = old_fb_lps_list  # already list of per-token tensors
 
             if self.config.kl_coeff > 0:
+                ref_a1_lps = ref_a1_lps_list
+                ref_a2_lps = ref_a2_lps_list
                 ref_resp_lps = [
                     torch.cat([a1, a2]) for a1, a2 in zip(ref_a1_lps_list, ref_a2_lps_list)
                 ]
                 ref_fb_lps = ref_fb_lps_list
             else:
+                ref_a1_lps = None
+                ref_a2_lps = None
                 ref_resp_lps = None
                 ref_fb_lps = None
 
@@ -684,39 +724,54 @@ class SelfReflectionGRPOTrainer:
                 for j in range(mb_end - mb_start):
                     ti = mb_start + j
 
-                    # Per-token log-probs: cat A1+A2 for response
-                    resp_new = torch.cat([mb_a1_lps[j], mb_a2_lps[j]])
                     fb_new = mb_fb_lps[j]
 
-                    # Per-token ratios
-                    resp_ratio_raw = torch.nan_to_num(
-                        resp_new - old_resp_lps[ti].detach(),
-                        nan=0.0,
-                        posinf=20.0,
-                        neginf=-20.0,
-                    )
-                    fb_ratio_raw = torch.nan_to_num(
-                        fb_new - old_fb_lps[ti].detach(),
-                        nan=0.0,
-                        posinf=20.0,
-                        neginf=-20.0,
-                    )
+                    if separate_turns and a1_advantages is not None:
+                        # SCoRe-style: separate A1 and A2 loss with per-turn advantages
+                        a1_new = mb_a1_lps[j]
+                        a2_new = mb_a2_lps[j]
 
-                    # Response: per-token clipped surrogate, advantage broadcasts
-                    resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
-                    resp_ratio = torch.exp(resp_log_ratio)
-                    resp_clipped_ratio = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
-                    resp_surr1 = resp_ratio * resp_advantages[ti]
-                    resp_surr2 = resp_clipped_ratio * resp_advantages[ti]
-                    traj_resp_loss = -torch.min(resp_surr1, resp_surr2).mean()
+                        a1_ratio_raw = torch.nan_to_num(
+                            a1_new - old_a1_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
+                        a2_ratio_raw = torch.nan_to_num(
+                            a2_new - old_a2_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
 
-                    # Track clip fraction
-                    self._resp_total_tokens += resp_ratio.numel()
-                    self._resp_clipped_tokens += (
-                        (resp_ratio != resp_clipped_ratio).sum().item()
-                    )
+                        a1_ratio = torch.exp(torch.clamp(a1_ratio_raw, -20.0, 20.0))
+                        a2_ratio = torch.exp(torch.clamp(a2_ratio_raw, -20.0, 20.0))
+                        a1_clipped = torch.clamp(a1_ratio, 1 - clip_range, 1 + clip_range)
+                        a2_clipped = torch.clamp(a2_ratio, 1 - clip_range, 1 + clip_range)
+
+                        a1_loss = -torch.min(a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]).mean()
+                        a2_loss = -torch.min(a2_ratio * a2_advantages[ti], a2_clipped * a2_advantages[ti]).mean()
+                        traj_resp_loss = a1_loss + a2_loss
+
+                        # Track clip fraction (combined)
+                        resp_ratio_combined = torch.cat([a1_ratio, a2_ratio])
+                        resp_clipped_combined = torch.cat([a1_clipped, a2_clipped])
+                        self._resp_total_tokens += resp_ratio_combined.numel()
+                        self._resp_clipped_tokens += (
+                            (resp_ratio_combined != resp_clipped_combined).sum().item()
+                        )
+                    else:
+                        # Original: joint A1+A2 response loss
+                        resp_new = torch.cat([mb_a1_lps[j], mb_a2_lps[j]])
+                        resp_ratio_raw = torch.nan_to_num(
+                            resp_new - old_resp_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
+                        resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
+                        resp_ratio = torch.exp(resp_log_ratio)
+                        resp_clipped_ratio = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
+                        resp_surr1 = resp_ratio * resp_advantages[ti]
+                        resp_surr2 = resp_clipped_ratio * resp_advantages[ti]
+                        traj_resp_loss = -torch.min(resp_surr1, resp_surr2).mean()
+
+                        self._resp_total_tokens += resp_ratio.numel()
+                        self._resp_clipped_tokens += (
+                            (resp_ratio != resp_clipped_ratio).sum().item()
+                        )
 
                     # Feedback: per-token clipped surrogate
+                    fb_ratio_raw = torch.nan_to_num(
+                        fb_new - old_fb_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
                     fb_log_ratio = torch.clamp(fb_ratio_raw, min=-20.0, max=20.0)
                     fb_ratio = torch.exp(fb_log_ratio)
                     fb_clipped_ratio = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
@@ -730,33 +785,27 @@ class SelfReflectionGRPOTrainer:
                         (fb_ratio != fb_clipped_ratio).sum().item()
                     )
 
-                    # KL loss (per-token, averaged)
-                    if self.config.kl_coeff > 0 and ref_resp_lps is not None:
-                        resp_kl_raw = torch.nan_to_num(
-                            ref_resp_lps[ti].detach() - resp_new,
-                            nan=0.0,
-                            posinf=20.0,
-                            neginf=-20.0,
-                        )
-                        resp_kl = (
-                            torch.exp(torch.clamp(resp_kl_raw, -20.0, 20.0))
-                            - torch.clamp(resp_kl_raw, -20.0, 20.0)
-                            - 1
-                        ).mean()
-                        fb_kl_raw = torch.nan_to_num(
-                            ref_fb_lps[ti].detach() - fb_new,
-                            nan=0.0,
-                            posinf=20.0,
-                            neginf=-20.0,
-                        )
-                        fb_kl = (
-                            torch.exp(torch.clamp(fb_kl_raw, -20.0, 20.0))
-                            - torch.clamp(fb_kl_raw, -20.0, 20.0)
-                            - 1
-                        ).mean()
-                        traj_kl_loss = self.config.kl_coeff * (resp_kl + fb_kl) / 2.0
+                    # KL loss (per-token, averaged) with per-turn coefficients.
+                    # SCoRe insight: strong A1 KL anchors first turn near base model,
+                    # preventing "direct solution collapse" where the model just
+                    # improves A1 instead of learning self-correction.
+                    if self.config.kl_coeff > 0 and ref_a1_lps is not None:
+                        def _kl_term(ref_lps: torch.Tensor, new_lps: torch.Tensor) -> torch.Tensor:
+                            raw = torch.nan_to_num(ref_lps.detach() - new_lps, nan=0.0, posinf=20.0, neginf=-20.0)
+                            clamped = torch.clamp(raw, -20.0, 20.0)
+                            return (torch.exp(clamped) - clamped - 1).mean()
+
+                        a1_kl = _kl_term(ref_a1_lps[ti], mb_a1_lps[j])
+                        a2_kl = _kl_term(ref_a2_lps[ti], mb_a2_lps[j])
+                        f1_kl = _kl_term(ref_fb_lps[ti], fb_new)
+
+                        a1_kl_c = self.config.kl_coeff * getattr(self.config, "a1_kl_coeff", 1.0)
+                        a2_kl_c = self.config.kl_coeff * getattr(self.config, "a2_kl_coeff", 1.0)
+                        fb_kl_c = self.config.kl_coeff * getattr(self.config, "fb_kl_coeff", 1.0)
+
+                        traj_kl_loss = (a1_kl_c * a1_kl + a2_kl_c * a2_kl + fb_kl_c * f1_kl) / 3.0
                     else:
-                        traj_kl_loss = torch.tensor(0.0, device=resp_new.device)
+                        traj_kl_loss = torch.tensor(0.0, device=fb_new.device)
 
                     traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
                     mb_loss = traj_loss if mb_loss is None else mb_loss + traj_loss
