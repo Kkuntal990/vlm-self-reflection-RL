@@ -529,7 +529,6 @@ class SelfReflectionGRPOTrainer:
             a2_rewards_list = []
             for result in rollout_results:
                 for rb in result.response_breakdowns:
-                    w = self.config.response_weights
                     a1_r = rb.weighted_components.get("a1_correctness", 0.0)
                     a2_r = (
                         rb.weighted_components.get("a2_correctness", 0.0)
@@ -651,14 +650,10 @@ class SelfReflectionGRPOTrainer:
             if self.config.kl_coeff > 0:
                 ref_a1_lps = ref_a1_lps_list
                 ref_a2_lps = ref_a2_lps_list
-                ref_resp_lps = [
-                    torch.cat([a1, a2]) for a1, a2 in zip(ref_a1_lps_list, ref_a2_lps_list)
-                ]
                 ref_fb_lps = ref_fb_lps_list
             else:
                 ref_a1_lps = None
                 ref_a2_lps = None
-                ref_resp_lps = None
                 ref_fb_lps = None
 
         # No explicit cache clear -- PyTorch reuses memory automatically.
@@ -803,7 +798,7 @@ class SelfReflectionGRPOTrainer:
                         a2_kl_c = self.config.kl_coeff * getattr(self.config, "a2_kl_coeff", 1.0)
                         fb_kl_c = self.config.kl_coeff * getattr(self.config, "fb_kl_coeff", 1.0)
 
-                        traj_kl_loss = (a1_kl_c * a1_kl + a2_kl_c * a2_kl + fb_kl_c * f1_kl) / 3.0
+                        traj_kl_loss = a1_kl_c * a1_kl + a2_kl_c * a2_kl + fb_kl_c * f1_kl
                     else:
                         traj_kl_loss = torch.tensor(0.0, device=fb_new.device)
 
