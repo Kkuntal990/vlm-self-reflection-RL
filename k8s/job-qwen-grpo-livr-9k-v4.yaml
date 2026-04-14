@@ -230,6 +230,8 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: ""
         - name: VLLM_NO_USAGE_STATS
           value: "1"
         - name: DO_NOT_TRACK
