@@ -152,12 +152,14 @@ class SSRBuffer:
             remaining_w = [weights[i] for i in available]
             r = random.random() * sum(remaining_w)
             cumulative = 0.0
+            chosen_idx = len(available) - 1  # fallback for float rounding
             for idx, i in enumerate(available):
                 cumulative += weights[i]
                 if r <= cumulative:
-                    selected.append(buf_list[i])
-                    available.pop(idx)
+                    chosen_idx = idx
                     break
+            selected.append(buf_list[available[chosen_idx]])
+            available.pop(chosen_idx)
 
         return selected
 
@@ -665,7 +667,7 @@ class SelfReflectionGRPOTrainer:
             for result in rollout_results:
                 fb_rews = result.feedback_rewards
                 # Only store complete K-groups (partial groups break advantage alignment)
-                if len(fb_rews) != k:
+                if len(fb_rews) != k or len(result.response_breakdowns) != k:
                     continue
                 fb_std = _torch.tensor(fb_rews).std().item()
                 if fb_std > 1e-4:
