@@ -232,6 +232,10 @@ spec:
           value: "1"
         - name: PYTORCH_CUDA_ALLOC_CONF
           value: ""
+        - name: NCCL_TIMEOUT
+          value: "1800"
+        - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+          value: "1800"
         - name: VLLM_NO_USAGE_STATS
           value: "1"
         - name: DO_NOT_TRACK
