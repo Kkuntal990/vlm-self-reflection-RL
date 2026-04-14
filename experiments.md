@@ -129,42 +129,54 @@ The improvement-based reward `R_improve = R(A2) - R(A1)` fixes this by giving RR
 
 ---
 
+## Experiment Diff Table
+
+Quick reference for what changed between versions. All share: Qwen2.5-VL-7B, LIVR 9K MCQ, K=8, dr_grpo, LoRA r=64, separate_turn_loss, 4x A100.
+
+| | v1 | v2 | v3 | v4 | v5 | v6 |
+|---|---|---|---|---|---|---|
+| **Key change** | Baseline + tags | Tag penalty | SCoRe KL | Drop cal/edit, shuffle | SSR buffer | Improve reward + freeze A1 |
+| w_calibration | 0.2 | 0.2 | 1.0 | **0.0** | 0.0 | 0.0 |
+| w_minimal_edit | 0.3 | 0.3 | 0.3 | **0.0** | 0.0 | 0.0 |
+| w_tag_penalty | 0.0 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 |
+| KL (A1/A2/FB) | 0/0/0 | 0/0/0 | 0.2/0.01/0.01 | 0.2/0.02/0.02 | 0.2/0.02/0.02 | 0.2/0.02/0.02 |
+| Data shuffle | No | No | No | **Yes** | Yes | Yes |
+| KL /3.0 bug | Yes | Yes | Yes | **Fixed** | Fixed | Fixed |
+| SSR | — | — | — | — | **buffer=64** | — |
+| Fb reward type | Transition | Transition | Transition | Transition | Transition | **Improvement** |
+| Freeze A1 | — | — | — | — | — | **100 steps** |
+| Status | Complete | Complete | Complete | Running | Crashed (NCCL) | Running |
+
+---
+
 ## v4: Drop Calibration, Drop Minimal Edit, Shuffle Data, KL Fix
 
 **Job**: `qwen-grpo-livr-9k-v4-downstream` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v4.yaml`
-**Date**: 2026-04-14 (running) | Base Qwen2.5-VL-7B (fresh) | Commit `999f684`
-**Output**: `/outputs/grpo_qwen_livr_v4/`
+**Date**: 2026-04-14 | Commit `999f684` → `0a2aa96` | **Output**: `/outputs/grpo_qwen_livr_v4/`
 
-**Changes from v3**: w_calibration=0.0, w_minimal_edit=0.0, shuffle training data, fix KL /3.0 normalization bug (A1 anchor was 3x weaker than intended).
+**Changes from v3**: w_calibration=0.0, w_minimal_edit=0.0, shuffle training data, fix KL /3.0 normalization bug (A1 anchor was 3x weaker than intended). NCCL timeout 1800s. Resumed from checkpoint-250 after NCCL crash at ~7%.
 
 ---
 
 ## v5: SSR (Selective Sample Replay)
 
 **Job**: `qwen-grpo-livr-9k-v5-ssr` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v5.yaml`
-**Date**: 2026-04-14 (pending GPUs) | Same as v4 + SSR (buffer=64, alpha=1.0)
+**Date**: 2026-04-14 | **Output**: `/outputs/grpo_qwen_livr_v5/`
+
+**Changes from v4**: +SSR (buffer=64, alpha=1.0, VL-Rethinker 2504.08837). Crashed at ~5% (NCCL timeout). **Deprioritized** — v3 analysis showed zero-var K-groups are only 2.8%, not the bottleneck.
 
 ---
 
-## v6 (planned): Improvement-Based Reward + SCoRe Stage I
+## v6: Improvement-Based Reward + SCoRe Stage I
 
-**Goal**: Fix the inverted advantage signal via two mathematically-motivated changes.
+**Job**: `qwen-grpo-livr-9k-v6-improve` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v6.yaml`
+**Date**: 2026-04-14 | Commit `d2011d9` | **Output**: `/outputs/grpo_qwen_livr_v6/`
 
-**Solution 1: Improvement-based feedback reward** (Critique-GRPO, 2506.03106)
+**Changes from v4**: Two mathematically-motivated fixes for the inverted WR advantage.
 
-Replace transition-shaped downstream with `R_improve = correctness(A2) - correctness(A1)`:
+1. **Improvement-based feedback reward** (Critique-GRPO, 2506.03106): `R_improve = R(A2) - R(A1)`. WR=+2, RW=-2, RR=0, WW=0. Group mean → 0, so WR/RW dominate the advantage instead of being diluted by RR/WW majority.
+2. **SCoRe Stage I** (2409.12917): Freeze A1 policy loss for 100 steps (A1 KL anchor preserved). Prevents A1 from co-adapting with F1 during initial learning.
 
-| Transition | Current R_downstream | New R_improve |
-|---|---|---|
-| WR | +3.0 | **+2.0** |
-| RW | -1.5 | **-2.0** |
-| RR | +1.0 | **0.0** |
-| WW | -1.0 | **0.0** |
+**Hypothesis**: v3 analysis showed WR mean advantage was -0.054 (GRPO pushes AWAY from correction). The improvement reward directly fixes this by zeroing out RR/WW. If WR advantage flips positive, self-correction should improve.
 
-RR and WW both → 0, so group mean converges to 0, and WR/RW dominate the advantage. This directly fixes the inverted advantage problem.
-
-**Solution 2: SCoRe Stage I — freeze A1 gradients** (SCoRe, 2409.12917)
-
-During first M steps (configurable), zero out A1 policy loss (keep A1 KL). This prevents A1 from co-adapting with F1, giving the critic a stable target distribution.
-
-**Refs**: Critique-GRPO (2506.03106), SCoRe (2409.12917), Huang et al. (2310.01798), PRIME (2412.01981), S2R (2502.12853).
+**Refs**: Critique-GRPO (2506.03106), SCoRe (2409.12917), Huang et al. (2310.01798).
