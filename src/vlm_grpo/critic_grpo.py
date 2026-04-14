@@ -32,7 +32,9 @@ Usage:
 import json
 import logging
 import math
+import random
 import sys
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -79,6 +81,88 @@ class SelfReflectionTrainStepResult:
     def to_dict(self) -> dict:
         """Convert to dictionary for logging."""
         return asdict(self)
+
+
+@dataclass
+class SSREntry:
+    """A stored K-group for Selective Sample Replay (VL-Rethinker).
+
+    Stores a complete rollout result for one sample (all K trajectories)
+    along with the sample dict needed to rebuild prompts and images.
+
+    Attributes:
+        sample: Original sample dict (question, image_path, etc.)
+        rollout_result: Full SelfReflectionRolloutResult with K trajectories
+        fb_reward_std: Feedback reward std within this K-group
+    """
+
+    sample: dict
+    rollout_result: Any
+    fb_reward_std: float
+
+
+class SSRBuffer:
+    """Selective Sample Replay buffer (VL-Rethinker, arXiv:2504.08837).
+
+    Stores K-groups with non-zero feedback reward variance and replays
+    them when the current batch has zero-variance groups, ensuring the
+    model always receives gradient signal for feedback learning.
+
+    Args:
+        max_size: Maximum K-groups in the buffer (FIFO eviction)
+        alpha: Exponent for priority sampling (|std|^alpha)
+    """
+
+    def __init__(self, max_size: int = 64, alpha: float = 1.0) -> None:
+        self._buffer: deque[SSREntry] = deque(maxlen=max_size)
+        self.alpha = alpha
+
+    def store(self, entries: list[SSREntry]) -> None:
+        """Add non-zero-variance K-groups to the buffer.
+
+        Args:
+            entries: SSREntry objects to store
+        """
+        for entry in entries:
+            self._buffer.append(entry)
+
+    def sample(self, n: int) -> list[SSREntry]:
+        """Sample n entries WITHOUT replacement, weighted by |fb_reward_std|^alpha.
+
+        Args:
+            n: Number of entries to sample
+
+        Returns:
+            List of sampled SSREntry objects (unique)
+        """
+        if not self._buffer or n <= 0:
+            return []
+
+        n = min(n, len(self._buffer))
+        buf_list = list(self._buffer)
+        weights = [abs(e.fb_reward_std) ** self.alpha for e in buf_list]
+        total = sum(weights)
+        if total < 1e-8:
+            return random.sample(buf_list, n)
+
+        # Without-replacement weighted sampling
+        selected = []
+        available = list(range(len(buf_list)))
+        for _ in range(n):
+            remaining_w = [weights[i] for i in available]
+            r = random.random() * sum(remaining_w)
+            cumulative = 0.0
+            for idx, i in enumerate(available):
+                cumulative += weights[i]
+                if r <= cumulative:
+                    selected.append(buf_list[i])
+                    available.pop(idx)
+                    break
+
+        return selected
+
+    def __len__(self) -> int:
+        return len(self._buffer)
 
 
 class SelfReflectionGRPOTrainer:
@@ -151,6 +235,19 @@ class SelfReflectionGRPOTrainer:
         self.best_metric = float("inf") if config.early_stopping.mode == "min" else float("-inf")
         self.patience_counter = 0
 
+        # Per-rank trajectory log for feedback preference data extraction.
+        # Written by ALL ranks (not just rank 0), so all 9K questions are saved.
+        self._trajectory_log = None
+
+        # Selective Sample Replay buffer (VL-Rethinker)
+        if getattr(config, "use_ssr", False):
+            self.ssr_buffer: Optional[SSRBuffer] = SSRBuffer(
+                max_size=getattr(config, "ssr_buffer_size", 64),
+                alpha=getattr(config, "ssr_alpha", 1.0),
+            )
+        else:
+            self.ssr_buffer = None
+
     def train(
         self,
         train_dataset: list[dict],
@@ -173,6 +270,12 @@ class SelfReflectionGRPOTrainer:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         is_main = self.accelerator is None or self.accelerator.is_main_process
+
+        # Open per-rank trajectory log (all ranks write, not just rank 0)
+        rank = getattr(self.accelerator, "process_index", 0) if self.accelerator else 0
+        traj_log_path = output_dir / f"trajectories_rank{rank}.jsonl"
+        self._trajectory_log = open(traj_log_path, "a")
+        logger.info(f"Trajectory log: {traj_log_path}")
 
         total_steps = math.ceil(len(train_dataset) / batch_size) * num_epochs
         logger.info(f"Starting self-reflection GRPO training: {total_steps} rollout steps")
@@ -356,6 +459,10 @@ class SelfReflectionGRPOTrainer:
             self._save_checkpoint(output_dir / "final")
         logger.info(f"Training complete. Model saved to {output_dir / 'final'}")
 
+        if self._trajectory_log is not None:
+            self._trajectory_log.close()
+            self._trajectory_log = None
+
         return all_metrics
 
     def train_step(self, batch: list[dict]) -> SelfReflectionTrainStepResult:
@@ -480,20 +587,52 @@ class SelfReflectionGRPOTrainer:
                         logger.info(f"  fb_components: {fb.components}")
                 logger.info("=" * 80)
 
+            # Save trajectory data to per-rank JSONL for feedback preference
+            # extraction. Unlike logger output, this is written by ALL ranks.
+            if self._trajectory_log is not None:
+                for j in range(k):
+                    rb = result.response_breakdowns[j] if result.response_breakdowns else None
+                    fb = result.feedback_breakdowns[j] if result.feedback_breakdowns else None
+                    record = {
+                        "question": result.question,
+                        "image_path": result.image_path,
+                        "ground_truth": result.ground_truth,
+                        "answer_type": result.answer_type,
+                        "dataset_name": result.dataset_name,
+                        "a1_text": result.answer1s[j],
+                        "f1_text": result.feedbacks[j],
+                        "a2_text": result.answer2s[j],
+                        "a1_correct": rb.a1_correct if rb else None,
+                        "a2_correct": rb.a2_correct if rb else None,
+                        "a2_extracted": rb.a2_extracted if rb else None,
+                        "resp_reward": result.response_rewards[j],
+                        "fb_reward": result.feedback_rewards[j],
+                        "resp_components": rb.components if rb else {},
+                        "fb_components": fb.components if fb else {},
+                        "global_step": self.global_step,
+                    }
+                    self._trajectory_log.write(json.dumps(record) + "\n")
+                self._trajectory_log.flush()
+
             image = None
             for s in batch:
                 if s.get("question", "").replace("<image>", "").strip() == result.question:
                     image = s.get("image")
                     break
 
+            use_tags = self.config.rollout.use_think_answer_tags
             for a1, f1, a2 in zip(result.answer1s, result.feedbacks, result.answer2s):
-                a1_prompt = build_initial_answer_prompt(result.question)
+                a1_prompt = build_initial_answer_prompt(
+                    result.question, use_think_answer_tags=use_tags
+                )
                 a1_full = build_prompt_with_completion(a1_prompt, a1)
 
                 f1_prompt = build_critic_prompt(result.question, a1, model_type=model_type)
                 f1_full = build_prompt_with_completion(f1_prompt, f1)
 
-                a2_prompt = build_refiner_prompt(result.question, a1, f1)
+                a2_prompt = build_refiner_prompt(
+                    result.question, a1, f1, use_think_answer_tags=use_tags
+                )
                 a2_full = build_prompt_with_completion(a2_prompt, a2)
 
                 trajectory_data.append(
@@ -514,6 +653,75 @@ class SelfReflectionGRPOTrainer:
             )
 
         k = self.config.rollout.k_samples
+
+        # SSR: store non-zero-variance K-groups, augment with replayed ones
+        if self.ssr_buffer is not None:
+            import torch as _torch
+
+            n_groups = len(rollout_results)
+            n_zero_var = 0
+            new_entries = []
+
+            for result in rollout_results:
+                fb_rews = result.feedback_rewards
+                # Only store complete K-groups (partial groups break advantage alignment)
+                if len(fb_rews) != k:
+                    continue
+                fb_std = _torch.tensor(fb_rews).std().item()
+                if fb_std > 1e-4:
+                    # Store image_path (not PIL Image) to avoid memory leak
+                    sample_copy = {"image_path": result.image_path,
+                                   "question": result.question}
+                    new_entries.append(SSREntry(
+                        sample=sample_copy,
+                        rollout_result=result,
+                        fb_reward_std=fb_std,
+                    ))
+                else:
+                    n_zero_var += 1
+
+            self.ssr_buffer.store(new_entries)
+
+            # Augment: for each zero-variance group, pull one from buffer
+            if n_zero_var > 0 and len(self.ssr_buffer) > 0:
+                replayed = self.ssr_buffer.sample(n_zero_var)
+                logger.info(
+                    f"  SSR: {n_zero_var}/{n_groups} zero-var fb groups, "
+                    f"replaying {len(replayed)} from buffer "
+                    f"(size={len(self.ssr_buffer)})"
+                )
+                use_tags = self.config.rollout.use_think_answer_tags
+                for entry in replayed:
+                    rr = entry.rollout_result
+                    all_resp_rewards.extend(rr.response_rewards)
+                    all_fb_rewards.extend(rr.feedback_rewards)
+
+                    # Reload image from path (not stored PIL reference)
+                    from vlm_grpo.data import load_image_safe
+                    image = load_image_safe(entry.sample["image_path"])
+
+                    for a1, f1, a2 in zip(
+                        rr.answer1s, rr.feedbacks, rr.answer2s
+                    ):
+                        a1_prompt = build_initial_answer_prompt(
+                            rr.question, use_think_answer_tags=use_tags
+                        )
+                        a1_full = build_prompt_with_completion(a1_prompt, a1)
+                        f1_prompt = build_critic_prompt(
+                            rr.question, a1, model_type=model_type
+                        )
+                        f1_full = build_prompt_with_completion(f1_prompt, f1)
+                        a2_prompt = build_refiner_prompt(
+                            rr.question, a1, f1,
+                            use_think_answer_tags=use_tags,
+                        )
+                        a2_full = build_prompt_with_completion(a2_prompt, a2)
+                        trajectory_data.append(
+                            {"a1_full": a1_full, "f1_full": f1_full,
+                             "a2_full": a2_full, "image": image}
+                        )
+
+                    rollout_results.append(rr)
 
         # Step 3: Group-relative advantages (computed once, frozen)
         resp_rewards_t = torch.tensor(all_resp_rewards, device=self.device)

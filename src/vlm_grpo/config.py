@@ -252,6 +252,9 @@ class SelfReflectionConfig:
     a2_kl_coeff: float = 1.0
     fb_kl_coeff: float = 1.0
     separate_turn_loss: bool = False
+    use_ssr: bool = False
+    ssr_buffer_size: int = 64
+    ssr_alpha: float = 1.0
     clip_range: float = 0.2
     loss_type: str = "grpo"
     freeze_vision_tower: bool = False

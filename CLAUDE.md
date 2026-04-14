@@ -178,6 +178,18 @@ All experiments are tracked in `experiments.md`. After each experiment:
 3. Note artifacts (output dir, wandb run, k8s yaml, commit)
 4. Keep entries concise — no config tables if same as prior experiment (just note diffs)
 
+## Cluster Operations
+
+**Helper Pod**: All `kubectl exec` commands for reading logs, checking outputs, or running scripts on the PVC must use the helper pod `vlm-jupyter-eval2`. If the pod is in `Completed` or `Failed` state, redeploy it first:
+
+```bash
+kubectl delete pod vlm-jupyter-eval2 --ignore-not-found
+kubectl apply -f /Users/kuntalkokate/svcl-projects/vlm-self-reflection/k8s/jupyter-1gpu-test.yaml
+kubectl wait --for=condition=Ready pod/vlm-jupyter-eval2 --timeout=120s
+```
+
+Do NOT exec into training job pods for log analysis — use the helper pod which has the shared PVC mounted at `/outputs/`.
+
 ## MUST Follow
 
 1. **Imports**: Standard library first, then third-party, then local. Alphabetized within groups.

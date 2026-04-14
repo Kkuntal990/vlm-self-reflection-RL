@@ -136,6 +136,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--a2_kl_coeff", type=float, default=1.0)
     parser.add_argument("--fb_kl_coeff", type=float, default=1.0)
     parser.add_argument("--separate_turn_loss", action="store_true")
+    parser.add_argument("--use_ssr", action="store_true",
+                        help="Enable Selective Sample Replay (VL-Rethinker)")
+    parser.add_argument("--ssr_buffer_size", type=int, default=64)
+    parser.add_argument("--ssr_alpha", type=float, default=1.0)
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument(
         "--num_inner_epochs",
@@ -316,6 +320,9 @@ def main() -> None:
         a2_kl_coeff=args.a2_kl_coeff,
         fb_kl_coeff=args.fb_kl_coeff,
         separate_turn_loss=args.separate_turn_loss,
+        use_ssr=args.use_ssr,
+        ssr_buffer_size=args.ssr_buffer_size,
+        ssr_alpha=args.ssr_alpha,
         clip_range=args.clip_range,
         loss_type=args.loss_type,
         freeze_vision_tower=args.freeze_vision_tower,
