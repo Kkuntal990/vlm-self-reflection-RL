@@ -948,6 +948,14 @@ class SelfReflectionGRPOTrainer:
 
                         a1_loss = -torch.min(a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]).mean()
                         a2_loss = -torch.min(a2_ratio * a2_advantages[ti], a2_clipped * a2_advantages[ti]).mean()
+
+                        # SCoRe Stage I: freeze A1 policy loss for initial steps.
+                        # A1 KL anchor is kept (computed separately below) so A1
+                        # stays near the reference distribution while F1/A2 learn.
+                        freeze_a1 = getattr(self.config, "freeze_a1_steps", 0)
+                        if freeze_a1 > 0 and self.global_step < freeze_a1:
+                            a1_loss = torch.zeros_like(a1_loss)
+
                         traj_resp_loss = a1_loss + a2_loss
 
                         # Track clip fraction (combined)

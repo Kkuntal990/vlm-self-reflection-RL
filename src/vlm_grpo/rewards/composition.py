@@ -1012,18 +1012,15 @@ def compute_feedback_reward_breakdown(
     answer_type: str,
     choices: str,
     weights: Any,
+    use_improvement_reward: bool = False,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
-    Four components:
-    1. Downstream-aware (did F1 help A2?) — 4 discrete values
-    2. SCoRe correction bonus (arXiv:2409.12917) — rewards the delta
-       between A2 and A1 correctness. Breaks RR/WW ties.
-    3. Calibration — keyword-based assessment of whether F1 correctly
-       identifies A1 correctness. Kept at small weight as a tiebreaker
-       since feedback TEXT varies across K trajectories even when
-       correctness outcomes are identical.
-    4. Format — is F1 substantive?
+    Components:
+    1. Downstream-aware (did F1 help A2?) — transition-shaped or improvement-based
+    2. Calibration — keyword-based assessment (variance-breaking tiebreaker)
+    3. Format — is F1 substantive?
+    4. Tag penalty — punish F1 using think/answer tags
 
     Args:
         feedback_text: Feedback text from the critic
@@ -1033,6 +1030,8 @@ def compute_feedback_reward_breakdown(
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         choices: MCQ choices string
         weights: FeedbackRewardWeights instance
+        use_improvement_reward: If True, use R(A2)-R(A1) instead of
+            transition-shaped downstream constants
 
     Returns:
         TrajectoryFeedbackRewardBreakdown with all component scores
@@ -1050,11 +1049,16 @@ def compute_feedback_reward_breakdown(
     format_valid = r_format >= 0
 
     # Downstream-aware reward (computed directly, no extra verify_answer call)
-    # For deterministic types: stronger WR reward to incentivize corrective feedback.
     from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
 
     if not feedback_text.strip():
         r_downstream = 0.0
+    elif use_improvement_reward:
+        # Improvement-based: R(A2) - R(A1) ∈ {-2, 0, +2}
+        # RR=0, WW=0, WR=+2, RW=-2. Group mean → 0, WR/RW dominate advantage.
+        r_a1 = 1.0 if a1_correct else -1.0
+        r_a2 = 1.0 if a2_correct else -1.0
+        r_downstream = r_a2 - r_a1
     elif answer_type in DETERMINISTIC_TYPES:
         if a1_correct:
             r_downstream = 1.0 if a2_correct else -1.5

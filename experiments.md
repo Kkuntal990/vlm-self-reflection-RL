@@ -68,16 +68,103 @@
 
 ---
 
-## v4 (planned): Effectiveness Reward + Reflection-Focused Training
+## v3 Final Analysis: The Real Problem
 
-**Goal**: Fix sycophantic critic via outcome-based feedback reward + remove conservative bias.
+**Job**: `qwen-grpo-livr-9k-v3-score` | **Complete**: 25h, 18,000 trajectories (2,250 samples)
 
-**Changes**:
-1. Replace keyword calibration with effectiveness indicator: WR=+0.5, RR=+0.25, WW=0.0, RW=-0.25 (SRPO 2506.01713)
-2. Remove minimal_edit reward (w=0.0) — stops rewarding "don't change" behavior
-3. Add SSR (Selective Sample Replay) for zero-variance K-groups (VL-Rethinker 2504.08837)
-4. Reward only F1 tokens when A2 succeeds — isolate feedback learning signal (Reflect/Retry/Reward 2505.24726)
+| Metric | First 10% | Last 10% | Delta |
+|--------|-----------|----------|-------|
+| A1 Acc | 46.2% | 49.5% | +3.3pp |
+| A2 Acc | 45.0% | 46.1% | +1.1pp |
+| WR | 5.8% | 6.1% | +0.3pp |
+| RW | 7.0% | 9.5% | +2.5pp |
+| Resp Reward | 0.855 | 0.916 | +0.06 |
+| FB Reward | -0.083 | 0.020 | +0.10 |
+| F1 Tag Leak | 0.2% | 0.4% | ~0 |
 
-**Future**: Pairwise preference GRPO warm-up (LLaVA-Critic-R1 2509.00676), rollout recombination (Octopus 2602.08503).
+### Key Findings (overturning prior assumptions)
 
-**Refs**: SRPO (2506.01713), VL-Rethinker (2504.08837), Reflect/Retry/Reward (2505.24726), LLaVA-Critic-R1 (2509.00676), Octopus (2602.08503), Critique-GRPO (2506.03106), S2R (2502.12853).
+**1. F1 is NOT overwhelmingly sycophantic.** When A1 is wrong (n=9,273): F1 honest 63.0%, sycophantic 27.7%, neutral 9.3%. The critic identifies errors more often than not.
+
+**2. Zero-variance K-groups are NOT the bottleneck.** Only 2.8% of fb K-groups have zero variance. Mean fb reward gap within groups = 6.07. Gradient signal exists.
+
+**3. Honest critique does NOT lead to correction — it makes things WORSE.**
+
+```
+P(A2 correct | A1 wrong, F1 honest)      =  8.1%
+P(A2 correct | A1 wrong, F1 sycophantic) = 15.2%
+Lift from honest F1 = -7.1pp
+```
+
+This is the **verification-generation gap**. For MCQ with C=4 choices, the model that chose (B) wrongly gains zero information from knowing "(B) is wrong" about which of (A)/(C)/(D) is correct. Honest critique sends the model into confused re-reasoning that fails 91.9% of the time.
+
+**4. GRPO advantage is INVERTED for WR trajectories.**
+
+| Transition | Mean fb_reward | Mean advantage | Positive adv % |
+|---|---|---|---|
+| WR (want highest) | 0.084 | **-0.054** | 44.8% |
+| RW (want lowest) | 0.054 | **+0.014** | 45.4% |
+
+WR has **negative mean advantage** — GRPO is pushing the policy AWAY from corrective feedback. Only 25.8% of WR trajectories beat all WW trajectories in their K-group.
+
+**5. The sycophancy gradient points the wrong way.**
+
+```
+R(sycophantic F1) ≈ 0.152·(+3) + 0.848·(-1) = -0.392
+R(critical F1)    ≈ 0.081·(+3) + 0.919·(-1) = -0.676
+∂E[R_fb]/∂s = R(syco) - R(crit) = +0.284 > 0
+```
+
+The policy has positive gradient toward MORE sycophancy because P(WR|syco)=15.2% > P(WR|honest)=8.1%.
+
+### Root Cause
+
+The transition-shaped downstream reward {WR:+3, RR:+1, WW:-1, RW:-1.5} is dominated by RR(+1) and WW(-1) within each K-group. These make the group mean noisy around 0, and a lone WR(+3) gets diluted. The honest_WR vs syco_WW fb_reward gap is only **+0.029** — essentially zero signal.
+
+### Mathematical Framework
+
+The core problem is that R_downstream is a function of the **transition (a1_correct, a2_correct)**, and within a K-group where all 8 trajectories share the same question, the transitions are highly correlated. The advantage `Â_k = R_k - μ_G` is dominated by the majority transition type, not the minority WR.
+
+The improvement-based reward `R_improve = R(A2) - R(A1)` fixes this by giving RR=0 and WW=0, making the group mean converge to 0 and letting WR(+2) and RW(-2) dominate the advantage.
+
+---
+
+## v4: Drop Calibration, Drop Minimal Edit, Shuffle Data, KL Fix
+
+**Job**: `qwen-grpo-livr-9k-v4-downstream` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v4.yaml`
+**Date**: 2026-04-14 (running) | Base Qwen2.5-VL-7B (fresh) | Commit `999f684`
+**Output**: `/outputs/grpo_qwen_livr_v4/`
+
+**Changes from v3**: w_calibration=0.0, w_minimal_edit=0.0, shuffle training data, fix KL /3.0 normalization bug (A1 anchor was 3x weaker than intended).
+
+---
+
+## v5: SSR (Selective Sample Replay)
+
+**Job**: `qwen-grpo-livr-9k-v5-ssr` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v5.yaml`
+**Date**: 2026-04-14 (pending GPUs) | Same as v4 + SSR (buffer=64, alpha=1.0)
+
+---
+
+## v6 (planned): Improvement-Based Reward + SCoRe Stage I
+
+**Goal**: Fix the inverted advantage signal via two mathematically-motivated changes.
+
+**Solution 1: Improvement-based feedback reward** (Critique-GRPO, 2506.03106)
+
+Replace transition-shaped downstream with `R_improve = correctness(A2) - correctness(A1)`:
+
+| Transition | Current R_downstream | New R_improve |
+|---|---|---|
+| WR | +3.0 | **+2.0** |
+| RW | -1.5 | **-2.0** |
+| RR | +1.0 | **0.0** |
+| WW | -1.0 | **0.0** |
+
+RR and WW both → 0, so group mean converges to 0, and WR/RW dominate the advantage. This directly fixes the inverted advantage problem.
+
+**Solution 2: SCoRe Stage I — freeze A1 gradients** (SCoRe, 2409.12917)
+
+During first M steps (configurable), zero out A1 policy loss (keep A1 KL). This prevents A1 from co-adapting with F1, giving the critic a stable target distribution.
+
+**Refs**: Critique-GRPO (2506.03106), SCoRe (2409.12917), Huang et al. (2310.01798), PRIME (2412.01981), S2R (2502.12853).

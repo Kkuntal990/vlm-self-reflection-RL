@@ -532,6 +532,7 @@ def generate_self_reflection_rollout(
                 answer_type=answer_types[i],
                 choices=choices_list[i],
                 weights=feedback_weights,
+                use_improvement_reward=getattr(config, "use_improvement_reward", False),
             )
             result.response_rewards.append(resp_bd.total_reward)
             result.feedback_rewards.append(fb_bd.total_reward)
