@@ -14,13 +14,31 @@ Usage:
 
 import re
 
-# Feedback calibration keyword patterns
+# Feedback calibration keyword patterns.
+#
+# Hedged-positive patterns ("partially correct", "on the right track, but")
+# are counted as NEGATIVE because they precede corrections in >90% of cases.
+# These are checked first and excluded from positive matching.
+_HEDGED_POSITIVE_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\bpartially correct\b",
+        r"\bmostly correct\b",
+        r"\bmostly accurate\b",
+        r"\bon the right track\b",
+        r"\bclose\b.*\bbut\b",
+        r"\bcorrect\b.*\bbut\b.*\b(?:should|could|need|better|more|however)\b",
+        r"\bcorrect answer (?:is|should be|would be)\b",
+        r"\bright answer (?:is|should be|would be)\b",
+    ]
+]
+
 _POSITIVE_FEEDBACK_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
         r"\bcorrect\b",
         r"\baccurate\b",
-        r"\bright\b",
+        r"\b(?:you(?:'re| are)|that(?:'s| is)) right\b",
         r"\bno change needed\b",
         r"\bno changes? (?:are |is )?(?:needed|necessary|required)\b",
         r"\bwell done\b",

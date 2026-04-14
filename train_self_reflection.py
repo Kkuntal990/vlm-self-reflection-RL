@@ -77,6 +77,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to validation JSONL",
     )
     parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.0,
+        help="Fraction of training data to hold out for validation (e.g. 0.1). "
+        "Ignored when --val_dataset_path is provided.",
+    )
+    parser.add_argument(
         "--image_base_dir",
         type=str,
         default="/outputs/image_base",
@@ -181,18 +188,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_a2_correctness", type=float, default=1.0)
     parser.add_argument("--w_no_regression", type=float, default=2.0)
     parser.add_argument("--w_a2_format", type=float, default=0.15)
-    parser.add_argument("--w_minimal_edit", type=float, default=0.3)
+    parser.add_argument("--w_minimal_edit", type=float, default=0.0)
 
     # Feedback reward weights
     parser.add_argument("--w_downstream", type=float, default=2.0)
-    parser.add_argument("--w_calibration", type=float, default=0.2)
+    parser.add_argument("--w_calibration", type=float, default=0.0)
     parser.add_argument("--w_fb_format", type=float, default=0.15)
     parser.add_argument("--w_fb_tag_penalty", type=float, default=0.0)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--val_check_interval", type=int, default=500)
 
     # Resume from checkpoint
     parser.add_argument(
@@ -320,7 +326,7 @@ def main() -> None:
         sanity_check_samples=args.sanity_check_samples,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        val_check_interval=args.val_check_interval,
+        val_check_interval=args.save_steps,
         seed=args.seed,
     )
 
@@ -356,6 +362,13 @@ def main() -> None:
     else:
         logger.info(f"Training dataset: {len(train_dataset)} samples")
 
+    # Shuffle training data to avoid task-type clustering.
+    # Fixed seed ensures identical order across accelerate processes.
+    import random
+
+    random.Random(args.seed).shuffle(train_dataset)
+    logger.info("Shuffled training dataset")
+
     val_dataset = None
     if args.val_dataset_path:
         val_dataset = load_self_reflection_dataset(
@@ -365,6 +378,14 @@ def main() -> None:
             max_pixels=img_max_pixels,
         )
         logger.info(f"Validation dataset: {len(val_dataset)} samples")
+    elif args.val_split > 0:
+        n_val = max(1, int(len(train_dataset) * args.val_split))
+        val_dataset = train_dataset[-n_val:]
+        train_dataset = train_dataset[:-n_val]
+        logger.info(
+            f"Split: {len(train_dataset)} train, {len(val_dataset)} val "
+            f"({args.val_split:.0%} held out)"
+        )
 
     # Sanity check mode (main process only)
     if args.sanity_check_samples > 0:

@@ -1066,10 +1066,9 @@ def compute_feedback_reward_breakdown(
         else:
             r_downstream = 2.0 if a2_correct else -1.0
 
-    # Calibration: varies across K trajectories because each generates
-    # different feedback TEXT even for the same correctness outcome.
-    # Key variance-breaking component — downstream alone has only 4
-    # discrete values, causing 50-75% zero-variance K-groups.
+    # Calibration: keyword-based assessment of whether F1 correctly
+    # identifies A1 correctness. Used as variance-breaking tiebreaker
+    # since feedback TEXT varies across K trajectories.
     r_calibration = compute_feedback_calibration_reward(feedback_text, a1_correct)
 
     # Tag leakage penalty: punish F1 that uses <think>/<answer> tags

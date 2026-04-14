@@ -147,7 +147,7 @@ class ResponseRewardWeights:
     w_a2_correctness: float = 1.0
     w_no_regression: float = 2.0
     w_a2_format: float = 0.15
-    w_minimal_edit: float = 0.3
+    w_minimal_edit: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -163,16 +163,17 @@ class FeedbackRewardWeights:
               + w_format * R_format
 
     Attributes:
-        w_downstream: Weight for downstream-aware reward (dominant)
-        w_calibration: Weight for calibration tiebreaker (keyword-based
-            assessment of whether F1 correctly identifies A1 correctness).
-            Kept small to avoid formulaic language but breaks reward ties
-            across K trajectories since feedback text varies.
-        w_format: Weight for format compliance
+        w_downstream: Weight for downstream-aware reward (dominant).
+            Transition-shaped: WR=+3, RR=+1, RW=-1.5, WW=-1.
+        w_calibration: Weight for keyword-based calibration. Disabled by
+            default (0.0) — literature consensus is outcome-based rewards
+            only for feedback. Kept in code for experimentation.
+        w_format: Weight for format compliance (word count penalty)
+        w_tag_penalty: Weight for F1 tag leakage penalty
     """
 
     w_downstream: float = 2.0
-    w_calibration: float = 0.2
+    w_calibration: float = 0.0
     w_format: float = 0.15
     w_tag_penalty: float = 0.5
 
