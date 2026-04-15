@@ -255,6 +255,8 @@ spec:
             secretKeyRef:
               name: wandb-api-key
               key: key
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_livr_v6/checkpoint-250"
         - name: WANDB_RUN_NAME
           value: "grpo-livr-9k-v6-improve"
 
