@@ -94,6 +94,7 @@ class RolloutConfig:
     batch_size: int = 8
     use_think_answer_tags: bool = False
     use_improvement_reward: bool = False
+    reward_shaping_alpha: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -257,6 +258,7 @@ class SelfReflectionConfig:
     ssr_buffer_size: int = 64
     ssr_alpha: float = 1.0
     use_improvement_reward: bool = False
+    reward_shaping_alpha: float = 0.0
     freeze_a1_steps: int = 0
     clip_range: float = 0.2
     loss_type: str = "grpo"

@@ -135,19 +135,19 @@ The improvement-based reward `R_improve = R(A2) - R(A1)` fixes this by giving RR
 
 Quick reference for what changed between versions. All share: Qwen2.5-VL-7B, LIVR 9K MCQ, K=8, dr_grpo, LoRA r=64, separate_turn_loss, 4x A100.
 
-| | v1 | v2 | v3 | v4 | v5 | v6 |
-|---|---|---|---|---|---|---|
-| **Key change** | Baseline + tags | Tag penalty | SCoRe KL | Drop cal/edit, shuffle | SSR buffer | Improve reward + freeze A1 |
-| w_calibration | 0.2 | 0.2 | 1.0 | **0.0** | 0.0 | 0.0 |
-| w_minimal_edit | 0.3 | 0.3 | 0.3 | **0.0** | 0.0 | 0.0 |
-| w_tag_penalty | 0.0 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 |
-| KL (A1/A2/FB) | 0/0/0 | 0/0/0 | 0.2/0.01/0.01 | 0.2/0.02/0.02 | 0.2/0.02/0.02 | 0.2/0.02/0.02 |
-| Data shuffle | No | No | No | **Yes** | Yes | Yes |
-| KL /3.0 bug | Yes | Yes | Yes | **Fixed** | Fixed | Fixed |
-| SSR | — | — | — | — | **buffer=64** | — |
-| Fb reward type | Transition | Transition | Transition | Transition | Transition | **Improvement** |
-| Freeze A1 | — | — | — | — | — | **100 steps** |
-| Status | Complete | Complete | Complete | Running | Crashed (NCCL) | Running |
+| | v1 | v2 | v3 | v4 | v5 | v6/v6b | v7 |
+|---|---|---|---|---|---|---|---|
+| **Key change** | Baseline + tags | Tag penalty | SCoRe KL | Drop cal/edit, shuffle | SSR buffer | Improve reward + freeze A1 | **Shaped fb reward** |
+| w_calibration | 0.2 | 0.2 | 1.0 | **0.0** | 0.0 | 0.0 | 0.0 |
+| w_minimal_edit | 0.3 | 0.3 | 0.3 | **0.0** | 0.0 | 0.0 | 0.0 |
+| w_tag_penalty | 0.0 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 |
+| KL (A1/A2/FB) | 0/0/0 | 0/0/0 | 0.2/0.01/0.01 | 0.2/0.02/0.02 | 0.2/0.02/0.02 | **20/0.02/0.02** | 20/0.02/0.02 |
+| Data shuffle | No | No | No | **Yes** | Yes | Yes | Yes |
+| KL /3.0 bug | Yes | Yes | Yes | **Fixed** | Fixed | Fixed | Fixed |
+| SSR | — | — | — | — | **buffer=64** | — | — |
+| Fb reward type | Transition | Transition | Transition | Transition | Transition | **Improvement** | **Shaped α=5** |
+| Freeze A1 | — | — | — | — | — | **280 steps** | 280 steps |
+| Status | Complete | Incomplete | Complete | Running | Crashed | **Running** | Planned |
 
 ---
 
@@ -182,3 +182,40 @@ Quick reference for what changed between versions. All share: Qwen2.5-VL-7B, LIV
 **Hypothesis**: v3 analysis showed WR mean advantage was -0.054 (GRPO pushes AWAY from correction). The improvement reward directly fixes this by zeroing out RR/WW. If WR advantage flips positive, self-correction should improve.
 
 **Refs**: Critique-GRPO (2506.03106), SCoRe (2409.12917), Huang et al. (2310.01798).
+
+### v6b: Strong A1 KL + 50% Freeze
+
+v6 crashed (NCCL). v6b re-ran with stronger settings: A1 KL=1000x (effective 20.0), freeze=280 steps (50%), fresh start. Output: `/outputs/grpo_qwen_livr_v6b/`.
+
+| Metric | First 10% | Latest 10% | Delta |
+|--------|-----------|------------|-------|
+| A1 Acc | 43.9% | 46.5% | +2.6pp |
+| A2 Acc | 41.4% | 44.7% | +3.3pp |
+| WR rate | 6.4% | 7.4% | +1.0pp |
+| RW rate | 13.8% | 12.3% | -1.4pp |
+| Entropy | 2.026 | 1.956 | -0.07 |
+
+**Freeze vs post-freeze**: RW dropped 14.3%→11.8% (good), WR flat 7.9%→7.5% (not improving). No A1 spike after unfreeze — strong KL anchor works. A2-A1 gap narrowing (-2.3pp→-1.6pp).
+
+**Root cause of flat WR**: Pure improvement reward (RR=0, WW=0) gives 33.6% dead K-groups and no RR stabilization signal. RW gradient (0.143) is 30% stronger than WR gradient (0.110), so the policy reduces regression without learning to correct. Need shaped reward to add RR signal and center group mean to 0.
+
+---
+
+## v7: SCoRe-Style Shaped Feedback Reward (Planned)
+
+**Changes from v6b**: Replace pure improvement `R(A2)-R(A1)` with shaped `R(A2) + α×(R(A2)-R(A1))`, α=5.
+
+```
+                 v6b (improvement)    v7 (shaped α=5)
+F1 reward WR:         +2                  +11
+F1 reward RW:         -2                  -11
+F1 reward RR:          0                   +1  ← new stabilization signal
+F1 reward WW:          0                   -1  ← new penalty
+Dead K-groups:       33.6%                0.3%
+```
+
+**Mathematical justification**: With v6b's improvement reward, E[μ_group]=-0.038 and |∇_RW|/|∇_WR|=1.30 (RW gradient 30% stronger). With shaped α=5, E[μ_group]≈0 and ∇_WR becomes dominant because RR(+1) and WW(-1) no longer dilute the mean.
+
+**A2 response reward unchanged**: no_regression stays (RR=+3, RW=-5, WR=+7, WW=-1). Analysis confirmed no_regression is necessary — without it, WR=RW=0 in A2's advantage and A2 loses all self-correction signal. Shaped A2 reward deferred to v8 (marginal benefit: WR advantage +6→+7, 17% improvement).
+
+**Architecture**: Same as v6b (separate_turn_loss, A1 KL=1000x, freeze=280 steps). Only the F1 reward function changes. New flag: `--reward_shaping_alpha 5.0`.

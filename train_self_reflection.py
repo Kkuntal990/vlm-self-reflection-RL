@@ -136,14 +136,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--a2_kl_coeff", type=float, default=1.0)
     parser.add_argument("--fb_kl_coeff", type=float, default=1.0)
     parser.add_argument("--separate_turn_loss", action="store_true")
-    parser.add_argument("--use_ssr", action="store_true",
-                        help="Enable Selective Sample Replay (VL-Rethinker)")
+    parser.add_argument(
+        "--use_ssr", action="store_true", help="Enable Selective Sample Replay (VL-Rethinker)"
+    )
     parser.add_argument("--ssr_buffer_size", type=int, default=64)
     parser.add_argument("--ssr_alpha", type=float, default=1.0)
-    parser.add_argument("--use_improvement_reward", action="store_true",
-                        help="Use R(A2)-R(A1) improvement reward for F1 (Critique-GRPO)")
-    parser.add_argument("--freeze_a1_steps", type=int, default=0,
-                        help="Freeze A1 policy loss for N steps (SCoRe Stage I)")
+    parser.add_argument(
+        "--use_improvement_reward",
+        action="store_true",
+        help="Use R(A2)-R(A1) improvement reward for F1 (Critique-GRPO)",
+    )
+    parser.add_argument(
+        "--reward_shaping_alpha",
+        type=float,
+        default=0.0,
+        help="SCoRe-style shaped reward alpha: R(A2)+α*(R(A2)-R(A1)). "
+        "Overrides --use_improvement_reward when > 0.",
+    )
+    parser.add_argument(
+        "--freeze_a1_steps",
+        type=int,
+        default=0,
+        help="Freeze A1 policy loss for N steps (SCoRe Stage I)",
+    )
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument(
         "--num_inner_epochs",
@@ -304,6 +319,7 @@ def main() -> None:
         batch_size=args.rollout_batch_size or args.per_device_train_batch_size,
         use_think_answer_tags=args.use_think_answer_tags,
         use_improvement_reward=args.use_improvement_reward,
+        reward_shaping_alpha=args.reward_shaping_alpha,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -332,6 +348,7 @@ def main() -> None:
         ssr_buffer_size=args.ssr_buffer_size,
         ssr_alpha=args.ssr_alpha,
         use_improvement_reward=args.use_improvement_reward,
+        reward_shaping_alpha=args.reward_shaping_alpha,
         freeze_a1_steps=args.freeze_a1_steps,
         clip_range=args.clip_range,
         loss_type=args.loss_type,

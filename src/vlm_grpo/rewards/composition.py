@@ -1013,6 +1013,7 @@ def compute_feedback_reward_breakdown(
     choices: str,
     weights: Any,
     use_improvement_reward: bool = False,
+    reward_shaping_alpha: float = 0.0,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
@@ -1053,6 +1054,14 @@ def compute_feedback_reward_breakdown(
 
     if not feedback_text.strip():
         r_downstream = 0.0
+    elif reward_shaping_alpha > 0:
+        # SCoRe-style shaped reward: R(A2) + α × (R(A2) - R(A1))
+        # With α=5: WR=+11, RW=-11, RR=+1, WW=-1
+        # Adds RR stabilization signal (+1) missing from pure improvement,
+        # and eliminates ~33% dead K-groups (RR≠WW, always has variance).
+        r_a1 = 1.0 if a1_correct else -1.0
+        r_a2 = 1.0 if a2_correct else -1.0
+        r_downstream = r_a2 + reward_shaping_alpha * (r_a2 - r_a1)
     elif use_improvement_reward:
         # Improvement-based: R(A2) - R(A1) ∈ {-2, 0, +2}
         # RR=0, WW=0, WR=+2, RW=-2. Group mean → 0, WR/RW dominate advantage.
