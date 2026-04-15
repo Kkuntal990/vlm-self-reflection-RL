@@ -47,7 +47,6 @@ spec:
           accelerate launch \
             --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
             --num_processes=${NUM_GPUS:-4} \
-            --ddp_timeout 1800 \
             train_self_reflection.py \
             --model_id "${MODEL_ID}" \
             --model_type qwen2vl \

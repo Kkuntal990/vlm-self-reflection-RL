@@ -237,14 +237,17 @@ def main() -> None:
     """Main training entry point."""
     args = parse_args()
 
-    from accelerate import Accelerator
+    from datetime import timedelta
+
+    from accelerate import Accelerator, InitProcessGroupKwargs
 
     from vlm_grpo.utils import set_seed, setup_environment
 
     setup_environment()
     set_seed(args.seed)
 
-    accelerator = Accelerator()
+    ddp_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=1800))
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
     # Suppress verbose logging on non-main processes
     if not accelerator.is_main_process:
