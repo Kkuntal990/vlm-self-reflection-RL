@@ -109,7 +109,7 @@ spec:
         - name: DATASET_PATH
           value: "/outputs/livr_data/livr_perception_mcq.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v6"
+          value: "/outputs/grpo_qwen_livr_v6b"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -119,7 +119,7 @@ spec:
         - name: KL_COEFF
           value: "0.02"
         - name: A1_KL_COEFF
-          value: "10.0"
+          value: "1000.0"
         - name: A2_KL_COEFF
           value: "1.0"
         - name: FB_KL_COEFF
@@ -185,7 +185,7 @@ spec:
 
         # SCoRe Stage I: freeze A1 policy loss for N steps
         - name: FREEZE_A1_STEPS
-          value: "100"
+          value: "280"
 
         # v6 changes: improvement reward, no calibration, no minimal_edit
         - name: W_A1_CORRECTNESS
@@ -255,10 +255,8 @@ spec:
             secretKeyRef:
               name: wandb-api-key
               key: key
-        - name: RESUME_CHECKPOINT
-          value: "/outputs/grpo_qwen_livr_v6/checkpoint-250"
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v6-improve"
+          value: "grpo-livr-9k-v6b-strongkl"
 
         resources:
           limits:
