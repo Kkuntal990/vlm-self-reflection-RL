@@ -29,19 +29,21 @@
 **Date**: 2026-04-12–13 | Base Qwen2.5-VL-7B (fresh) | Commit `9f52e22`
 **Output**: `/outputs/grpo_qwen_livr_v2/` | **WandB**: `grpo-livr-9k-v2-tagfix`
 
-**Changes from v1**: F1 tag penalty (w=0.5, raw=-2.0), hardened critic prompt ("Do NOT use XML tags"), MCQ extraction bugfix.
+**Changes from v1**: F1 tag penalty (w=0.5, raw=-2.0), hardened critic prompt ("Do NOT use XML tags"), MCQ extraction bugfix (`extract_from_answer_tags` before MCQ matching).
 
-| Metric | Early 10% | Late 10% | Delta |
-|--------|-----------|----------|-------|
-| A1 Acc | 53.6% | 42.9% | -10.7pp |
-| A2 Acc | 54.5% | 41.1% | -13.4pp |
-| WR | 7.1% | 2.7% | -4.4pp |
-| RW | 6.2% | 4.5% | -1.7pp |
-| Entropy | 0.839 | 0.864 | +0.025 |
-| F1 Tag Leak | 0% | 0% | fixed |
+**Incomplete**: Killed at ~27% (4,958/18,000 trajectories, checkpoint-250 only). Prior table was misleading — compared v2's 27% endpoint against v1's 100% endpoint, with different extraction logic.
 
-**Worked**: F1 tag leakage completely eliminated (0/560). Tag penalty + hardened prompt sufficient.
-**Failed**: Accuracy degraded. WR declined 7.1%→2.7%. No separate turn loss = same WR stagnation as v1.
+| Metric | v1 Q5 (21-27%) | v2 Q5 (21-27%) | Notes |
+|--------|-----------------|-----------------|-------|
+| A1 Acc | 51.1% | 51.3% | Equivalent |
+| A2 Acc | 48.1% | 47.7% | Equivalent |
+| WR rate | 9.1% | 7.7% | Within noise |
+| RW rate | 14.7% | 14.4% | Within noise |
+| resp_rwd | 1.009 | 0.990 | Equivalent |
+| F1 Tag Leak | N/A | 0.0% | Fixed |
+
+**Worked**: F1 tag leakage completely eliminated (0%). Tag penalty + hardened prompt sufficient.
+**Not failed**: At equivalent training windows, v2 tracks v1 closely. The previously reported "accuracy degradation" was an artifact of (1) comparing different training percentages, and (2) the MCQ extraction bugfix changing how `a1_correct`/`a2_correct` were computed (v1 could match stray letters in `<think>` sections).
 
 ---
 

@@ -237,6 +237,11 @@ class SelfReflectionGRPOTrainer:
         self.best_metric = float("inf") if config.early_stopping.mode == "min" else float("-inf")
         self.patience_counter = 0
 
+        # EMA tracking for wandb metrics (per-step values are too noisy with
+        # only batch_size * K = 16 trajectories per step).
+        self._ema: dict[str, float] = {}
+        self._ema_alpha = 0.05  # ~20-step half-life
+
         # Per-rank trajectory log for feedback preference data extraction.
         # Written by ALL ranks (not just rank 0), so all 9K questions are saved.
         self._trajectory_log = None
@@ -249,6 +254,14 @@ class SelfReflectionGRPOTrainer:
             )
         else:
             self.ssr_buffer = None
+
+    def _update_ema(self, key: str, value: float) -> float:
+        """Update exponential moving average and return smoothed value."""
+        if key not in self._ema:
+            self._ema[key] = value
+        else:
+            self._ema[key] = (1 - self._ema_alpha) * self._ema[key] + self._ema_alpha * value
+        return self._ema[key]
 
     def train(
         self,
@@ -360,21 +373,17 @@ class SelfReflectionGRPOTrainer:
                         "reward/fb_std": step_result.rollout_metrics.get(
                             "sr/feedback_reward_std", 0
                         ),
-                        # Accuracy
+                        # Accuracy (raw)
                         "accuracy/a1": metrics.get("sr/a1_accuracy", 0),
                         "accuracy/a2": metrics.get("sr/a2_accuracy", 0),
-                        # Transition rates
+                        # Transition rates (raw)
                         "transitions/rr_rate": metrics.get("sr/rr_rate", 0),
                         "transitions/rw_rate": rw_rate,
                         "transitions/wr_rate": metrics.get("sr/wr_rate", 0),
                         "transitions/ww_rate": metrics.get("sr/ww_rate", 0),
                         # Training stability
-                        "stability/entropy": step_result.rollout_metrics.get(
-                            "sr/entropy", 0
-                        ),
-                        "stability/grad_norm": step_result.rollout_metrics.get(
-                            "sr/grad_norm", 0
-                        ),
+                        "stability/entropy": step_result.rollout_metrics.get("sr/entropy", 0),
+                        "stability/grad_norm": step_result.rollout_metrics.get("sr/grad_norm", 0),
                         "stability/frac_zero_std_resp": step_result.rollout_metrics.get(
                             "sr/frac_zero_std_resp", 0
                         ),
@@ -395,20 +404,43 @@ class SelfReflectionGRPOTrainer:
                             "sr/fb_adv_abs_mean", 0
                         ),
                         # Token lengths
-                        "lengths/a1_tokens": step_result.rollout_metrics.get(
-                            "sr/avg_a1_tokens", 0
-                        ),
-                        "lengths/f1_tokens": step_result.rollout_metrics.get(
-                            "sr/avg_f1_tokens", 0
-                        ),
-                        "lengths/a2_tokens": step_result.rollout_metrics.get(
-                            "sr/avg_a2_tokens", 0
-                        ),
+                        "lengths/a1_tokens": step_result.rollout_metrics.get("sr/avg_a1_tokens", 0),
+                        "lengths/f1_tokens": step_result.rollout_metrics.get("sr/avg_f1_tokens", 0),
+                        "lengths/a2_tokens": step_result.rollout_metrics.get("sr/avg_a2_tokens", 0),
                         # Feedback quality
                         "feedback/format_valid_rate": metrics.get(
                             "sr/feedback_format_valid_rate", 0
                         ),
                     }
+
+                    # EMA-smoothed versions of noisy per-step metrics
+                    # (raw values have only batch_size * K = 16 samples per step)
+                    ema_sources = {
+                        "ema/a1_acc": metrics.get("sr/a1_accuracy", 0),
+                        "ema/a2_acc": metrics.get("sr/a2_accuracy", 0),
+                        "ema/wr_rate": metrics.get("sr/wr_rate", 0),
+                        "ema/rw_rate": rw_rate,
+                        "ema/rr_rate": metrics.get("sr/rr_rate", 0),
+                        "ema/ww_rate": metrics.get("sr/ww_rate", 0),
+                        "ema/resp_reward": step_result.response_reward_mean,
+                        "ema/fb_reward": step_result.feedback_reward_mean,
+                        "ema/entropy": step_result.rollout_metrics.get("sr/entropy", 0),
+                        "ema/resp_adv_abs": step_result.rollout_metrics.get(
+                            "sr/resp_adv_abs_mean", 0
+                        ),
+                        "ema/fb_adv_abs": step_result.rollout_metrics.get("sr/fb_adv_abs_mean", 0),
+                    }
+                    for ema_key, raw_val in ema_sources.items():
+                        wandb_dict[ema_key] = self._update_ema(ema_key, raw_val)
+
+                    # Derived EMA metrics
+                    wandb_dict["ema/a2_minus_a1"] = self._ema.get("ema/a2_acc", 0) - self._ema.get(
+                        "ema/a1_acc", 0
+                    )
+                    wandb_dict["ema/wr_minus_rw"] = self._ema.get("ema/wr_rate", 0) - self._ema.get(
+                        "ema/rw_rate", 0
+                    )
+
                     # Add reward component breakdown if available
                     for key in [
                         "sr/resp_a1_correctness_mean",
@@ -672,13 +704,14 @@ class SelfReflectionGRPOTrainer:
                 fb_std = _torch.tensor(fb_rews).std().item()
                 if fb_std > 1e-4:
                     # Store image_path (not PIL Image) to avoid memory leak
-                    sample_copy = {"image_path": result.image_path,
-                                   "question": result.question}
-                    new_entries.append(SSREntry(
-                        sample=sample_copy,
-                        rollout_result=result,
-                        fb_reward_std=fb_std,
-                    ))
+                    sample_copy = {"image_path": result.image_path, "question": result.question}
+                    new_entries.append(
+                        SSREntry(
+                            sample=sample_copy,
+                            rollout_result=result,
+                            fb_reward_std=fb_std,
+                        )
+                    )
                 else:
                     n_zero_var += 1
 
@@ -700,27 +733,30 @@ class SelfReflectionGRPOTrainer:
 
                     # Reload image from path (not stored PIL reference)
                     from vlm_grpo.data import load_image_safe
+
                     image = load_image_safe(entry.sample["image_path"])
 
-                    for a1, f1, a2 in zip(
-                        rr.answer1s, rr.feedbacks, rr.answer2s
-                    ):
+                    for a1, f1, a2 in zip(rr.answer1s, rr.feedbacks, rr.answer2s):
                         a1_prompt = build_initial_answer_prompt(
                             rr.question, use_think_answer_tags=use_tags
                         )
                         a1_full = build_prompt_with_completion(a1_prompt, a1)
-                        f1_prompt = build_critic_prompt(
-                            rr.question, a1, model_type=model_type
-                        )
+                        f1_prompt = build_critic_prompt(rr.question, a1, model_type=model_type)
                         f1_full = build_prompt_with_completion(f1_prompt, f1)
                         a2_prompt = build_refiner_prompt(
-                            rr.question, a1, f1,
+                            rr.question,
+                            a1,
+                            f1,
                             use_think_answer_tags=use_tags,
                         )
                         a2_full = build_prompt_with_completion(a2_prompt, a2)
                         trajectory_data.append(
-                            {"a1_full": a1_full, "f1_full": f1_full,
-                             "a2_full": a2_full, "image": image}
+                            {
+                                "a1_full": a1_full,
+                                "f1_full": f1_full,
+                                "a2_full": a2_full,
+                                "image": image,
+                            }
                         )
 
                     rollout_results.append(rr)
@@ -937,17 +973,23 @@ class SelfReflectionGRPOTrainer:
                         a2_new = mb_a2_lps[j]
 
                         a1_ratio_raw = torch.nan_to_num(
-                            a1_new - old_a1_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
+                            a1_new - old_a1_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0
+                        )
                         a2_ratio_raw = torch.nan_to_num(
-                            a2_new - old_a2_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
+                            a2_new - old_a2_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0
+                        )
 
                         a1_ratio = torch.exp(torch.clamp(a1_ratio_raw, -20.0, 20.0))
                         a2_ratio = torch.exp(torch.clamp(a2_ratio_raw, -20.0, 20.0))
                         a1_clipped = torch.clamp(a1_ratio, 1 - clip_range, 1 + clip_range)
                         a2_clipped = torch.clamp(a2_ratio, 1 - clip_range, 1 + clip_range)
 
-                        a1_loss = -torch.min(a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]).mean()
-                        a2_loss = -torch.min(a2_ratio * a2_advantages[ti], a2_clipped * a2_advantages[ti]).mean()
+                        a1_loss = -torch.min(
+                            a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]
+                        ).mean()
+                        a2_loss = -torch.min(
+                            a2_ratio * a2_advantages[ti], a2_clipped * a2_advantages[ti]
+                        ).mean()
 
                         # SCoRe Stage I: freeze A1 policy loss for initial steps.
                         # A1 KL anchor is kept (computed separately below) so A1
@@ -969,7 +1011,8 @@ class SelfReflectionGRPOTrainer:
                         # Original: joint A1+A2 response loss
                         resp_new = torch.cat([mb_a1_lps[j], mb_a2_lps[j]])
                         resp_ratio_raw = torch.nan_to_num(
-                            resp_new - old_resp_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
+                            resp_new - old_resp_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0
+                        )
                         resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
                         resp_ratio = torch.exp(resp_log_ratio)
                         resp_clipped_ratio = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
@@ -978,13 +1021,12 @@ class SelfReflectionGRPOTrainer:
                         traj_resp_loss = -torch.min(resp_surr1, resp_surr2).mean()
 
                         self._resp_total_tokens += resp_ratio.numel()
-                        self._resp_clipped_tokens += (
-                            (resp_ratio != resp_clipped_ratio).sum().item()
-                        )
+                        self._resp_clipped_tokens += (resp_ratio != resp_clipped_ratio).sum().item()
 
                     # Feedback: per-token clipped surrogate
                     fb_ratio_raw = torch.nan_to_num(
-                        fb_new - old_fb_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0)
+                        fb_new - old_fb_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0
+                    )
                     fb_log_ratio = torch.clamp(fb_ratio_raw, min=-20.0, max=20.0)
                     fb_ratio = torch.exp(fb_log_ratio)
                     fb_clipped_ratio = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
@@ -994,17 +1036,18 @@ class SelfReflectionGRPOTrainer:
 
                     # Track clip fraction
                     self._fb_total_tokens += fb_ratio.numel()
-                    self._fb_clipped_tokens += (
-                        (fb_ratio != fb_clipped_ratio).sum().item()
-                    )
+                    self._fb_clipped_tokens += (fb_ratio != fb_clipped_ratio).sum().item()
 
                     # KL loss (per-token, averaged) with per-turn coefficients.
                     # SCoRe insight: strong A1 KL anchors first turn near base model,
                     # preventing "direct solution collapse" where the model just
                     # improves A1 instead of learning self-correction.
                     if self.config.kl_coeff > 0 and ref_a1_lps is not None:
+
                         def _kl_term(ref_lps: torch.Tensor, new_lps: torch.Tensor) -> torch.Tensor:
-                            raw = torch.nan_to_num(ref_lps.detach() - new_lps, nan=0.0, posinf=20.0, neginf=-20.0)
+                            raw = torch.nan_to_num(
+                                ref_lps.detach() - new_lps, nan=0.0, posinf=20.0, neginf=-20.0
+                            )
                             clamped = torch.clamp(raw, -20.0, 20.0)
                             return (torch.exp(clamped) - clamped - 1).mean()
 
@@ -1072,12 +1115,8 @@ class SelfReflectionGRPOTrainer:
         entropy = self._entropy_sum / self._entropy_tokens if self._entropy_tokens > 0 else 0.0
 
         # Compute clip fraction: fraction of tokens where ratio was clipped
-        resp_clip_frac = (
-            self._resp_clipped_tokens / max(self._resp_total_tokens, 1)
-        )
-        fb_clip_frac = (
-            self._fb_clipped_tokens / max(self._fb_total_tokens, 1)
-        )
+        resp_clip_frac = self._resp_clipped_tokens / max(self._resp_total_tokens, 1)
+        fb_clip_frac = self._fb_clipped_tokens / max(self._fb_total_tokens, 1)
 
         logger.info(
             f"  Inner epochs done: resp_loss={total_resp_loss / num_inner:.4f}, "
