@@ -209,9 +209,9 @@ spec:
         - name: SEED
           value: "42"
 
-        # Resume from checkpoint (v4 crashed at ~7% due to NCCL timeout)
+        # Resume from checkpoint (v4 crashed at ~29% due to NCCL timeout)
         - name: RESUME_CHECKPOINT
-          value: "/outputs/grpo_qwen_livr_v4/checkpoint-250"
+          value: "/outputs/grpo_qwen_livr_v4/checkpoint-500"
 
         # LLM Judge disabled for MCQ
         - name: VLM_USE_LLM_JUDGE
