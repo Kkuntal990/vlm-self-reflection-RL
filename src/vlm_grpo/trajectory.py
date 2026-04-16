@@ -175,6 +175,7 @@ def extract_answer_from_text(
     text: str,
     answer_type: str,
     choices: str = "",
+    require_answer_tag: bool = False,
 ) -> str:
     """Liberal extraction of answer from text for correctness scoring.
 
@@ -182,6 +183,10 @@ def extract_answer_from_text(
     NOT by format reward. This intentionally recovers answers from prose
     like "The answer is B" so correctness can still be evaluated even
     when format is wrong.
+
+    When require_answer_tag=True (answer-tag-only mode), extraction only
+    works from <answer> tag content. If no tag is found, returns "" (failed)
+    to prevent false positives from stray letters in prose like "A hen".
 
     For MCQ: extracts single letter (A-F), rejects multiple different letters.
     For YesNo: extracts "Yes" or "No", rejects hedging.
@@ -192,10 +197,15 @@ def extract_answer_from_text(
         text: Raw answer text
         answer_type: Expected answer type ("mcq", "yesno", "numeric", "open")
         choices: Optional comma-separated MCQ choices
+        require_answer_tag: If True, return "" when <answer> tags are missing
 
     Returns:
         Normalized answer string, or empty string if extraction failed
     """
+    # When answer tags required, only extract from tag content
+    if require_answer_tag and not _ANSWER_TAG_PATTERN.search(text):
+        return ""
+
     # Extract from <answer> tags first to avoid matching stray letters
     # in <think> sections (e.g., "reflectance." → false 'E' match)
     text = extract_from_answer_tags(text)
