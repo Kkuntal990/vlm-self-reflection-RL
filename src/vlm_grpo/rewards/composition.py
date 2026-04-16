@@ -929,39 +929,48 @@ def compute_response_reward_breakdown(
     Returns:
         TrajectoryResponseRewardBreakdown with all component scores
     """
-    # Verify A1 and A2 ONCE each (previously called 7 times per trajectory).
-    # Results are reused by all sub-reward functions.
+    # Verify A1 and A2 ONCE each.
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
-    a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
 
-    # In answer-tag-only mode, if A2 has no <answer> tag, treat as WRONG
-    # regardless of what verify_answer found (prevents false positives
-    # from stray letters in prose like "A hen" matching GT "A").
-    if use_answer_tag_only and not re.search(r"<answer>", a2_text, re.IGNORECASE):
-        a2_correct = False
+    # When tags are required (think+answer or answer-only mode) and A2
+    # has no <answer> tag: correctness=0 (neutral), treat as WRONG for
+    # transitions. Prevents false positives from stray letters in prose.
+    requires_tags = use_think_answer_tags or use_answer_tag_only
+    a2_has_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
+
+    if requires_tags and not a2_has_tag:
+        a2_correct = False  # for transitions (RR/RW/WR/WW)
+        r_a1 = 1.0 if a1_correct else -1.0
+        r_a2 = 0.0  # neutral — no signal
+        r_a2_format = _compute_refiner_format_reward(
+            a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+        )
+        a2_format_valid = False
+        a2_extracted = ""
     else:
+        a2_result = verify_answer(a2_text, ground_truth, answer_type)
         a2_correct = a2_result.is_correct
 
-    # Format reward
-    r_a2_format = _compute_refiner_format_reward(
-        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-    )
-    a2_format_valid = r_a2_format >= 0
+        # Format reward
+        r_a2_format = _compute_refiner_format_reward(
+            a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+        )
+        a2_format_valid = r_a2_format > 0
 
-    # Extract A2 for display
-    a2_extracted = extract_answer_from_text(
-        a2_text, answer_type, choices, require_answer_tag=use_answer_tag_only
-    )
+        # Extract A2 for display
+        a2_extracted = extract_answer_from_text(
+            a2_text, answer_type, choices, require_answer_tag=requires_tags
+        )
 
-    # A1 correctness reward
-    r_a1 = 1.0 if a1_correct else -1.0
+        # A1 correctness reward
+        r_a1 = 1.0 if a1_correct else -1.0
 
-    # A2 correctness reward (use pre-computed result)
-    if answer_type in ("counting", "open") and a2_result.score is not None:
-        r_a2 = 2.0 * a2_result.score - 1.0
-    else:
-        r_a2 = 1.0 if a2_correct else -1.0
+        # A2 correctness reward
+        if answer_type in ("counting", "open") and a2_result.score is not None:
+            r_a2 = 2.0 * a2_result.score - 1.0
+        else:
+            r_a2 = 1.0 if a2_correct else -1.0
 
     # No-regression / improvement reward for A2.
     # When reward_shaping_alpha > 0: use shaped improvement term α*(R(A2)-R(A1)).

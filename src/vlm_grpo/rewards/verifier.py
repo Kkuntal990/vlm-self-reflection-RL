@@ -75,7 +75,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Answer types where extraction failure = WRONG (before fallback checks)
-DETERMINISTIC_TYPES: frozenset[str] = frozenset({"mcq", "yesno", "numeric"})
+DETERMINISTIC_TYPES: frozenset[str] = frozenset({"mcq", "yesno", "numeric", "counting"})
 
 # Verdict constants
 CORRECT = "CORRECT"
