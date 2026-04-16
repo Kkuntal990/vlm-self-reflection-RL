@@ -587,15 +587,11 @@ def _compute_tag_format_reward(
     answer_type: str,
     ground_truth: str = "",
 ) -> float:
-    """Format reward for tag mode: check <think>+<answer> structure.
+    """Format reward for think+answer tag mode. Binary: 1.0 or 0.0.
 
-    Wider range than bare mode to provide positive incentive for tags:
-        Both tags + valid inner answer → +0.5  (positive reward for compliance)
-        Tags present but inner answer invalid → -0.5  (partial credit)
-        Tags missing entirely → -1.0  (penalty)
-
-    With w_a2_format=0.5, this gives a 0.75 weighted swing (+0.25 to -0.5),
-    meaningful against the ~10-point total response reward range.
+    Following DeepSeek-R1 convention: simple binary format check.
+    1.0 if both <think>+<answer> tags present with valid inner content.
+    0.0 otherwise.
 
     Args:
         a2_text: Raw A2 text.
@@ -603,39 +599,34 @@ def _compute_tag_format_reward(
         ground_truth: Ground truth (unused, kept for API compat).
 
     Returns:
-        +0.5 if fully compliant, -0.5 if tags present but answer invalid,
-        -1.0 if tags missing.
+        1.0 if fully compliant, 0.0 otherwise.
     """
     from vlm_grpo.trajectory import extract_from_answer_tags, has_think_answer_tags
 
     if not has_think_answer_tags(a2_text):
-        return -1.0
+        return 0.0
 
-    # Tags present — check inner answer content STRICTLY (raw, not normalized)
+    # Tags present — check inner answer content strictly
     inner = extract_from_answer_tags(a2_text).strip()
-
     if not inner:
-        return -0.5
+        return 0.0
 
     if answer_type == "mcq":
-        # Strict: must be (A) format — letter in parentheses
         if not re.match(r"^\([A-Da-d]\)$", inner):
-            return -0.5
+            return 0.0
     elif answer_type == "yesno":
         if inner.lower() not in ("yes", "no"):
-            return -0.5
+            return 0.0
     elif answer_type == "counting":
-        # Strict: must be a bare integer like "6"
         if not re.match(r"^\d+$", inner):
-            return -0.5
+            return 0.0
     elif answer_type == "numeric":
-        num_text = inner.replace(",", "")
         try:
-            float(num_text.rstrip("%").replace("/", "."))
+            float(inner.replace(",", "").rstrip("%").replace("/", "."))
         except ValueError:
-            return -0.5
+            return 0.0
 
-    return 0.5
+    return 1.0
 
 
 def _compute_bare_format_reward(
@@ -940,14 +931,33 @@ def compute_response_reward_breakdown(
     a2_has_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
 
     if requires_tags and not a2_has_tag:
-        a2_correct = False  # for transitions (RR/RW/WR/WW)
-        r_a1 = 1.0 if a1_correct else -1.0
-        r_a2 = 0.0  # neutral — no signal
-        r_a2_format = _compute_refiner_format_reward(
-            a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-        )
+        # No <answer> tag: zero out entire reward. No signal at all.
+        # The model learns: "without tags, I get nothing."
+        a2_correct = False
+        r_a1 = 0.0
+        r_a2 = 0.0
+        r_a2_format = 0.0
         a2_format_valid = False
         a2_extracted = ""
+
+        # Short-circuit: return zero reward directly
+        components = {
+            "a1_correctness": 0.0,
+            "a2_correctness": 0.0,
+            "no_regression": 0.0,
+            "a2_format": 0.0,
+            "minimal_edit": 0.0,
+        }
+        weighted_components = {k: 0.0 for k in components}
+        return TrajectoryResponseRewardBreakdown(
+            total_reward=0.0,
+            components=components,
+            weighted_components=weighted_components,
+            a1_correct=a1_correct,
+            a2_correct=False,
+            a2_extracted="",
+            a2_format_valid=False,
+        )
     else:
         a2_result = verify_answer(a2_text, ground_truth, answer_type)
         a2_correct = a2_result.is_correct
@@ -1046,6 +1056,7 @@ def compute_feedback_reward_breakdown(
     weights: Any,
     use_improvement_reward: bool = False,
     reward_shaping_alpha: float = 0.0,
+    requires_answer_tag: bool = False,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
@@ -1070,6 +1081,17 @@ def compute_feedback_reward_breakdown(
         TrajectoryFeedbackRewardBreakdown with all component scores
     """
     from vlm_grpo.rewards.feedback import compute_feedback_calibration_reward
+
+    # If A2 had no <answer> tags and tags were required, zero out feedback
+    # reward too — we can't judge F1's quality if A2 is unextractable.
+    if requires_answer_tag and not re.search(r"<answer>", a2_text, re.IGNORECASE):
+        components = {"downstream": 0.0, "calibration": 0.0, "format": 0.0, "tag_penalty": 0.0}
+        return TrajectoryFeedbackRewardBreakdown(
+            total_reward=0.0,
+            components=components,
+            weighted_components={k: 0.0 for k in components},
+            feedback_format_valid=False,
+        )
 
     # Verify A1 and A2 ONCE (downstream needs both)
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
