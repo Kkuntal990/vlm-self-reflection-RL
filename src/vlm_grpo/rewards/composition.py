@@ -611,21 +611,25 @@ def _compute_tag_format_reward(
     if not has_think_answer_tags(a2_text):
         return -1.0
 
-    # Tags present — check inner answer content
-    inner = extract_from_answer_tags(a2_text)
-    normalized = normalize_answer(inner)
+    # Tags present — check inner answer content STRICTLY (raw, not normalized)
+    inner = extract_from_answer_tags(a2_text).strip()
 
-    if not normalized:
+    if not inner:
         return -0.5
 
     if answer_type == "mcq":
-        if len(normalized) != 1 or normalized not in "abcdef":
+        # Strict: must be (A) format — letter in parentheses
+        if not re.match(r"^\([A-Da-d]\)$", inner):
             return -0.5
     elif answer_type == "yesno":
-        if normalized not in ("yes", "no"):
+        if inner.lower() not in ("yes", "no"):
+            return -0.5
+    elif answer_type == "counting":
+        # Strict: must be a bare integer like "6"
+        if not re.match(r"^\d+$", inner):
             return -0.5
     elif answer_type == "numeric":
-        num_text = normalized.replace(",", "")
+        num_text = inner.replace(",", "")
         try:
             float(num_text.rstrip("%").replace("/", "."))
         except ValueError:
@@ -660,6 +664,11 @@ def _compute_bare_format_reward(
     elif answer_type == "yesno":
         if normalized not in ("yes", "no"):
             return _llm_format_fallback(a2_text, ground_truth, answer_type)
+    elif answer_type == "counting":
+        try:
+            int(normalized)
+        except ValueError:
+            return -1.0
     elif answer_type == "numeric":
         num_text = normalized.replace(",", "")
         if "/" in num_text:
@@ -901,6 +910,7 @@ def compute_response_reward_breakdown(
     choices: str,
     weights: Any,
     use_think_answer_tags: bool = False,
+    reward_shaping_alpha: float = 0.0,
 ) -> TrajectoryResponseRewardBreakdown:
     """Compute response reward for a single trajectory.
 
@@ -944,13 +954,17 @@ def compute_response_reward_breakdown(
     else:
         r_a2 = 1.0 if a2_correct else -1.0
 
-    # No-regression reward (use pre-computed a1_correct, a2_correct)
-    # Deterministic types (MCQ/YesNo/Numeric): lower RW penalty, higher WR reward
-    # to encourage correction (small answer space makes changing cheap).
-    # Open-ended: heavy RW penalty to protect correct freeform answers.
+    # No-regression / improvement reward for A2.
+    # When reward_shaping_alpha > 0: use shaped improvement term α*(R(A2)-R(A1)).
+    # This replaces transition-based no_regression with a continuous signal
+    # that reduces RR stabilization (less conservative A2) while amplifying
+    # WR/RW gradient. Use w_no_regression=1.0 when alpha > 0.
+    # When alpha = 0: fall back to transition-based no_regression.
     from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
 
-    if answer_type in DETERMINISTIC_TYPES:
+    if reward_shaping_alpha > 0:
+        r_no_reg = reward_shaping_alpha * (r_a2 - r_a1)
+    elif answer_type in DETERMINISTIC_TYPES:
         if a1_correct:
             r_no_reg = 1.0 if a2_correct else -2.0
         else:

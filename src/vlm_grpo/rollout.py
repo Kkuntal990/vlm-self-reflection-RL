@@ -526,6 +526,7 @@ def generate_self_reflection_rollout(
                 choices=choices_list[i],
                 weights=response_weights,
                 use_think_answer_tags=config.use_think_answer_tags,
+                reward_shaping_alpha=getattr(config, "reward_shaping_alpha", 0.0),
             )
             fb_bd = compute_feedback_reward_breakdown(
                 feedback_text=f1,

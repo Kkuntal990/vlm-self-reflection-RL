@@ -187,7 +187,9 @@ spec:
         - name: FREEZE_A1_STEPS
           value: "280"
 
-        # v7: shaped reward alpha=5, w_downstream=1.0 (shaped already has large magnitudes)
+        # v7: shaped reward alpha=5 for both A2 and F1
+        # A2: r_no_reg = α*(r_a2 - r_a1), w=1.0 (α handles scaling)
+        # F1: r_downstream = r_a2 + α*(r_a2 - r_a1), w=1.0
         - name: REWARD_SHAPING_ALPHA
           value: "5.0"
         - name: W_A1_CORRECTNESS
@@ -195,7 +197,7 @@ spec:
         - name: W_A2_CORRECTNESS
           value: "1.0"
         - name: W_NO_REGRESSION
-          value: "2.0"
+          value: "1.0"
         - name: W_A2_FORMAT
           value: "0.5"
         - name: W_MINIMAL_EDIT

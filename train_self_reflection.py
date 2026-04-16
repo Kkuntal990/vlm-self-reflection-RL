@@ -424,7 +424,12 @@ def main() -> None:
     # Sanity check mode (main process only)
     if args.sanity_check_samples > 0:
         if accelerator.is_main_process:
-            _run_sanity_check(train_dataset, response_weights, feedback_weights)
+            _run_sanity_check(
+                train_dataset,
+                response_weights,
+                feedback_weights,
+                reward_shaping_alpha=args.reward_shaping_alpha,
+            )
         return
 
     # Load model + ref model
@@ -679,6 +684,7 @@ def _run_sanity_check(
     dataset: list[dict],
     response_weights: object,
     feedback_weights: object,
+    reward_shaping_alpha: float = 0.0,
 ) -> None:
     """Run sanity check with synthetic (A1, F1, A2) tuples.
 
@@ -688,6 +694,7 @@ def _run_sanity_check(
         dataset: List of sample dicts
         response_weights: Response reward weights
         feedback_weights: Feedback reward weights
+        reward_shaping_alpha: SCoRe-style shaped reward alpha
     """
     from vlm_grpo.rewards.composition import (
         compute_feedback_reward_breakdown,
@@ -745,6 +752,7 @@ def _run_sanity_check(
                 answer_type=a_type,
                 choices=ch,
                 weights=response_weights,
+                reward_shaping_alpha=reward_shaping_alpha,
             )
             fb_bd = compute_feedback_reward_breakdown(
                 feedback_text=traj["f1"],
@@ -754,6 +762,7 @@ def _run_sanity_check(
                 answer_type=a_type,
                 choices=ch,
                 weights=feedback_weights,
+                reward_shaping_alpha=reward_shaping_alpha,
             )
 
             logger.info(f"  [{case_name}]")

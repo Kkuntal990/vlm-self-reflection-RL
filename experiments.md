@@ -201,21 +201,37 @@ v6 crashed (NCCL). v6b re-ran with stronger settings: A1 KL=1000x (effective 20.
 
 ---
 
-## v7: SCoRe-Style Shaped Feedback Reward (Planned)
+## v7: SCoRe-Style Shaped Reward for Both F1 and A2 (Planned)
 
-**Changes from v6b**: Replace pure improvement `R(A2)-R(A1)` with shaped `R(A2) + α×(R(A2)-R(A1))`, α=5.
+**Changes from v6b**: Shaped reward `α×(R(A2)-R(A1))` replaces both F1 improvement reward AND A2 no_regression, α=5. Dataset: `livr_perception_mixed.jsonl` (11K).
 
 ```
-                 v6b (improvement)    v7 (shaped α=5)
-F1 reward WR:         +2                  +11
-F1 reward RW:         -2                  -11
-F1 reward RR:          0                   +1  ← new stabilization signal
-F1 reward WW:          0                   -1  ← new penalty
-Dead K-groups:       33.6%                0.3%
+                 v6b                    v7 (shaped α=5)
+F1 reward:       R(A2)-R(A1)           R(A2) + α×(R(A2)-R(A1))
+  WR:            +2                     +11
+  RW:            -2                     -11
+  RR:             0                     +1
+  WW:             0                     -1
+  Dead K-groups: 53.8%                  <1%
+
+A2 reward:       a2_corr + 2×noreg     a2_corr + 1×α×(a2_corr - a1_corr)
+  WR:            +7                     +11
+  RW:            -5                     -11
+  RR:            +3                     +1   (less conservative → more exploration)
+  RW:            -1                     -1
 ```
 
-**Mathematical justification**: With v6b's improvement reward, E[μ_group]=-0.038 and |∇_RW|/|∇_WR|=1.30 (RW gradient 30% stronger). With shaped α=5, E[μ_group]≈0 and ∇_WR becomes dominant because RR(+1) and WW(-1) no longer dilute the mean.
+**Why replace no_regression for A2**: Current RR stabilization (Â=+2.3) makes A2 too conservative. RR gradient dominates WR gradient 3.8:1 (∇_RR=0.94 vs ∇_WR=0.25) because RR is 10x more frequent. With shaped α=5: ratio drops to 1.2:1 (∇_RR=0.53 vs ∇_WR=0.45). A2 becomes willing to attempt correction while RW penalty is stronger (-10.71 vs -5.70).
 
-**A2 response reward unchanged**: no_regression stays (RR=+3, RW=-5, WR=+7, WW=-1). Analysis confirmed no_regression is necessary — without it, WR=RW=0 in A2's advantage and A2 loses all self-correction signal. Shaped A2 reward deferred to v8 (marginal benefit: WR advantage +6→+7, 17% improvement).
+**F1 fix**: Dead K-groups 53.8%→<1%. RR(+1)/WW(-1) always differ, providing variance for F1 gradient.
 
-**Architecture**: Same as v6b (separate_turn_loss, A1 KL=1000x, freeze=280 steps). Only the F1 reward function changes. New flag: `--reward_shaping_alpha 5.0`.
+**v6b final analysis (99%, 17,824 traj)**: Three problems identified:
+1. **88% F1 sycophancy** — honest F1 gives 33% WR but only produced 9% of the time
+2. **53.8% dead fb K-groups** — improvement reward RR=WW=0 kills gradient
+3. **WR flat at 7.5%** despite RW dropping 13.8%→8.1% — A2 too conservative
+
+v7 directly fixes #2 and #3. Problem #1 (sycophancy) requires architectural changes (v8: verify-then-correct).
+
+**Architecture**: Same as v6b (separate_turn_loss, A1 KL=1000x, freeze=280 steps). `--reward_shaping_alpha 5.0`, `w_no_regression=1.0`, `w_downstream=1.0`.
+
+**Refs**: SCoRe (2409.12917), Tyen et al. (2311.08516), Huang et al. (2310.01798).
