@@ -211,6 +211,10 @@ spec:
         - name: W_FB_TAG_PENALTY
           value: "0.5"
 
+        # Resume from checkpoint (node crash at ~44%)
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_livr_v7/checkpoint-250"
+
         # Logging
         - name: LOGGING_STEPS
           value: "10"
