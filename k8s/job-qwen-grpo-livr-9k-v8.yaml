@@ -213,6 +213,10 @@ spec:
         - name: W_VERIFICATION_ACCURACY
           value: "1.0"
 
+        # Resume from checkpoint (node crash at ~48%)
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_livr_v8/checkpoint-500"
+
         # Logging
         - name: LOGGING_STEPS
           value: "10"
