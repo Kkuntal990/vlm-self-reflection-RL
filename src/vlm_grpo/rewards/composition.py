@@ -931,26 +931,27 @@ def compute_response_reward_breakdown(
     a2_has_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
 
     if requires_tags and not a2_has_tag:
-        # No <answer> tag: zero out entire reward. No signal at all.
-        # The model learns: "without tags, I get nothing."
-        a2_correct = False
-        r_a1 = 0.0
-        r_a2 = 0.0
-        r_a2_format = 0.0
-        a2_format_valid = False
-        a2_extracted = ""
-
-        # Short-circuit: return zero reward directly
+        # No <answer> tag: small negative reward to nudge toward tags.
+        # Not zero (wasted trajectory — zero advantage in GRPO).
+        # Not ±1 correctness (false positives from stray letters in prose).
+        # Only the format penalty fires: -1.0 raw, weighted by w_a2_format.
+        _NO_TAG_PENALTY = -1.0
         components = {
             "a1_correctness": 0.0,
             "a2_correctness": 0.0,
             "no_regression": 0.0,
-            "a2_format": 0.0,
+            "a2_format": _NO_TAG_PENALTY,
             "minimal_edit": 0.0,
         }
-        weighted_components = {k: 0.0 for k in components}
+        weighted_components = {
+            "a1_correctness": 0.0,
+            "a2_correctness": 0.0,
+            "no_regression": 0.0,
+            "a2_format": _NO_TAG_PENALTY * weights.w_a2_format,
+            "minimal_edit": 0.0,
+        }
         return TrajectoryResponseRewardBreakdown(
-            total_reward=0.0,
+            total_reward=_NO_TAG_PENALTY * weights.w_a2_format,
             components=components,
             weighted_components=weighted_components,
             a1_correct=a1_correct,
@@ -1056,7 +1057,6 @@ def compute_feedback_reward_breakdown(
     weights: Any,
     use_improvement_reward: bool = False,
     reward_shaping_alpha: float = 0.0,
-    requires_answer_tag: bool = False,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
@@ -1081,17 +1081,6 @@ def compute_feedback_reward_breakdown(
         TrajectoryFeedbackRewardBreakdown with all component scores
     """
     from vlm_grpo.rewards.feedback import compute_feedback_calibration_reward
-
-    # If A2 had no <answer> tags and tags were required, zero out feedback
-    # reward too — we can't judge F1's quality if A2 is unextractable.
-    if requires_answer_tag and not re.search(r"<answer>", a2_text, re.IGNORECASE):
-        components = {"downstream": 0.0, "calibration": 0.0, "format": 0.0, "tag_penalty": 0.0}
-        return TrajectoryFeedbackRewardBreakdown(
-            total_reward=0.0,
-            components=components,
-            weighted_components={k: 0.0 for k in components},
-            feedback_format_valid=False,
-        )
 
     # Verify A1 and A2 ONCE (downstream needs both)
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
