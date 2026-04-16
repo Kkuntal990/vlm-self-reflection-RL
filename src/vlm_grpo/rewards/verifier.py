@@ -625,7 +625,7 @@ def _verify_counting(
             abs_error = abs(pred_num - gt_num)
             denom = max(abs(gt_num), 3)
             score = max(0.0, 1.0 - abs_error / denom)
-        verdict = CORRECT if score >= 0.5 else WRONG
+        verdict = CORRECT if score >= 0.75 else WRONG
         return MatchResult(
             answer_type="counting",
             parse_ok=True,

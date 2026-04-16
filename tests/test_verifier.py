@@ -135,6 +135,65 @@ class TestNumericVerification:
 
 
 # =============================================================================
+# Counting verification
+# =============================================================================
+
+
+class TestCountingVerification:
+    """Tests for counting answer verification (fuzzy scoring + verdict)."""
+
+    def test_exact_match(self) -> None:
+        r = verify_answer("6", "6", "counting")
+        assert r.verdict == CORRECT
+        assert r.score == 1.0
+
+    def test_off_by_one_large_gt(self) -> None:
+        """Off-by-1 with GT>=4 should be CORRECT (score >= 0.75)."""
+        r = verify_answer("8", "9", "counting")
+        assert r.verdict == CORRECT
+        assert r.score > 0.75
+
+    def test_off_by_one_small_gt(self) -> None:
+        """Off-by-1 with GT=3: score=0.667 < 0.75 → WRONG."""
+        r = verify_answer("2", "3", "counting")
+        assert r.verdict == WRONG
+        assert r.score < 0.75
+
+    def test_off_by_three(self) -> None:
+        """Off-by-3 with GT=8: score=0.625 → WRONG."""
+        r = verify_answer("5", "8", "counting")
+        assert r.verdict == WRONG
+
+    def test_way_off(self) -> None:
+        """Completely wrong count."""
+        r = verify_answer("2", "10", "counting")
+        assert r.verdict == WRONG
+        assert r.score < 0.5
+
+    def test_score_is_continuous(self) -> None:
+        """Score should be between 0 and 1, not binary."""
+        r = verify_answer("7", "9", "counting")
+        assert 0 < r.score < 1
+
+    def test_zero_exact(self) -> None:
+        r = verify_answer("0", "0", "counting")
+        assert r.verdict == CORRECT
+        assert r.score == 1.0
+
+    def test_word_number(self) -> None:
+        """Number words in prose should be extracted."""
+        r = verify_answer("There are six cups", "6", "counting")
+        assert r.verdict == CORRECT
+        assert r.score == 1.0
+
+    def test_word_number_wrong(self) -> None:
+        r = verify_answer("I see three birds", "8", "counting")
+        assert r.verdict == WRONG
+
+    def test_counting_in_deterministic_types(self) -> None:
+        assert "counting" in DETERMINISTIC_TYPES
+
+
 # Open-ended verification (deterministic stages only -- no embedding)
 # =============================================================================
 
