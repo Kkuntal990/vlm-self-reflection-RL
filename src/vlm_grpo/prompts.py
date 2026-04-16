@@ -75,6 +75,19 @@ VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS = (
     "<answer>(A)</answer>"
 )
 
+# Answer-tag-only variant. No <think> tags required — model can reason
+# freely in plain text, but must wrap the final answer in <answer> tags.
+# Used for v8+ where we want structured extraction without forcing
+# a specific reasoning format.
+VL_ASSISTANT_SYSTEM_PROMPT_WITH_ANSWER_TAG = (
+    "You are a visual question answering assistant. "
+    "Look at the image carefully and answer the question. "
+    "When given feedback on your previous answer, re-examine the image "
+    "and either correct your answer or keep it if you believe it is right.\n\n"
+    "Put your final answer inside <answer> tags.\n"
+    "Example: <answer>(A)</answer>"
+)
+
 
 # Backward-compatible aliases
 REFINER_SYSTEM_PROMPT = VL_ASSISTANT_SYSTEM_PROMPT
@@ -88,6 +101,7 @@ CRITIC_SYSTEM_PROMPT = FEEDBACK_CRITIC_SYSTEM_PROMPT
 def build_initial_answer_prompt(
     question: str,
     use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
 ) -> list[dict]:
     """Build prompt for initial answer (A1) generation.
 
@@ -97,16 +111,18 @@ def build_initial_answer_prompt(
 
     Args:
         question: The visual question (cleaned, no <image> tag)
-        use_think_answer_tags: If True, append tag format instruction
+        use_think_answer_tags: If True, use <think>+<answer> tag format
+        use_answer_tag_only: If True, use <answer> tag only (no <think>)
 
     Returns:
         List of message dicts for A1 generation
     """
-    system_prompt = (
-        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
-        if use_think_answer_tags
-        else VL_ASSISTANT_SYSTEM_PROMPT
-    )
+    if use_think_answer_tags:
+        system_prompt = VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
+    elif use_answer_tag_only:
+        system_prompt = VL_ASSISTANT_SYSTEM_PROMPT_WITH_ANSWER_TAG
+    else:
+        system_prompt = VL_ASSISTANT_SYSTEM_PROMPT
 
     return [
         {
@@ -217,6 +233,7 @@ def build_refiner_prompt(
     answer_type: str = "open",
     choices: str = "",
     use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
 ) -> list[dict]:
     """Build refiner prompt for answer refinement (A2).
 
@@ -234,16 +251,18 @@ def build_refiner_prompt(
         feedback1: Raw feedback from the critic (passed as-is)
         answer_type: Expected answer type (unused, kept for API compat)
         choices: Optional MCQ choices (unused, kept for API compat)
-        use_think_answer_tags: If True, append tag format instruction to feedback
+        use_think_answer_tags: If True, use <think>+<answer> tag format
+        use_answer_tag_only: If True, use <answer> tag only (no <think>)
 
     Returns:
         List of message dicts in conversational format
     """
-    system_prompt = (
-        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
-        if use_think_answer_tags
-        else VL_ASSISTANT_SYSTEM_PROMPT
-    )
+    if use_think_answer_tags:
+        system_prompt = VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
+    elif use_answer_tag_only:
+        system_prompt = VL_ASSISTANT_SYSTEM_PROMPT_WITH_ANSWER_TAG
+    else:
+        system_prompt = VL_ASSISTANT_SYSTEM_PROMPT
     messages = [
         {
             "role": "system",

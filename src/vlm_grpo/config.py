@@ -93,6 +93,7 @@ class RolloutConfig:
     a2_temperature: float = 1.0
     batch_size: int = 8
     use_think_answer_tags: bool = False
+    use_answer_tag_only: bool = False
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
     use_binary_verification: bool = False

@@ -54,6 +54,7 @@ spec:
             --output_dir "${OUTPUT_DIR}" \
             --image_base_dir "${IMAGE_BASE_DIR}" \
             --use_vllm \
+            --use_answer_tag_only \
             --use_binary_verification \
             --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.50} \
             --max_samples ${MAX_SAMPLES:-0} \
@@ -208,7 +209,7 @@ spec:
         - name: W_FB_FORMAT
           value: "0.0"
         - name: W_FB_TAG_PENALTY
-          value: "0.0"
+          value: "0.5"
         - name: W_VERIFICATION_ACCURACY
           value: "1.0"
 

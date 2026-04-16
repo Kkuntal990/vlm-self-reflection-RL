@@ -404,8 +404,13 @@ def generate_self_reflection_rollout(
             # Step 1: Generate K A1s for every sample in the chunk.
             # repeat_interleave: [q0]*k + [q1]*k + ... -> chunk_size*k prompts
             use_tags = config.use_think_answer_tags
+            use_answer_only = getattr(config, "use_answer_tag_only", False)
             a1_prompts = [
-                build_initial_answer_prompt(q, use_think_answer_tags=use_tags)
+                build_initial_answer_prompt(
+                    q,
+                    use_think_answer_tags=use_tags,
+                    use_answer_tag_only=use_answer_only,
+                )
                 for q in chunk_qs
                 for _ in range(k)
             ]
@@ -474,6 +479,7 @@ def generate_self_reflection_rollout(
                     chunk_a1s[i * k + j],
                     chunk_f1s[i * k + j],
                     use_think_answer_tags=use_tags,
+                    use_answer_tag_only=use_answer_only,
                 )
                 for i in range(chunk_size)
                 for j in range(k)
@@ -532,6 +538,7 @@ def generate_self_reflection_rollout(
                 choices=choices_list[i],
                 weights=response_weights,
                 use_think_answer_tags=config.use_think_answer_tags,
+                use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
                 reward_shaping_alpha=getattr(config, "reward_shaping_alpha", 0.0),
             )
             fb_bd = compute_feedback_reward_breakdown(

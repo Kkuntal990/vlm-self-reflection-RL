@@ -445,6 +445,7 @@ def compute_refiner_reward_breakdown(
     choices: str,
     weights: RefinerRewardWeights,
     use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
 ) -> RefinerRewardBreakdown:
     """Compute full reward breakdown for one refiner completion.
 
@@ -465,7 +466,7 @@ def compute_refiner_reward_breakdown(
     """
     # Format reward
     r_format = _compute_refiner_format_reward(
-        a2_text, answer_type, ground_truth, use_think_answer_tags
+        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
     )
     format_valid = r_format >= 0
 
@@ -589,37 +590,41 @@ def _compute_refiner_format_reward(
     answer_type: str,
     ground_truth: str = "",
     use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
 ) -> float:
     """R_format for refiner: format compliance check.
 
-    Two modes controlled by use_think_answer_tags:
+    Three modes:
 
-    **Tag mode** (use_think_answer_tags=True):
+    **Think+Answer tag mode** (use_think_answer_tags=True):
         Checks for <think>...</think><answer>...</answer> structure.
         Then validates the inner answer content by type.
-        - Both tags present + valid inner answer → 0.0
-        - Tags present but inner answer invalid → -0.5 (partial credit)
-        - Tags missing entirely → -1.0
+        +0.5 fully compliant, -0.5 tags but bad inner, -1.0 tags missing.
 
-    **Bare mode** (use_think_answer_tags=False):
-        Original normalize-first pipeline:
-        1. normalize_answer(a2_text)
-        2. Type-specific check (MCQ=letter, YesNo=yes/no, etc.)
-        3. LLM fallback if deterministic check fails
+    **Answer-tag-only mode** (use_answer_tag_only=True):
+        Checks for <answer>...</answer> only (no <think> required).
+        Validates inner answer content by type.
+        +0.5 fully compliant, -0.5 tag but bad inner, -1.0 tag missing.
 
-    Penalty-only: 0.0 when compliant, -1.0 (or -0.5) when not.
+    **Bare mode** (both False):
+        Original normalize-first pipeline.
+        0.0 when compliant, -1.0 when not.
 
     Args:
         a2_text: Raw A2 text from the refiner
         answer_type: Expected answer type
         ground_truth: Ground truth answer (for LLM format fallback)
-        use_think_answer_tags: Whether to check for tag format
+        use_think_answer_tags: Whether to check for <think>+<answer> tags
+        use_answer_tag_only: Whether to check for <answer> tag only
 
     Returns:
-        0.0 if format-compliant, negative if not
+        Format reward score
     """
     if use_think_answer_tags:
         return _compute_tag_format_reward(a2_text, answer_type, ground_truth)
+
+    if use_answer_tag_only:
+        return _compute_answer_tag_only_format_reward(a2_text, answer_type)
 
     return _compute_bare_format_reward(a2_text, answer_type, ground_truth)
 
@@ -668,6 +673,55 @@ def _compute_tag_format_reward(
             return -0.5
     elif answer_type == "counting":
         # Strict: must be a bare integer like "6"
+        if not re.match(r"^\d+$", inner):
+            return -0.5
+    elif answer_type == "numeric":
+        num_text = inner.replace(",", "")
+        try:
+            float(num_text.rstrip("%").replace("/", "."))
+        except ValueError:
+            return -0.5
+
+    return 0.5
+
+
+def _compute_answer_tag_only_format_reward(
+    a2_text: str,
+    answer_type: str,
+) -> float:
+    """Format reward for answer-tag-only mode.
+
+    Only requires <answer>...</answer> tags (no <think> required).
+    Validates inner content strictly by type.
+
+    Args:
+        a2_text: Raw A2 text.
+        answer_type: Expected answer type.
+
+    Returns:
+        +0.5 if <answer> present with valid content,
+        -0.5 if <answer> present but content invalid,
+        -1.0 if <answer> tag missing.
+    """
+    from vlm_grpo.trajectory import extract_from_answer_tags
+
+    # Check for <answer> tag presence
+    if not re.search(r"<answer>", a2_text, re.IGNORECASE):
+        return -1.0
+
+    # Tag present — check inner content strictly
+    inner = extract_from_answer_tags(a2_text).strip()
+
+    if not inner:
+        return -0.5
+
+    if answer_type == "mcq":
+        if not re.match(r"^\([A-Da-d]\)$", inner):
+            return -0.5
+    elif answer_type == "yesno":
+        if inner.lower() not in ("yes", "no"):
+            return -0.5
+    elif answer_type == "counting":
         if not re.match(r"^\d+$", inner):
             return -0.5
     elif answer_type == "numeric":
@@ -952,6 +1006,7 @@ def compute_response_reward_breakdown(
     choices: str,
     weights: Any,
     use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
     reward_shaping_alpha: float = 0.0,
 ) -> TrajectoryResponseRewardBreakdown:
     """Compute response reward for a single trajectory.
@@ -980,7 +1035,7 @@ def compute_response_reward_breakdown(
 
     # Format reward
     r_a2_format = _compute_refiner_format_reward(
-        a2_text, answer_type, ground_truth, use_think_answer_tags
+        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
     )
     a2_format_valid = r_a2_format >= 0
 

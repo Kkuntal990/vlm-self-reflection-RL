@@ -196,6 +196,12 @@ def parse_args() -> argparse.Namespace:
         help="Use <think>...</think><answer>...</answer> tag format for A1/A2 generation. "
         "Enables structured reasoning with format reward for tags.",
     )
+    parser.add_argument(
+        "--use_answer_tag_only",
+        action="store_true",
+        help="Use <answer>...</answer> tag only (no <think>). Model reasons freely, "
+        "wraps final answer in <answer> tags for structured extraction.",
+    )
     parser.add_argument("--min_pixels", type=int, default=200704, help="Min pixels per image")
     parser.add_argument(
         "--loss_type",
@@ -302,9 +308,9 @@ def main() -> None:
     # so the model has positive incentive to use tags (range +0.5 to -1.0).
     # User can still override explicitly with --w_a2_format.
     w_a2_format = args.w_a2_format
-    if args.use_think_answer_tags and w_a2_format == 0.15:
+    if (args.use_think_answer_tags or getattr(args, "use_answer_tag_only", False)) and w_a2_format == 0.15:
         w_a2_format = 0.5
-        logger.info("Auto-increased w_a2_format to 0.5 for think/answer tag mode")
+        logger.info("Auto-increased w_a2_format to 0.5 for tag mode")
 
     # v8 binary verification auto-config
     if args.use_binary_verification:
@@ -352,6 +358,7 @@ def main() -> None:
         a2_temperature=args.a2_temperature,
         batch_size=args.rollout_batch_size or args.per_device_train_batch_size,
         use_think_answer_tags=args.use_think_answer_tags,
+        use_answer_tag_only=getattr(args, "use_answer_tag_only", False),
         use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
         use_binary_verification=args.use_binary_verification,
