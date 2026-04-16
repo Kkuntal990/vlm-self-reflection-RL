@@ -53,6 +53,15 @@ FEEDBACK_CRITIC_SYSTEM_PROMPT = (
     "feedback in what is visible in the image."
 )
 
+# Binary verification prompt for v8 mode.
+# F1 outputs exactly one word: CORRECT or INCORRECT.
+BINARY_VERIFICATION_SYSTEM_PROMPT = (
+    "You are a visual question answering verifier. "
+    "Given an image, a question, and the user's answer, "
+    "determine whether the answer is correct or incorrect. "
+    "Respond with exactly one word: CORRECT or INCORRECT."
+)
+
 # System prompt variant with think/answer tag instructions.
 # Used for A1 and A2 generation when use_think_answer_tags=True.
 VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS = (
@@ -94,7 +103,8 @@ def build_initial_answer_prompt(
         List of message dicts for A1 generation
     """
     system_prompt = (
-        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS if use_think_answer_tags
+        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
+        if use_think_answer_tags
         else VL_ASSISTANT_SYSTEM_PROMPT
     )
 
@@ -119,6 +129,7 @@ def build_critic_prompt(
     answer_type: str = "open",
     choices: str = "",
     model_type: str = "llava",
+    use_binary_verification: bool = False,
 ) -> list[dict]:
     """Build critic prompt for feedback generation with role-flipped conversation.
 
@@ -136,22 +147,33 @@ def build_critic_prompt(
     For Qwen2.5-VL: image is placed in the assistant message since Qwen's
     processor handles images natively in any role.
 
+    When use_binary_verification=True, the system prompt instructs the
+    model to output exactly "CORRECT" or "INCORRECT" instead of open
+    feedback.
+
     Args:
         question: The visual question (cleaned, no <image> tag)
         answer1: The initial answer to critique
         answer_type: Expected answer type (unused, kept for API compat)
         choices: Optional MCQ choices (unused, kept for API compat)
         model_type: Model family ("llava" or "qwen2vl")
+        use_binary_verification: If True, use binary verification prompt
 
     Returns:
         List of message dicts in conversational format
     """
+    critic_system = (
+        BINARY_VERIFICATION_SYSTEM_PROMPT
+        if use_binary_verification
+        else FEEDBACK_CRITIC_SYSTEM_PROMPT
+    )
+
     if model_type == "qwen2vl":
         # Qwen2.5-VL: role-flipped, image in assistant message (native support)
         messages = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": FEEDBACK_CRITIC_SYSTEM_PROMPT}],
+                "content": [{"type": "text", "text": critic_system}],
             },
             {
                 "role": "assistant",
@@ -172,7 +194,7 @@ def build_critic_prompt(
                 "role": "system",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": FEEDBACK_CRITIC_SYSTEM_PROMPT},
+                    {"type": "text", "text": critic_system},
                 ],
             },
             {
@@ -218,7 +240,8 @@ def build_refiner_prompt(
         List of message dicts in conversational format
     """
     system_prompt = (
-        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS if use_think_answer_tags
+        VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
+        if use_think_answer_tags
         else VL_ASSISTANT_SYSTEM_PROMPT
     )
     messages = [

@@ -318,6 +318,48 @@ def compute_f1_tag_penalty(feedback_text: str) -> float:
     return 0.0
 
 
+# ---- v8 Binary Verification Rewards ----
+
+_BINARY_VERIFICATION_PATTERN = re.compile(r"^\s*(CORRECT|INCORRECT)\s*$", re.IGNORECASE)
+
+
+def compute_verification_format_reward(feedback_text: str) -> float:
+    """R_format for binary verification: is output exactly CORRECT/INCORRECT?
+
+    Args:
+        feedback_text: Verification output from the model
+
+    Returns:
+        0.0 if format compliant, -2.0 if not
+    """
+    if _BINARY_VERIFICATION_PATTERN.match(feedback_text.strip()):
+        return 0.0
+    return -2.0
+
+
+def compute_verification_accuracy_reward(
+    feedback_text: str,
+    a1_is_correct: bool,
+) -> float:
+    """R_verification: does F1's CORRECT/INCORRECT match A1's actual correctness?
+
+    Args:
+        feedback_text: Verification output from the model
+        a1_is_correct: Whether A1 was actually correct
+
+    Returns:
+        +1.0 if classification matches ground truth,
+        -1.0 if classification contradicts ground truth,
+        0.0 if F1 is not in valid format (format reward handles penalty)
+    """
+    stripped = feedback_text.strip().upper()
+    if stripped == "CORRECT":
+        return 1.0 if a1_is_correct else -1.0
+    elif stripped == "INCORRECT":
+        return 1.0 if not a1_is_correct else -1.0
+    return 0.0
+
+
 def compute_critic_reward_breakdown(
     feedback_text: str,
     a2_text: str,
@@ -1028,14 +1070,16 @@ def compute_feedback_reward_breakdown(
     weights: Any,
     use_improvement_reward: bool = False,
     reward_shaping_alpha: float = 0.0,
+    use_binary_verification: bool = False,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
-    Components:
-    1. Downstream-aware (did F1 help A2?) — transition-shaped or improvement-based
-    2. Calibration — keyword-based assessment (variance-breaking tiebreaker)
-    3. Format — is F1 substantive?
-    4. Tag penalty — punish F1 using think/answer tags
+    Two modes:
+    - **Standard** (use_binary_verification=False): open-ended critique with
+      downstream, calibration, format, and tag penalty components.
+    - **Binary verification** (use_binary_verification=True): F1 outputs
+      CORRECT/INCORRECT. Components: downstream, verification accuracy,
+      binary format check. Calibration and tag penalty disabled.
 
     Args:
         feedback_text: Feedback text from the critic
@@ -1047,6 +1091,8 @@ def compute_feedback_reward_breakdown(
         weights: FeedbackRewardWeights instance
         use_improvement_reward: If True, use R(A2)-R(A1) instead of
             transition-shaped downstream constants
+        reward_shaping_alpha: SCoRe-style shaped reward alpha
+        use_binary_verification: If True, use binary verification rewards
 
     Returns:
         TrajectoryFeedbackRewardBreakdown with all component scores
@@ -1059,8 +1105,11 @@ def compute_feedback_reward_breakdown(
     a1_correct = a1_result.is_correct
     a2_correct = a2_result.is_correct
 
-    # Feedback format reward (penalty-only: 0.0 = valid, negative = invalid)
-    r_format = compute_critic_format_reward(feedback_text)
+    # Format reward depends on mode
+    if use_binary_verification:
+        r_format = compute_verification_format_reward(feedback_text)
+    else:
+        r_format = compute_critic_format_reward(feedback_text)
     format_valid = r_format >= 0
 
     # Downstream-aware reward (computed directly, no extra verify_answer call)
@@ -1093,14 +1142,15 @@ def compute_feedback_reward_breakdown(
         else:
             r_downstream = 2.0 if a2_correct else -1.0
 
-    # Calibration: keyword-based assessment of whether F1 correctly
-    # identifies A1 correctness. Used as variance-breaking tiebreaker
-    # since feedback TEXT varies across K trajectories.
-    r_calibration = compute_feedback_calibration_reward(feedback_text, a1_correct)
-
-    # Tag leakage penalty: punish F1 that uses <think>/<answer> tags
-    # from A1/A2 training. Only applied when w_tag_penalty > 0.
-    r_tag_penalty = compute_f1_tag_penalty(feedback_text)
+    if use_binary_verification:
+        # Binary mode: verification accuracy replaces calibration,
+        # tag penalty is irrelevant (F1 outputs 1 word).
+        r_calibration = compute_verification_accuracy_reward(feedback_text, a1_correct)
+        r_tag_penalty = 0.0
+    else:
+        # Standard mode: keyword-based calibration + tag leakage penalty
+        r_calibration = compute_feedback_calibration_reward(feedback_text, a1_correct)
+        r_tag_penalty = compute_f1_tag_penalty(feedback_text)
 
     components = {
         "downstream": r_downstream,
@@ -1109,9 +1159,13 @@ def compute_feedback_reward_breakdown(
         "tag_penalty": r_tag_penalty,
     }
     w_tag = getattr(weights, "w_tag_penalty", 0.0)
+    w_verif = getattr(weights, "w_verification_accuracy", 0.0)
+    # In binary mode, verification accuracy uses the calibration slot
+    # but with its own weight.
+    cal_weight = w_verif if use_binary_verification else weights.w_calibration
     weighted_components = {
         "downstream": r_downstream * weights.w_downstream,
-        "calibration": r_calibration * weights.w_calibration,
+        "calibration": r_calibration * cal_weight,
         "format": r_format * weights.w_format,
         "tag_penalty": r_tag_penalty * w_tag,
     }

@@ -448,8 +448,14 @@ def generate_self_reflection_rollout(
             all_a1s.extend(chunk_a1s)
 
             # Step 2: Generate F1 for each trajectory.
+            use_binary = getattr(config, "use_binary_verification", False)
             f1_prompts = [
-                build_critic_prompt(chunk_qs[i], chunk_a1s[i * k + j], model_type=model_type)
+                build_critic_prompt(
+                    chunk_qs[i],
+                    chunk_a1s[i * k + j],
+                    model_type=model_type,
+                    use_binary_verification=use_binary,
+                )
                 for i in range(chunk_size)
                 for j in range(k)
             ]
@@ -538,6 +544,7 @@ def generate_self_reflection_rollout(
                 weights=feedback_weights,
                 use_improvement_reward=getattr(config, "use_improvement_reward", False),
                 reward_shaping_alpha=getattr(config, "reward_shaping_alpha", 0.0),
+                use_binary_verification=getattr(config, "use_binary_verification", False),
             )
             result.response_rewards.append(resp_bd.total_reward)
             result.feedback_rewards.append(fb_bd.total_reward)

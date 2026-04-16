@@ -154,6 +154,18 @@ def parse_args() -> argparse.Namespace:
         "Overrides --use_improvement_reward when > 0.",
     )
     parser.add_argument(
+        "--use_binary_verification",
+        action="store_true",
+        help="V8: Binary verification mode. F1 outputs CORRECT/INCORRECT "
+        "instead of open critique. Auto-disables think/answer tags.",
+    )
+    parser.add_argument(
+        "--w_verification_accuracy",
+        type=float,
+        default=0.0,
+        help="Weight for F1 verification accuracy reward (v8 binary mode)",
+    )
+    parser.add_argument(
         "--freeze_a1_steps",
         type=int,
         default=0,
@@ -294,6 +306,27 @@ def main() -> None:
         w_a2_format = 0.5
         logger.info("Auto-increased w_a2_format to 0.5 for think/answer tag mode")
 
+    # v8 binary verification auto-config
+    if args.use_binary_verification:
+        if args.use_think_answer_tags:
+            logger.warning("--use_binary_verification overrides --use_think_answer_tags to False")
+            args.use_think_answer_tags = False
+        # Auto-reduce token limits for minimal output
+        if args.a1_max_completion_length >= 200:
+            args.a1_max_completion_length = 32
+            logger.info("Auto-reduced a1_max_completion to 32 for binary verification")
+        if args.f1_max_completion_length >= 200:
+            args.f1_max_completion_length = 16
+            logger.info("Auto-reduced f1_max_completion to 16 for binary verification")
+        if args.a2_max_completion_length >= 200:
+            args.a2_max_completion_length = 32
+            logger.info("Auto-reduced a2_max_completion to 32 for binary verification")
+        # Auto-set verification accuracy weight if not explicitly set
+        if args.w_verification_accuracy == 0.0:
+            args.w_verification_accuracy = 1.0
+            logger.info("Auto-set w_verification_accuracy to 1.0 for binary verification")
+        logger.info("Pipeline mode: V8 Binary Verification (A1→F1:CORRECT/INCORRECT→A2)")
+
     response_weights = ResponseRewardWeights(
         w_a1_correctness=args.w_a1_correctness,
         w_a2_correctness=args.w_a2_correctness,
@@ -306,6 +339,7 @@ def main() -> None:
         w_calibration=args.w_calibration,
         w_format=args.w_fb_format,
         w_tag_penalty=args.w_fb_tag_penalty,
+        w_verification_accuracy=args.w_verification_accuracy,
     )
     rollout_config = RolloutConfig(
         k_samples=args.k_samples,
@@ -320,6 +354,7 @@ def main() -> None:
         use_think_answer_tags=args.use_think_answer_tags,
         use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
+        use_binary_verification=args.use_binary_verification,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -429,6 +464,7 @@ def main() -> None:
                 response_weights,
                 feedback_weights,
                 reward_shaping_alpha=args.reward_shaping_alpha,
+                use_binary_verification=args.use_binary_verification,
             )
         return
 
@@ -685,6 +721,7 @@ def _run_sanity_check(
     response_weights: object,
     feedback_weights: object,
     reward_shaping_alpha: float = 0.0,
+    use_binary_verification: bool = False,
 ) -> None:
     """Run sanity check with synthetic (A1, F1, A2) tuples.
 
@@ -695,6 +732,7 @@ def _run_sanity_check(
         response_weights: Response reward weights
         feedback_weights: Feedback reward weights
         reward_shaping_alpha: SCoRe-style shaped reward alpha
+        use_binary_verification: If True, use binary verification test cases
     """
     from vlm_grpo.rewards.composition import (
         compute_feedback_reward_breakdown,
@@ -702,7 +740,8 @@ def _run_sanity_check(
     )
 
     logger.info("=" * 70)
-    logger.info("SANITY CHECK MODE (two-reward self-reflection)")
+    mode = "BINARY VERIFICATION" if use_binary_verification else "two-reward self-reflection"
+    logger.info(f"SANITY CHECK MODE ({mode})")
     logger.info("=" * 70)
     logger.info(f"Response weights: {response_weights.to_dict()}")
     logger.info(f"Feedback weights: {feedback_weights.to_dict()}")
@@ -721,28 +760,52 @@ def _run_sanity_check(
         logger.info(f"  GT: {gt} | Type: {a_type} | Dataset: {ds}")
 
         # Synthetic trajectory scenarios
-        test_cases = {
-            "RR_good_feedback": {
-                "a1": gt,
-                "f1": "The answer is correct and well-supported by the image.",
-                "a2": gt,
-            },
-            "RW_bad_feedback": {
-                "a1": gt,
-                "f1": "The answer is incorrect, it should be changed completely.",
-                "a2": "ZZZ_WRONG_ANSWER",
-            },
-            "WR_helpful_feedback": {
-                "a1": "ZZZ_WRONG_ANSWER",
-                "f1": f"The answer is incorrect. The correct answer should be {gt}.",
-                "a2": gt,
-            },
-            "WW_useless_feedback": {
-                "a1": "ZZZ_WRONG_ANSWER",
-                "f1": "Looks fine to me.",
-                "a2": "ZZZ_STILL_WRONG",
-            },
-        }
+        if use_binary_verification:
+            test_cases = {
+                "RR_correct_verify": {
+                    "a1": gt,
+                    "f1": "CORRECT",
+                    "a2": gt,
+                },
+                "RW_wrong_verify": {
+                    "a1": gt,
+                    "f1": "INCORRECT",
+                    "a2": "ZZZ_WRONG_ANSWER",
+                },
+                "WR_correct_verify": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": "INCORRECT",
+                    "a2": gt,
+                },
+                "WW_sycophantic_verify": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": "CORRECT",
+                    "a2": "ZZZ_STILL_WRONG",
+                },
+            }
+        else:
+            test_cases = {
+                "RR_good_feedback": {
+                    "a1": gt,
+                    "f1": "The answer is correct and well-supported by the image.",
+                    "a2": gt,
+                },
+                "RW_bad_feedback": {
+                    "a1": gt,
+                    "f1": "The answer is incorrect, it should be changed completely.",
+                    "a2": "ZZZ_WRONG_ANSWER",
+                },
+                "WR_helpful_feedback": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": f"The answer is incorrect. The correct answer should be {gt}.",
+                    "a2": gt,
+                },
+                "WW_useless_feedback": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": "Looks fine to me.",
+                    "a2": "ZZZ_STILL_WRONG",
+                },
+            }
 
         for case_name, traj in test_cases.items():
             resp_bd = compute_response_reward_breakdown(
@@ -763,6 +826,7 @@ def _run_sanity_check(
                 choices=ch,
                 weights=feedback_weights,
                 reward_shaping_alpha=reward_shaping_alpha,
+                use_binary_verification=use_binary_verification,
             )
 
             logger.info(f"  [{case_name}]")

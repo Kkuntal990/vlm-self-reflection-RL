@@ -661,7 +661,13 @@ class SelfReflectionGRPOTrainer:
                 )
                 a1_full = build_prompt_with_completion(a1_prompt, a1)
 
-                f1_prompt = build_critic_prompt(result.question, a1, model_type=model_type)
+                use_binary = getattr(self.config.rollout, "use_binary_verification", False)
+                f1_prompt = build_critic_prompt(
+                    result.question,
+                    a1,
+                    model_type=model_type,
+                    use_binary_verification=use_binary,
+                )
                 f1_full = build_prompt_with_completion(f1_prompt, f1)
 
                 a2_prompt = build_refiner_prompt(
@@ -741,7 +747,12 @@ class SelfReflectionGRPOTrainer:
                             rr.question, use_think_answer_tags=use_tags
                         )
                         a1_full = build_prompt_with_completion(a1_prompt, a1)
-                        f1_prompt = build_critic_prompt(rr.question, a1, model_type=model_type)
+                        f1_prompt = build_critic_prompt(
+                            rr.question,
+                            a1,
+                            model_type=model_type,
+                            use_binary_verification=use_binary,
+                        )
                         f1_full = build_prompt_with_completion(f1_prompt, f1)
                         a2_prompt = build_refiner_prompt(
                             rr.question,

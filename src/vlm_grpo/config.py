@@ -95,6 +95,7 @@ class RolloutConfig:
     use_think_answer_tags: bool = False
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
+    use_binary_verification: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -178,6 +179,7 @@ class FeedbackRewardWeights:
     w_calibration: float = 0.0
     w_format: float = 0.15
     w_tag_penalty: float = 0.5
+    w_verification_accuracy: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
