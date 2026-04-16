@@ -107,7 +107,7 @@ spec:
         - name: MODEL_ID
           value: "Qwen/Qwen2.5-VL-7B-Instruct"
         - name: DATASET_PATH
-          value: "/outputs/livr_data/livr_perception_mcq.jsonl"
+          value: "/outputs/livr_data/livr_perception_mixed.jsonl"
         - name: OUTPUT_DIR
           value: "/outputs/grpo_qwen_livr_v7"
         - name: IMAGE_BASE_DIR
