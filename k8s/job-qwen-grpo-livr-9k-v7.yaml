@@ -191,7 +191,7 @@ spec:
         # A2: r_no_reg = α*(r_a2 - r_a1), w=1.0 (α handles scaling)
         # F1: r_downstream = r_a2 + α*(r_a2 - r_a1), w=1.0
         - name: REWARD_SHAPING_ALPHA
-          value: "5.0"
+          value: "10.0"
         - name: W_A1_CORRECTNESS
           value: "1.0"
         - name: W_A2_CORRECTNESS
