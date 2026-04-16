@@ -127,7 +127,7 @@ def match_numeric(
         return False
 
     if gt_val == 0:
-        return abs(pred_val) < tolerance
+        return abs(pred_val) <= tolerance
 
     return abs(pred_val - gt_val) / max(abs(gt_val), 1e-10) <= tolerance
 
@@ -160,6 +160,8 @@ def match_answer(
         return match_yesno(predicted, ground_truth)
     elif answer_type == "numeric":
         return match_numeric(predicted, ground_truth, tolerance)
+    elif answer_type == "counting":
+        return match_numeric(predicted, ground_truth, tolerance=0.0)
     else:
         # Open-ended: direct comparison (both already normalized/lowercase)
         if predicted == ground_truth:

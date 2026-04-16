@@ -23,9 +23,9 @@ _THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IG
 
 # Answer extraction patterns (case-insensitive for a-f / A-F)
 _MCQ_LETTER_PATTERN = re.compile(r"[A-Fa-f]")
-_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.)\s*$")
-# Matches "(A)", "(b)" or "A.", "b." at word boundary
-_MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)|([A-Fa-f])\.)")
+_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])[.\s]?)\s*$")
+# Matches "(A)", "(b)" or standalone "A.", "b." (not inside words like "presented.")
+_MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)|(?<!\w)([A-Fa-f])\.)")
 # Captures "(A) Yes" or "a. Yes" → letter + answer_text
 _MCQ_LETTER_AND_TEXT_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)\s*|([A-Fa-f])\.\s*)(.*)", re.DOTALL)
 # Matches "The answer is X" / "answer: X" / "Answer is X" / "answer:X" patterns
@@ -34,6 +34,15 @@ _MCQ_ANSWER_IS_PATTERN = re.compile(
 )
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
+_NUMBER_WORDS: dict[str, str] = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15",
+}
+_NUMBER_WORD_PATTERN = re.compile(
+    r"\b(" + "|".join(_NUMBER_WORDS.keys()) + r")\b", re.IGNORECASE
+)
 
 # Hedging detection patterns for yes/no answers
 _HEDGING_PATTERNS = [
@@ -206,8 +215,8 @@ def extract_answer_from_text(
         return _extract_mcq_answer(text)
     elif answer_type == "yesno":
         return _extract_yesno_answer(text)
-    elif answer_type == "numeric":
-        return _extract_numeric_answer(text)
+    elif answer_type in ("numeric", "counting"):
+        return _extract_numeric_answer(text, allow_words=answer_type == "counting")
     else:
         return text
 
@@ -277,19 +286,27 @@ def _extract_yesno_answer(text: str) -> str:
     return "Yes" if answer == "yes" else "No"
 
 
-def _extract_numeric_answer(text: str) -> str:
+def _extract_numeric_answer(text: str, allow_words: bool = False) -> str:
     """Extract numeric answer from text.
 
     Args:
         text: Raw answer text
+        allow_words: If True, also match number words (e.g., "six" -> "6").
+            Used for counting tasks where models may spell out numbers.
 
     Returns:
         Number string, or empty string if extraction failed
     """
     match = _NUMERIC_PATTERN.search(text)
-    if not match:
-        return ""
-    return match.group(0)
+    if match:
+        return match.group(0)
+
+    if allow_words:
+        word_match = _NUMBER_WORD_PATTERN.search(text)
+        if word_match:
+            return _NUMBER_WORDS[word_match.group(1).lower()]
+
+    return ""
 
 
 def extract_mcq_letter_and_text(text: str) -> tuple[str, str]:

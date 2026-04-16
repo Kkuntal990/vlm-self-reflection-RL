@@ -37,10 +37,10 @@ Usage:
 
 # VL Assistant system prompt for A1 and A2 generation.
 VL_ASSISTANT_SYSTEM_PROMPT = (
-    "You are a helpful vision-language assistant. You should produce accurate, "
-    "detailed, and grounded answers based on the image and the user's instructions. "
-    "When given feedback, critique, or scores, revise your response to improve "
-    "correctness, specificity, and completeness."
+    "You are a visual question answering assistant. "
+    "Look at the image carefully and answer the question. "
+    "When given feedback on your previous answer, re-examine the image "
+    "and either correct your answer or keep it if you believe it is right."
 )
 
 # Feedback critic system prompt for F1 generation.
@@ -54,21 +54,21 @@ FEEDBACK_CRITIC_SYSTEM_PROMPT = (
 )
 
 # Binary verification prompt for v8 mode.
-# F1 outputs exactly one word: CORRECT or INCORRECT.
+# F1 classifies the answer as CORRECT or INCORRECT with brief justification.
 BINARY_VERIFICATION_SYSTEM_PROMPT = (
     "You are a visual question answering verifier. "
     "Given an image, a question, and the user's answer, "
     "determine whether the answer is correct or incorrect. "
-    "Respond with exactly one word: CORRECT or INCORRECT."
+    "State your verdict as CORRECT or INCORRECT and briefly explain why."
 )
 
 # System prompt variant with think/answer tag instructions.
 # Used for A1 and A2 generation when use_think_answer_tags=True.
 VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS = (
-    "You are a helpful vision-language assistant. You should produce accurate, "
-    "detailed, and grounded answers based on the image and the user's instructions. "
-    "When given feedback, critique, or scores, revise your response to improve "
-    "correctness, specificity, and completeness.\n\n"
+    "You are a visual question answering assistant. "
+    "Look at the image carefully and answer the question. "
+    "When given feedback on your previous answer, re-examine the image "
+    "and either correct your answer or keep it if you believe it is right.\n\n"
     "Always structure your response as: first explain your visual reasoning "
     "inside <think> tags, then give your final answer inside <answer> tags.\n"
     "Example: <think>I see a cat in the top-left corner.</think>"

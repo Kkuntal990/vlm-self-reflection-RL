@@ -142,11 +142,11 @@ spec:
         - name: MAX_COMPLETION_LENGTH
           value: "256"
         - name: A1_MAX_COMPLETION
-          value: "32"
+          value: "256"
         - name: F1_MAX_COMPLETION
-          value: "16"
+          value: "256"
         - name: A2_MAX_COMPLETION
-          value: "32"
+          value: "256"
         - name: TEMPERATURE
           value: "1.0"
         - name: FEEDBACK_TEMPERATURE
@@ -188,9 +188,9 @@ spec:
         - name: FREEZE_A1_STEPS
           value: "280"
 
-        # v8: binary verification, shaped reward α=10
+        # v8: binary verification, shaped reward α=5
         - name: REWARD_SHAPING_ALPHA
-          value: "10.0"
+          value: "5.0"
         - name: W_A1_CORRECTNESS
           value: "1.0"
         - name: W_A2_CORRECTNESS
@@ -206,7 +206,7 @@ spec:
         - name: W_CALIBRATION
           value: "0.0"
         - name: W_FB_FORMAT
-          value: "0.15"
+          value: "0.0"
         - name: W_FB_TAG_PENALTY
           value: "0.0"
         - name: W_VERIFICATION_ACCURACY
