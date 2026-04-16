@@ -1031,7 +1031,14 @@ def compute_response_reward_breakdown(
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
     a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
-    a2_correct = a2_result.is_correct
+
+    # In answer-tag-only mode, if A2 has no <answer> tag, treat as WRONG
+    # regardless of what verify_answer found (prevents false positives
+    # from stray letters in prose like "A hen" matching GT "A").
+    if use_answer_tag_only and not re.search(r"<answer>", a2_text, re.IGNORECASE):
+        a2_correct = False
+    else:
+        a2_correct = a2_result.is_correct
 
     # Format reward
     r_a2_format = _compute_refiner_format_reward(
@@ -1040,7 +1047,9 @@ def compute_response_reward_breakdown(
     a2_format_valid = r_a2_format >= 0
 
     # Extract A2 for display
-    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
+    a2_extracted = extract_answer_from_text(
+        a2_text, answer_type, choices, require_answer_tag=use_answer_tag_only
+    )
 
     # A1 correctness reward
     r_a1 = 1.0 if a1_correct else -1.0
