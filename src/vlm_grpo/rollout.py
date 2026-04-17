@@ -54,6 +54,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_response_alpha(config: Any) -> float:
+    """Get shaped reward alpha for response (A2). Falls back to shared alpha."""
+    a = getattr(config, "response_alpha", -1.0)
+    if a >= 0:
+        return a
+    return getattr(config, "reward_shaping_alpha", 0.0)
+
+
+def _get_feedback_alpha(config: Any) -> float:
+    """Get shaped reward alpha for feedback (F1). Falls back to shared alpha."""
+    a = getattr(config, "feedback_alpha", -1.0)
+    if a >= 0:
+        return a
+    return getattr(config, "reward_shaping_alpha", 0.0)
+
+
 # =============================================================================
 # Rollout Data Structures
 # =============================================================================
@@ -539,7 +555,7 @@ def generate_self_reflection_rollout(
                 weights=response_weights,
                 use_think_answer_tags=config.use_think_answer_tags,
                 use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
-                reward_shaping_alpha=getattr(config, "reward_shaping_alpha", 0.0),
+                reward_shaping_alpha=_get_response_alpha(config),
             )
             fb_bd = compute_feedback_reward_breakdown(
                 feedback_text=f1,
@@ -550,7 +566,7 @@ def generate_self_reflection_rollout(
                 choices=choices_list[i],
                 weights=feedback_weights,
                 use_improvement_reward=getattr(config, "use_improvement_reward", False),
-                reward_shaping_alpha=getattr(config, "reward_shaping_alpha", 0.0),
+                reward_shaping_alpha=_get_feedback_alpha(config),
                 use_binary_verification=getattr(config, "use_binary_verification", False),
             )
             result.response_rewards.append(resp_bd.total_reward)

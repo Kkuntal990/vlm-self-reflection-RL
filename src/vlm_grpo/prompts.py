@@ -53,13 +53,26 @@ FEEDBACK_CRITIC_SYSTEM_PROMPT = (
     "feedback in what is visible in the image."
 )
 
-# Binary verification prompt for v8 mode.
+# Binary verification prompt for v8 mode (deprecated — no tags).
 # F1 classifies the answer as CORRECT or INCORRECT with brief justification.
 BINARY_VERIFICATION_SYSTEM_PROMPT = (
     "You are a visual question answering verifier. "
     "Given an image, a question, and the user's answer, "
     "determine whether the answer is correct or incorrect. "
     "State your verdict as CORRECT or INCORRECT and briefly explain why."
+)
+
+# v9 feedback verifier prompt with <feedback> tags for robust extraction.
+# The model puts its verdict in tags, then explains. This mirrors how
+# <answer> tags work for A1/A2 — deterministic extraction, no regex heuristics.
+FEEDBACK_VERIFIER_SYSTEM_PROMPT = (
+    "You are a visual question answering verifier. "
+    "Given an image, a question, and the user's answer, "
+    "determine whether the answer is correct or incorrect. "
+    "Put your verdict inside <feedback> tags as either CORRECT or INCORRECT, "
+    "then briefly explain why.\n"
+    "Example: <feedback>INCORRECT</feedback> The answer should be (B) because "
+    "the image shows a red car, not a blue one."
 )
 
 # System prompt variant with think/answer tag instructions.
@@ -179,7 +192,7 @@ def build_critic_prompt(
         List of message dicts in conversational format
     """
     critic_system = (
-        BINARY_VERIFICATION_SYSTEM_PROMPT
+        FEEDBACK_VERIFIER_SYSTEM_PROMPT
         if use_binary_verification
         else FEEDBACK_CRITIC_SYSTEM_PROMPT
     )

@@ -154,6 +154,18 @@ def parse_args() -> argparse.Namespace:
         "Overrides --use_improvement_reward when > 0.",
     )
     parser.add_argument(
+        "--response_alpha",
+        type=float,
+        default=-1.0,
+        help="Shaped reward alpha for response (A2). -1 means use --reward_shaping_alpha.",
+    )
+    parser.add_argument(
+        "--feedback_alpha",
+        type=float,
+        default=-1.0,
+        help="Shaped reward alpha for feedback (F1). -1 means use --reward_shaping_alpha.",
+    )
+    parser.add_argument(
         "--use_binary_verification",
         action="store_true",
         help="V8: Binary verification mode. F1 outputs CORRECT/INCORRECT "
@@ -361,6 +373,8 @@ def main() -> None:
         use_answer_tag_only=getattr(args, "use_answer_tag_only", False),
         use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
+        response_alpha=args.response_alpha,
+        feedback_alpha=args.feedback_alpha,
         use_binary_verification=args.use_binary_verification,
     )
     config = SelfReflectionConfig(

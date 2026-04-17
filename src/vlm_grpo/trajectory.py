@@ -20,6 +20,8 @@ import re
 # Tag extraction patterns for <think>...</think><answer>...</answer> format
 _ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
 _THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IGNORECASE)
+# Feedback tag pattern for F1 verdict: <feedback>CORRECT</feedback> or <feedback>INCORRECT</feedback>
+_FEEDBACK_TAG_PATTERN = re.compile(r"<feedback>\s*(.*?)\s*</feedback>", re.DOTALL | re.IGNORECASE)
 
 # Answer extraction patterns (case-insensitive for a-f / A-F)
 _MCQ_LETTER_PATTERN = re.compile(r"[A-Fa-f]")
@@ -178,6 +180,34 @@ def has_think_answer_tags(text: str) -> bool:
         True if both <think> and <answer> tags are present.
     """
     return bool(_THINK_TAG_PATTERN.search(text) and _ANSWER_TAG_PATTERN.search(text))
+
+
+def extract_from_feedback_tags(text: str) -> str:
+    """Extract verdict from <feedback>...</feedback> tags.
+
+    Args:
+        text: Raw F1 output, possibly containing <feedback> tags.
+
+    Returns:
+        Content inside <feedback> tags (e.g. "CORRECT" or "INCORRECT"),
+        or empty string if no tags found.
+    """
+    match = _FEEDBACK_TAG_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def has_feedback_tags(text: str) -> bool:
+    """Check whether text contains <feedback> tags.
+
+    Args:
+        text: Raw F1 output.
+
+    Returns:
+        True if <feedback> tags are present.
+    """
+    return bool(_FEEDBACK_TAG_PATTERN.search(text))
 
 
 def extract_answer_from_text(

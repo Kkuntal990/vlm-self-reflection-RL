@@ -96,6 +96,8 @@ class RolloutConfig:
     use_answer_tag_only: bool = False
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
+    response_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
+    feedback_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
     use_binary_verification: bool = False
 
     def to_dict(self) -> dict:

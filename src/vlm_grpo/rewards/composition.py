@@ -318,30 +318,40 @@ def compute_f1_tag_penalty(feedback_text: str) -> float:
     return 0.0
 
 
-# ---- v8 Binary Verification Rewards ----
-
-_BINARY_VERIFICATION_PATTERN = re.compile(r"^\s*(CORRECT|INCORRECT)\s*$", re.IGNORECASE)
+# ---- Binary Verification Rewards (v9: <feedback> tag based) ----
 
 
 def compute_verification_format_reward(feedback_text: str) -> float:
-    """R_format for binary verification: is output exactly CORRECT/INCORRECT?
+    """R_format for binary verification: does F1 have <feedback> tags with valid verdict?
+
+    Binary: 1.0 if <feedback>CORRECT</feedback> or <feedback>INCORRECT</feedback>
+    present, 0.0 otherwise. Mirrors DeepSeek-R1 binary format convention.
 
     Args:
         feedback_text: Verification output from the model
 
     Returns:
-        0.0 if format compliant, -2.0 if not
+        1.0 if format compliant, 0.0 if not
     """
-    if _BINARY_VERIFICATION_PATTERN.match(feedback_text.strip()):
+    from vlm_grpo.trajectory import extract_from_feedback_tags, has_feedback_tags
+
+    if not has_feedback_tags(feedback_text):
         return 0.0
-    return -2.0
+    verdict = extract_from_feedback_tags(feedback_text).upper()
+    if verdict in ("CORRECT", "INCORRECT"):
+        return 1.0
+    return 0.0
 
 
 def compute_verification_accuracy_reward(
     feedback_text: str,
     a1_is_correct: bool,
 ) -> float:
-    """R_verification: does F1's CORRECT/INCORRECT match A1's actual correctness?
+    """R_verification: does F1's verdict match A1's actual correctness?
+
+    Extracts verdict from <feedback> tags first (deterministic). Falls back
+    to searching for CORRECT/INCORRECT anywhere in the text if no tags found
+    (handles early training before model learns tags).
 
     Args:
         feedback_text: Verification output from the model
@@ -350,36 +360,32 @@ def compute_verification_accuracy_reward(
     Returns:
         +1.0 if classification matches ground truth,
         -1.0 if classification contradicts ground truth,
-        0.0 if F1 is not in valid format (format reward handles penalty)
+        0.0 if verdict cannot be determined
     """
-    # Search for INCORRECT/CORRECT anywhere in the text.
-    # Check INCORRECT first since "CORRECT" is a substring of it.
-    # Handles: "INCORRECT\n\nExplanation...", "The answer is incorrect",
-    # "CORRECT. The painting...", "I believe this is correct", etc.
+    from vlm_grpo.trajectory import extract_from_feedback_tags, has_feedback_tags
+
+    # Primary: extract from <feedback> tags (clean, deterministic)
+    if has_feedback_tags(feedback_text):
+        verdict = extract_from_feedback_tags(feedback_text).upper()
+        if verdict == "INCORRECT":
+            return 1.0 if not a1_is_correct else -1.0
+        if verdict == "CORRECT":
+            return 1.0 if a1_is_correct else -1.0
+        return 0.0
+
+    # Fallback: search for INCORRECT/CORRECT anywhere in text.
+    # Needed for early training before the model learns to use tags.
     upper = feedback_text.upper()
     if not upper.strip():
         return 0.0
-    has_incorrect = "INCORRECT" in upper
-    has_correct = "CORRECT" in upper
-    if has_incorrect and not has_correct:
-        # Only "INCORRECT" found (note: "INCORRECT" contains "CORRECT",
-        # so if has_incorrect is True, has_correct is also True from
-        # the substring). This branch handles the edge case where the
-        # word is only "INCORRECT".
-        return 1.0 if not a1_is_correct else -1.0
-    if has_incorrect:
-        # Both present — "INCORRECT" contains "CORRECT" as substring.
-        # Check if there's a standalone "CORRECT" NOT inside "INCORRECT".
-        # Use regex to find word-boundary CORRECT that isn't INCORRECT.
-        import re
+    # Check INCORRECT first (contains CORRECT as substring)
+    if "INCORRECT" in upper:
+        # Verify no standalone CORRECT exists (ambiguous)
         standalone_correct = re.search(r"(?<!IN)CORRECT", upper)
         if not standalone_correct:
-            # Only "INCORRECT" (the "CORRECT" match was inside it)
             return 1.0 if not a1_is_correct else -1.0
-        # Both standalone CORRECT and INCORRECT → ambiguous, return 0
         return 0.0
-    if has_correct:
-        # Only standalone "CORRECT"
+    if "CORRECT" in upper:
         return 1.0 if a1_is_correct else -1.0
     return 0.0
 
