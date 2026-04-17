@@ -352,16 +352,34 @@ def compute_verification_accuracy_reward(
         -1.0 if classification contradicts ground truth,
         0.0 if F1 is not in valid format (format reward handles penalty)
     """
-    # Extract verdict from the first line/word. F1 outputs
-    # "INCORRECT\n\nExplanation: ..." so we match the leading word,
-    # not the entire text.
-    stripped = feedback_text.strip()
-    if not stripped:
+    # Search for INCORRECT/CORRECT anywhere in the text.
+    # Check INCORRECT first since "CORRECT" is a substring of it.
+    # Handles: "INCORRECT\n\nExplanation...", "The answer is incorrect",
+    # "CORRECT. The painting...", "I believe this is correct", etc.
+    upper = feedback_text.upper()
+    if not upper.strip():
         return 0.0
-    first_word = stripped.split()[0].strip(".:,!").upper()
-    if first_word == "INCORRECT":
+    has_incorrect = "INCORRECT" in upper
+    has_correct = "CORRECT" in upper
+    if has_incorrect and not has_correct:
+        # Only "INCORRECT" found (note: "INCORRECT" contains "CORRECT",
+        # so if has_incorrect is True, has_correct is also True from
+        # the substring). This branch handles the edge case where the
+        # word is only "INCORRECT".
         return 1.0 if not a1_is_correct else -1.0
-    elif first_word == "CORRECT":
+    if has_incorrect:
+        # Both present — "INCORRECT" contains "CORRECT" as substring.
+        # Check if there's a standalone "CORRECT" NOT inside "INCORRECT".
+        # Use regex to find word-boundary CORRECT that isn't INCORRECT.
+        import re
+        standalone_correct = re.search(r"(?<!IN)CORRECT", upper)
+        if not standalone_correct:
+            # Only "INCORRECT" (the "CORRECT" match was inside it)
+            return 1.0 if not a1_is_correct else -1.0
+        # Both standalone CORRECT and INCORRECT → ambiguous, return 0
+        return 0.0
+    if has_correct:
+        # Only standalone "CORRECT"
         return 1.0 if a1_is_correct else -1.0
     return 0.0
 

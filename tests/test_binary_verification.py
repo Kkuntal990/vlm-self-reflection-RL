@@ -62,8 +62,16 @@ class TestVerificationAccuracyReward:
     def test_incorrect_when_a1_right(self) -> None:
         assert compute_verification_accuracy_reward("INCORRECT", a1_is_correct=True) == -1.0
 
-    def test_invalid_format_returns_zero(self) -> None:
-        assert compute_verification_accuracy_reward("maybe correct", a1_is_correct=True) == 0.0
+    def test_no_verdict_returns_zero(self) -> None:
+        assert compute_verification_accuracy_reward("The painting shows blue tones", a1_is_correct=True) == 0.0
+
+    def test_embedded_correct_matches(self) -> None:
+        """Text containing 'correct' anywhere should match."""
+        assert compute_verification_accuracy_reward("maybe correct", a1_is_correct=True) == 1.0
+
+    def test_ambiguous_both_returns_zero(self) -> None:
+        """Text with both CORRECT and INCORRECT returns 0 (ambiguous)."""
+        assert compute_verification_accuracy_reward("correct, not incorrect", a1_is_correct=True) == 0.0
 
     def test_empty_returns_zero(self) -> None:
         assert compute_verification_accuracy_reward("", a1_is_correct=True) == 0.0
