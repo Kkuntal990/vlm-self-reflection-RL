@@ -924,10 +924,10 @@ def compute_response_reward_breakdown(
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
 
-    # When tags are required (think+answer or answer-only mode) and A2
-    # has no <answer> tag: correctness=0 (neutral), treat as WRONG for
-    # transitions. Prevents false positives from stray letters in prose.
-    requires_tags = use_think_answer_tags or use_answer_tag_only
+    # When think+answer tags are required and A2 has no <answer> tag:
+    # short-circuit to penalty-only. Prevents false positives from stray
+    # letters in prose being extracted as MCQ answers.
+    requires_tags = use_think_answer_tags
     a2_has_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
 
     if requires_tags and not a2_has_tag:
@@ -965,7 +965,7 @@ def compute_response_reward_breakdown(
 
         # Format reward
         r_a2_format = _compute_refiner_format_reward(
-            a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+            a2_text, answer_type, ground_truth, use_think_answer_tags
         )
         a2_format_valid = r_a2_format > 0
 
