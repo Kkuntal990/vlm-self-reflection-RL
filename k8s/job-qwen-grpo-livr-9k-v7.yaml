@@ -109,7 +109,7 @@ spec:
         - name: DATASET_PATH
           value: "/outputs/livr_data/livr_perception_mixed.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v7"
+          value: "/outputs/grpo_qwen_livr_v7b"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -119,7 +119,7 @@ spec:
         - name: KL_COEFF
           value: "0.02"
         - name: A1_KL_COEFF
-          value: "1000.0"
+          value: "150.0"
         - name: A2_KL_COEFF
           value: "1.0"
         - name: FB_KL_COEFF
@@ -187,11 +187,11 @@ spec:
         - name: FREEZE_A1_STEPS
           value: "280"
 
-        # v7: shaped reward alpha=5 for both A2 and F1
+        # v7: shaped reward α=5 (reduced from 10 to keep RR advantage positive)
         # A2: r_no_reg = α*(r_a2 - r_a1), w=1.0 (α handles scaling)
         # F1: r_downstream = r_a2 + α*(r_a2 - r_a1), w=1.0
         - name: REWARD_SHAPING_ALPHA
-          value: "10.0"
+          value: "5.0"
         - name: W_A1_CORRECTNESS
           value: "1.0"
         - name: W_A2_CORRECTNESS
@@ -199,7 +199,7 @@ spec:
         - name: W_NO_REGRESSION
           value: "1.0"
         - name: W_A2_FORMAT
-          value: "0.5"
+          value: "2.0"
         - name: W_MINIMAL_EDIT
           value: "0.0"
         - name: W_DOWNSTREAM
@@ -211,9 +211,9 @@ spec:
         - name: W_FB_TAG_PENALTY
           value: "0.5"
 
-        # Resume from checkpoint (node crash at ~44%)
+        # Fresh start — reward structure changed (α, format weight, KL)
         - name: RESUME_CHECKPOINT
-          value: "/outputs/grpo_qwen_livr_v7/checkpoint-250"
+          value: ""
 
         # Logging
         - name: LOGGING_STEPS
@@ -264,7 +264,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v7-shaped"
+          value: "grpo-livr-9k-v7b-shaped"
 
         resources:
           limits:

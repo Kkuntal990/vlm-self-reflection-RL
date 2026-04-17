@@ -931,11 +931,11 @@ def compute_response_reward_breakdown(
     a2_has_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
 
     if requires_tags and not a2_has_tag:
-        # No <answer> tag: small negative reward to nudge toward tags.
-        # Not zero (wasted trajectory — zero advantage in GRPO).
-        # Not ±1 correctness (false positives from stray letters in prose).
-        # Only the format penalty fires: -1.0 raw, weighted by w_a2_format.
-        _NO_TAG_PENALTY = -1.0
+        # No <answer> tag: strong negative to push model toward tags.
+        # -2.0 raw × w_a2_format ensures no-tag is always worse than
+        # the worst tagged outcome (WW with tags), creating clear
+        # gradient signal for tag adoption separate from correctness.
+        _NO_TAG_PENALTY = -2.0
         components = {
             "a1_correctness": 0.0,
             "a2_correctness": 0.0,
