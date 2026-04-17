@@ -111,7 +111,7 @@ spec:
         - name: DATASET_PATH
           value: "/outputs/livr_data/livr_perception_mixed.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v8"
+          value: "/outputs/grpo_qwen_livr_v8b"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -121,7 +121,7 @@ spec:
         - name: KL_COEFF
           value: "0.02"
         - name: A1_KL_COEFF
-          value: "1000.0"
+          value: "150.0"
         - name: A2_KL_COEFF
           value: "1.0"
         - name: FB_KL_COEFF
@@ -153,7 +153,7 @@ spec:
         - name: FEEDBACK_TEMPERATURE
           value: "1.0"
         - name: A2_TEMPERATURE
-          value: "1.0"
+          value: "0.7"
 
         # Optimization
         - name: LEARNING_RATE
@@ -189,7 +189,7 @@ spec:
         - name: FREEZE_A1_STEPS
           value: "280"
 
-        # v8: binary verification, shaped reward α=5
+        # v8b: binary verification, shaped α=5, no-tag fix, lower KL, a2_temp=0.7
         - name: REWARD_SHAPING_ALPHA
           value: "5.0"
         - name: W_A1_CORRECTNESS
@@ -199,9 +199,9 @@ spec:
         - name: W_NO_REGRESSION
           value: "1.0"
         - name: W_A2_FORMAT
-          value: "0.5"
+          value: "2.0"
         - name: W_MINIMAL_EDIT
-          value: "0.0"
+          value: "0.3"
         - name: W_DOWNSTREAM
           value: "1.0"
         - name: W_CALIBRATION
@@ -213,7 +213,9 @@ spec:
         - name: W_VERIFICATION_ACCURACY
           value: "1.0"
 
-        # Fresh start (v8 output dir lost in node crash)
+        # Fresh start — reward structure changed fundamentally
+        - name: RESUME_CHECKPOINT
+          value: ""
 
         # Logging
         - name: LOGGING_STEPS
@@ -264,7 +266,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v8-verify"
+          value: "grpo-livr-9k-v8b-verify"
 
         resources:
           limits:

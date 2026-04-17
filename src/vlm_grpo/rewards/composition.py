@@ -352,11 +352,17 @@ def compute_verification_accuracy_reward(
         -1.0 if classification contradicts ground truth,
         0.0 if F1 is not in valid format (format reward handles penalty)
     """
-    stripped = feedback_text.strip().upper()
-    if stripped == "CORRECT":
-        return 1.0 if a1_is_correct else -1.0
-    elif stripped == "INCORRECT":
+    # Extract verdict from the first line/word. F1 outputs
+    # "INCORRECT\n\nExplanation: ..." so we match the leading word,
+    # not the entire text.
+    stripped = feedback_text.strip()
+    if not stripped:
+        return 0.0
+    first_word = stripped.split()[0].strip(".:,!").upper()
+    if first_word == "INCORRECT":
         return 1.0 if not a1_is_correct else -1.0
+    elif first_word == "CORRECT":
+        return 1.0 if a1_is_correct else -1.0
     return 0.0
 
 
@@ -1033,13 +1039,34 @@ def compute_response_reward_breakdown(
     a2_has_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
 
     if use_answer_tag_only and not a2_has_tag:
-        # No <answer> tag: neutral correctness, no format reward
-        a2_correct = False  # for transitions (RR/RW/WR/WW)
-        r_a1 = 1.0 if a1_correct else -1.0
-        r_a2 = 0.0  # neutral — no signal, not +1 or -1
-        r_a2_format = 0.0
-        a2_format_valid = False
-        a2_extracted = ""
+        # No <answer> tag: hard short-circuit to penalty-only.
+        # -2.0 raw × w_a2_format ensures no-tag is always worse than
+        # the worst tagged outcome. Prevents the bug where neutral
+        # r_a2=0 leaks into shaped reward giving +5 for no-tag + A1W.
+        _NO_TAG_PENALTY = -2.0
+        components = {
+            "a1_correctness": 0.0,
+            "a2_correctness": 0.0,
+            "no_regression": 0.0,
+            "a2_format": _NO_TAG_PENALTY,
+            "minimal_edit": 0.0,
+        }
+        weighted_components = {
+            "a1_correctness": 0.0,
+            "a2_correctness": 0.0,
+            "no_regression": 0.0,
+            "a2_format": _NO_TAG_PENALTY * weights.w_a2_format,
+            "minimal_edit": 0.0,
+        }
+        return TrajectoryResponseRewardBreakdown(
+            total_reward=_NO_TAG_PENALTY * weights.w_a2_format,
+            components=components,
+            weighted_components=weighted_components,
+            a1_correct=a1_correct,
+            a2_correct=False,
+            a2_extracted="",
+            a2_format_valid=False,
+        )
     else:
         a2_result = verify_answer(a2_text, ground_truth, answer_type)
         a2_correct = a2_result.is_correct
