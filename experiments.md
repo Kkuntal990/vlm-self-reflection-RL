@@ -235,3 +235,157 @@ v7 directly fixes #2 and #3. Problem #1 (sycophancy) requires architectural chan
 **Architecture**: Same as v6b (separate_turn_loss, A1 KL=1000x, freeze=280 steps). `--reward_shaping_alpha 5.0`, `w_no_regression=1.0`, `w_downstream=1.0`.
 
 **Refs**: SCoRe (2409.12917), Tyen et al. (2311.08516), Huang et al. (2310.01798).
+
+---
+
+## v7b: α=5 Shaped Reward + Rebalanced Weights
+
+**Job**: `qwen-grpo-livr-9k-v7-shaped` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v7.yaml`
+**Date**: 2026-04-17 | Base Qwen2.5-VL-7B | Commits `88107b5` → `202719b`
+**Output**: `/outputs/grpo_qwen_livr_v7b/` | **WandB**: `grpo-livr-9k-v7b-shaped`
+
+**Changes from v7 plan**: α reduced 10→5 (avoid RR negative advantage), w_a2_format 0.5→2.0 (format signal visible), no-tag penalty -1.0→-2.0 raw, A1_KL 1000x→150x. Used `<think>+<answer>` tags.
+
+| Metric | v7b late | Notes |
+|--------|---|---|
+| A1 Acc | 47.4% | Flat (KL strong) |
+| A2 Acc | 46.5% | Slightly below A1 |
+| **Self-reflection Δ** | **-0.9pp** | Negative |
+| WR rate | 2.9% | Low |
+| RW rate | 3.7% | Still > WR |
+
+**Root cause of regression**: `<think>` tags let the model reason itself out of correct answers. 97% of RW cases had positive F1 ("Your answer is correct") but the model overthought in `<think>` and flipped anyway. Job deleted in favor of v8 (answer-tag-only).
+
+---
+
+## v8b: Binary Verification + Answer-Tag-Only (FULL RUN COMPLETED)
+
+**Job**: `qwen-grpo-livr-9k-v8-verify` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v8.yaml`
+**Date**: 2026-04-17→18 | 24h+ total | Commit `a02b147`
+**Output**: `/outputs/grpo_qwen_livr_v8b/final/`
+**WandB**: `grpo-livr-9k-v8b-verify` ([link](https://wandb.ai/braindecode/vlm-self-reflection-grpo/runs/c1sgeeqp))
+
+**Changes from v7b**: `<answer>` tag only (no `<think>`), binary verification F1 (CORRECT/INCORRECT), a2_temp=0.7, w_minimal_edit=0.3. α=5, w_a2=1, w_fmt=2.0, A1_KL=150.
+
+**Completed**: Original crashed at step 1190 (SIGABRT rank 3); resumed from checkpoint-1000 pinned to commit a02b147, finished full 2763 steps.
+
+| Metric | Late 1600 trajectories | Notes |
+|--------|---|---|
+| A1 Acc | 50.9% | |
+| A2 Acc | 54.2% | |
+| **Self-reflection Δ** | **+3.3pp** | Best so far |
+| WR rate (of A1-wrong) | 21.9% | Big jump from v7b |
+| RW rate (of A1-correct) | 14.7% | Higher but offset by WR |
+| WR > RW? | **Yes** (172 > 120) | First experiment where this holds |
+
+**Worked**: no-tag short-circuit, `a2_temp=0.7`, `minimal_edit=0.3`, binary verifier simpler than freeform.
+**Failed**: 44% over-harshness (F1 cries wolf), sycophancy 29%→17% but still meaningful, rw_rate elevated.
+
+**Post-run bug discovery**: `train_self_reflection.py` auto-reduced F1 token cap from yaml-set 256 to **16 tokens** whenever `--use_binary_verification` was active. F1 explanations truncated mid-sentence. v8b was affected by this bug. Fix: remove auto-reduce (commit `f52b38d`).
+
+---
+
+## v9: Rebalanced Rewards + `<feedback>` Tags (RUNNING, α=3 w_a2=3)
+
+**Job**: `qwen-grpo-livr-9k-v9-balanced` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v9.yaml`
+**Date**: 2026-04-18 (fresh restart after F1 token cap bug fix) | Commit `f52b38d`
+**Output**: `/outputs/grpo_qwen_livr_v9_fixed/`
+**WandB**: `grpo-livr-9k-v9-balanced-fixed`
+
+**Hypothesis**: Rebalance WR:RR ratio to ~2:1 (was 4.3:1 in v7b) via:
+- α reduced 5→3 (halves shaped amplification)
+- w_a2_correctness 1→3 (raises RR base so it stays positive in advantage)
+- `<feedback>` tags for deterministic F1 verdict extraction
+- w_fb_format 0→0.5 (incentivize `<feedback>` tag usage + explanations)
+- Added separate `response_alpha` / `feedback_alpha` params (currently both 3)
+
+**Expected A2 reward table**:
+| Transition | v9 | v8b/v9b (α=5) |
+|---|---|---|
+| RR same + tag | +5.3 | +1.5 |
+| WR + tag | +11.0 | +12.0 |
+| RW + tag | -7.0 | -9.0 |
+| WW + tag | -1.0 | -0.5 |
+| No tag | -4.0 | -4.0 |
+
+**WR:RR ratio: 2.1:1** (both positive on hard Q).
+
+**Key infrastructure fixes from v8**:
+1. F1 token cap bug (auto-reduce to 16) removed → F1 explanations can reach 50-80 tokens
+2. Env-var prompts (commit `c9f6b7a`) → yaml is source of truth for prompts
+3. Commit pinning in yaml → reproducible runs
+
+**Progress at step ~670 (24%)**:
+| Window | resp_r | fb_r | rw_rate |
+|--------|---|---|---|
+| Pre-freeze (10-280) | +1.22 | +0.34 | 0.163 |
+| Post-freeze (280+) | +1.65 | +0.64 | 0.122 |
+
+Loss spikes: 2 (step 240, step 620) vs v9b's 4. Smoother training.
+
+---
+
+## v9b: v8b Ablation with Bug Fix (RUNNING, in parallel)
+
+**Job**: `qwen-grpo-livr-9k-v9b-v8params` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v9b.yaml`
+**Date**: 2026-04-18 | Commit `f52b38d`
+**Output**: `/outputs/grpo_qwen_livr_v9b/`
+**WandB**: `grpo-livr-9k-v9b-v8params-fixed`
+
+**Purpose**: Isolate the impact of the F1 token cap bug on v8b's design. Same parameters as v8b (α=5, w_a2=1, BINARY_VERIFIER prompt without `<feedback>` tags) but with the token cap bug fixed.
+
+**v8b vs v9b byte-for-byte identical except**:
+- Code commit: a02b147 (bug) → f52b38d (fixed)
+- Effective F1 token cap: 16 → 256
+
+**3-way comparison goal**:
+- **v9 vs v9b**: does rebalanced reward design beat v8b-style once the bug is fixed?
+- **v9b vs v8b-final**: how much did the bug hurt v8b?
+
+**Progress at step ~670 (24%)**:
+| Metric | v9 | v9b | Gap |
+|--------|------|------|------|
+| Cumulative resp | +1.47 | +1.29 | +0.18 (v9) |
+| Cumulative fb | **+0.51** | **-0.13** | **+0.64** (v9) |
+| rw_rate avg | 0.139 | 0.132 | tied |
+| Loss spikes | 2 | 4 | v9 more stable |
+
+---
+
+## Experimental Infrastructure Notes
+
+### EMA Smoothing
+
+Per-step metrics in wandb are smoothed with EMA:
+```python
+ema_alpha = 0.05  # weight for new value
+ema = 0.95 * prev + 0.05 * new
+```
+
+**Half-life ≈ 13.5 steps** (60 steps → 95% new info). EMA lags the true trend by ~14 steps. If the EMA of WR-RW stays flat over many steps, the underlying metric is genuinely not improving — this is an accurate signal, not a display artifact.
+
+### Known Bug Fixed in Commit `f52b38d`
+
+Prior to `f52b38d`, `train_self_reflection.py` had an auto-reduce that silently overrode yaml-set token caps to 16/32 tokens when `--use_binary_verification` was active. This truncated F1 explanations mid-sentence. Fixed by removing the auto-reduce and respecting yaml values.
+
+### Are Our Rewards Actually Training Self-Reflection?
+
+**Observation**: Rewards are outcome-based (did A2 improve over A1?), not process-based (did the model actually reflect on F1's content?). A WR transition gets the same reward whether:
+- Model correctly identified the error and fixed it (true reflection), OR
+- Model happened to sample a different answer that was correct (variance)
+
+Evidence from v8b trajectory analysis (77k trajectories):
+- When F1 says "CORRECT" and A1 IS correct: 19% of A2s CHANGE anyway
+- When F1 (miscalibrated) says "INCORRECT" and A1 IS correct: 52% follow → RW
+- Over-harshness rate: 44% (F1 defaults to "INCORRECT")
+- Sycophancy: early 29% → late 17% (did improve)
+
+This suggests the model learns **which tokens correlate with reward**, not necessarily the ACT of reflection. Self-reflection Δ of +3.3pp is real but may plateau without process-level signals.
+
+**Potential future rewards for true self-reflection** (v10+ ideas):
+- Gate A2 reward on whether A2's content cites F1's specific error
+- Reward F1 for citing visual evidence (not just verdict)
+- Add a "consistency" reward: A1 and A2 should agree when F1 says CORRECT
+- Supervised pre-training of F1 on calibrated critiques before joint RL
+
+**Refs**: SCoRe (2409.12917), Self-Rewarding Correction (2502.19613), Critique-GRPO (2506.03106), DAPO (2503.14476), Dr.GRPO (2503.20783).
