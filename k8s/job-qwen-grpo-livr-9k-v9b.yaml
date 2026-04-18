@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-livr-9k-v9-balanced
+  name: qwen-grpo-livr-9k-v9b-v8params
 spec:
   backoffLimit: 0
   template:
@@ -9,7 +9,7 @@ spec:
       labels:
         app: grpo-trainer
         model: qwen2-5-vl-7b
-        task: livr-perception-grpo-v9
+        task: livr-perception-grpo-v9b
     spec:
       restartPolicy: Never
       containers:
@@ -20,8 +20,8 @@ spec:
         - |
           set -e
           echo "========================================="
-          echo "Qwen2.5-VL-7B LIVR Perception GRPO v9"
-          echo "Changes: rebalanced rewards (w_a2=3,α=3), <feedback> tags, minimal_edit"
+          echo "Qwen2.5-VL-7B LIVR Perception GRPO v9b"
+          echo "Rerun of v8b params with F1 token cap bug fixed (was truncating to 16 tokens)"
           echo "Model: ${MODEL_ID}"
           echo "Dataset: ${DATASET_PATH}"
           echo "Output: ${OUTPUT_DIR}"
@@ -35,10 +35,10 @@ spec:
           # Install dependencies
           pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
 
-          # Clone and install project (pinned commit for reproducibility)
+          # Clone and install project — pinned to f52b38d (has F1 token cap fix)
           git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
           cd /workspace/vlm-self-reflection-RL
-          git checkout ${GIT_COMMIT:-afc46c2}
+          git checkout ${GIT_COMMIT:-f52b38d}
           pip install -e . 2>&1 | tail -3
 
           # Create output dir
@@ -112,11 +112,11 @@ spec:
         - name: DATASET_PATH
           value: "/outputs/livr_data/livr_perception_mixed.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v9_fixed"
+          value: "/outputs/grpo_qwen_livr_v9b"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
-        # v9: rebalanced + <feedback> tags + SCoRe Stage I
+        # v8: binary verification + shaped reward + SCoRe Stage I
         - name: SEPARATE_TURN_LOSS
           value: "1"
         - name: KL_COEFF
@@ -177,27 +177,22 @@ spec:
         # vLLM
         - name: VLLM_GPU_MEM
           value: "0.50"
-        # Pinned commit for reproducibility.
-        # f52b38d fixes the auto-reduce bug that silently truncated F1 to 16 tokens.
+        # v9b: same v8b params + F1 token cap bug fix (f52b38d).
+        # Fresh run — the LoRA adapter is trained with BINARY_VERIFIER prompt (no tags).
         - name: GIT_COMMIT
           value: "f52b38d"
-        - name: GIT_BRANCH
-          value: "feature/v8-verify-correct"
 
-        # === System Prompts (override Python defaults in prompts.py) ===
-        # v9: answer-tag-only A1/A2 + <feedback>-tag F1 verifier.
-        # Changing any prompt here requires a fresh run (don't resume across
-        # prompt changes — the model's policy is tied to the training prompt).
+        # === System Prompts (override Python defaults) ===
+        # v8: answer-tag-only A1/A2 + binary CORRECT/INCORRECT F1 (no feedback tags).
         - name: VL_ASSISTANT_PROMPT_ANS_TAG
           value: |
             You are a visual question answering assistant. Look at the image carefully and answer the question. When given feedback on your previous answer, re-examine the image and either correct your answer or keep it if you believe it is right.
 
             Put your final answer inside <answer> tags.
             Example: <answer>(A)</answer>
-        - name: FEEDBACK_VERIFIER_PROMPT
+        - name: BINARY_VERIFIER_PROMPT
           value: |
-            You are a visual question answering verifier. Given an image, a question, and the user's answer, determine whether the answer is correct or incorrect. Put your verdict inside <feedback> tags as either CORRECT or INCORRECT, then briefly explain why.
-            Example: <feedback>INCORRECT</feedback> The answer should be (B) because the image shows a red car, not a blue one.
+            You are a visual question answering verifier. Given an image, a question, and the user's answer, determine whether the answer is correct or incorrect. State your verdict as CORRECT or INCORRECT and briefly explain why.
 
         # Qwen2.5-VL image resolution
         - name: MAX_PIXELS
@@ -209,15 +204,13 @@ spec:
         - name: FREEZE_A1_STEPS
           value: "280"
 
-        # v9: rebalanced rewards — WR:RR ≈ 2:1, <feedback> tags, minimal_edit
-        # Key change: w_a2=3 raises RR base, α=3 halves shaped signal
-        # A2 rewards: RR=5.3, WR=11, RW=-7, WW=-1, no-tag=-4
+        # v8b: binary verification, shaped α=5, no-tag fix, lower KL, a2_temp=0.7
         - name: REWARD_SHAPING_ALPHA
-          value: "3.0"
+          value: "5.0"
         - name: W_A1_CORRECTNESS
           value: "1.0"
         - name: W_A2_CORRECTNESS
-          value: "3.0"
+          value: "1.0"
         - name: W_NO_REGRESSION
           value: "1.0"
         - name: W_A2_FORMAT
@@ -229,13 +222,13 @@ spec:
         - name: W_CALIBRATION
           value: "0.0"
         - name: W_FB_FORMAT
-          value: "0.5"
+          value: "0.0"
         - name: W_FB_TAG_PENALTY
           value: "0.5"
         - name: W_VERIFICATION_ACCURACY
           value: "1.0"
 
-        # Fresh start — reward structure changed fundamentally
+        # Fresh start — v9b is a new experiment (v8b params + bug fix)
         - name: RESUME_CHECKPOINT
           value: ""
 
@@ -288,7 +281,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v9-balanced-fixed"
+          value: "grpo-livr-9k-v9b-v8params-fixed"
 
         resources:
           limits:
