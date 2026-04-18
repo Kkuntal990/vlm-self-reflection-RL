@@ -35,9 +35,10 @@ spec:
           # Install dependencies
           pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
 
-          # Clone and install project (v8 branch!)
-          git clone -b ${GIT_BRANCH} https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          # Clone and install project (pinned commit for reproducibility)
+          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
           cd /workspace/vlm-self-reflection-RL
+          git checkout ${GIT_COMMIT:-afc46c2}
           pip install -e . 2>&1 | tail -3
 
           # Create output dir
@@ -176,8 +177,29 @@ spec:
         # vLLM
         - name: VLLM_GPU_MEM
           value: "0.50"
+        # Pinned commit for reproducibility. To use a different commit,
+        # override GIT_COMMIT; to use branch HEAD, clear it.
+        # c9f6b7a adds env-var override for prompts (above); afc46c2 is
+        # the original v9 launch commit with hardcoded prompts.
+        - name: GIT_COMMIT
+          value: "c9f6b7a"
         - name: GIT_BRANCH
           value: "feature/v8-verify-correct"
+
+        # === System Prompts (override Python defaults in prompts.py) ===
+        # v9: answer-tag-only A1/A2 + <feedback>-tag F1 verifier.
+        # Changing any prompt here requires a fresh run (don't resume across
+        # prompt changes — the model's policy is tied to the training prompt).
+        - name: VL_ASSISTANT_PROMPT_ANS_TAG
+          value: |
+            You are a visual question answering assistant. Look at the image carefully and answer the question. When given feedback on your previous answer, re-examine the image and either correct your answer or keep it if you believe it is right.
+
+            Put your final answer inside <answer> tags.
+            Example: <answer>(A)</answer>
+        - name: FEEDBACK_VERIFIER_PROMPT
+          value: |
+            You are a visual question answering verifier. Given an image, a question, and the user's answer, determine whether the answer is correct or incorrect. Put your verdict inside <feedback> tags as either CORRECT or INCORRECT, then briefly explain why.
+            Example: <feedback>INCORRECT</feedback> The answer should be (B) because the image shows a red car, not a blue one.
 
         # Qwen2.5-VL image resolution
         - name: MAX_PIXELS

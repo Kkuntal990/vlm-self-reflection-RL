@@ -35,9 +35,10 @@ spec:
           # Install dependencies
           pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
 
-          # Clone and install project (v8 branch!)
-          git clone -b ${GIT_BRANCH} https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          # Clone and install project (pinned commit to match crashed run's prompt)
+          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
           cd /workspace/vlm-self-reflection-RL
+          git checkout ${GIT_COMMIT:-a02b147}
           pip install -e . 2>&1 | tail -3
 
           # Create output dir
@@ -176,8 +177,22 @@ spec:
         # vLLM
         - name: VLLM_GPU_MEM
           value: "0.50"
-        - name: GIT_BRANCH
-          value: "feature/v8-verify-correct"
+        # Pinned commit — v8b was trained with BINARY_VERIFIER prompt (no tags).
+        # Do NOT update without a fresh run: the LoRA adapter is tied to this prompt.
+        - name: GIT_COMMIT
+          value: "a02b147"
+
+        # === System Prompts (override Python defaults) ===
+        # v8: answer-tag-only A1/A2 + binary CORRECT/INCORRECT F1 (no feedback tags).
+        - name: VL_ASSISTANT_PROMPT_ANS_TAG
+          value: |
+            You are a visual question answering assistant. Look at the image carefully and answer the question. When given feedback on your previous answer, re-examine the image and either correct your answer or keep it if you believe it is right.
+
+            Put your final answer inside <answer> tags.
+            Example: <answer>(A)</answer>
+        - name: BINARY_VERIFIER_PROMPT
+          value: |
+            You are a visual question answering verifier. Given an image, a question, and the user's answer, determine whether the answer is correct or incorrect. State your verdict as CORRECT or INCORRECT and briefly explain why.
 
         # Qwen2.5-VL image resolution
         - name: MAX_PIXELS
@@ -213,9 +228,9 @@ spec:
         - name: W_VERIFICATION_ACCURACY
           value: "1.0"
 
-        # Fresh start — reward structure changed fundamentally
+        # Resume from last good checkpoint (crash at step 1190)
         - name: RESUME_CHECKPOINT
-          value: ""
+          value: "/outputs/grpo_qwen_livr_v8b/checkpoint-1000"
 
         # Logging
         - name: LOGGING_STEPS
