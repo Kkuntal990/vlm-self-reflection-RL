@@ -329,16 +329,9 @@ def main() -> None:
         if args.use_think_answer_tags:
             logger.warning("--use_binary_verification overrides --use_think_answer_tags to False")
             args.use_think_answer_tags = False
-        # Auto-reduce token limits for minimal output
-        if args.a1_max_completion_length >= 200:
-            args.a1_max_completion_length = 32
-            logger.info("Auto-reduced a1_max_completion to 32 for binary verification")
-        if args.f1_max_completion_length >= 200:
-            args.f1_max_completion_length = 16
-            logger.info("Auto-reduced f1_max_completion to 16 for binary verification")
-        if args.a2_max_completion_length >= 200:
-            args.a2_max_completion_length = 32
-            logger.info("Auto-reduced a2_max_completion to 32 for binary verification")
+        # Token limits are NOT auto-reduced — yaml value is respected.
+        # (The earlier auto-reduce to 16 silently truncated F1 explanations
+        # even when the yaml specified 256. Always trust the yaml.)
         # Auto-set verification accuracy weight if not explicitly set
         if args.w_verification_accuracy == 0.0:
             args.w_verification_accuracy = 1.0
