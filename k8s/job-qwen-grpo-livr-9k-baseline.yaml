@@ -180,7 +180,7 @@ spec:
 
         # Pin to the baseline feature commit for reproducibility.
         - name: GIT_COMMIT
-          value: "3e5b853"
+          value: "0938485"
         - name: GIT_BRANCH
           value: "worktree-grpo-baseline"
 
