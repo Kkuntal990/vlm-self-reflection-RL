@@ -178,9 +178,9 @@ spec:
         - name: VLLM_GPU_MEM
           value: "0.50"
 
-        # Pin to the baseline worktree branch.
+        # Pin to the baseline feature commit for reproducibility.
         - name: GIT_COMMIT
-          value: "worktree-grpo-baseline"
+          value: "3e5b853"
         - name: GIT_BRANCH
           value: "worktree-grpo-baseline"
 
