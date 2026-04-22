@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-livr-9k-v10-revert
+  name: qwen-grpo-livr-9k-v10-r1init
 spec:
   backoffLimit: 0
   template:
@@ -9,7 +9,7 @@ spec:
       labels:
         app: grpo-trainer
         model: qwen2-5-vl-7b
-        task: livr-perception-grpo-v10
+        task: livr-perception-grpo-v10-r1init
     spec:
       restartPolicy: Never
       containers:
@@ -20,8 +20,8 @@ spec:
         - |
           set -e
           echo "========================================="
-          echo "Qwen2.5-VL-7B LIVR Perception GRPO v10"
-          echo "Changes: v8b weights + Pattern A prompting (no custom system, no role-flip)"
+          echo "v10-r1init: LLaVA-Critic-R1-7B start + Pattern A prompting"
+          echo "Start weights: ${MODEL_ID} (Qwen2.5-VL-7B RL'd on 40K pairwise preferences)"
           echo "Model: ${MODEL_ID}"
           echo "Dataset: ${DATASET_PATH}"
           echo "Output: ${OUTPUT_DIR}"
@@ -107,11 +107,11 @@ spec:
         env:
         # Model and data
         - name: MODEL_ID
-          value: "Qwen/Qwen2.5-VL-7B-Instruct"
+          value: "lmms-lab/LLaVA-Critic-R1-7B"
         - name: DATASET_PATH
           value: "/outputs/livr_data/livr_perception_mixed.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v10"
+          value: "/outputs/grpo_qwen_livr_v10_r1init"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -189,7 +189,7 @@ spec:
         # default "You are a helpful assistant." Instructions below are
         # embedded in the user message alongside the question/candidate.
         # Matches LLaVA-Critic-R1 convention (arXiv:2509.00676, Qwen2.5-VL-7B).
-        - name: A1_THINK_ANSWER_INSTRUCTION
+        - name: THINK_ANSWER_INSTRUCTION
           value: |
             The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in <answer> </answer> tags.
         - name: F1_VERIFIER_INSTRUCTION
@@ -290,7 +290,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v10-revert"
+          value: "grpo-livr-9k-v10-r1init"
 
         resources:
           limits:

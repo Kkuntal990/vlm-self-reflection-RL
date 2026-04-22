@@ -18,8 +18,8 @@ broader literature survey (LLaVA-Critic, Volcano, Critic-V, Critique-GRPO,
 MT-Bench, CriticGPT, etc.) — none use role-flipping for same-model critique.
 
 Env vars (override instruction text, not system prompts):
-    A1_ANSWER_TAG_INSTRUCTION   — A1/A2 answer-tag-only instruction
-    A1_THINK_ANSWER_INSTRUCTION — A1/A2 think+answer tag instruction
+    ANSWER_TAG_INSTRUCTION      — A1/A2 answer-tag-only instruction
+    THINK_ANSWER_INSTRUCTION    — A1/A2 think+answer tag instruction
     F1_VERIFIER_INSTRUCTION     — F1 verifier instruction
 
 Usage:
@@ -61,13 +61,13 @@ def _prompt_from_env(env_var: str, default: str) -> str:
 # alongside the question / candidate / feedback. Qwen's chat template
 # provides the system prompt ("You are a helpful assistant.") by default.
 
-A1_ANSWER_TAG_INSTRUCTION = _prompt_from_env(
-    "A1_ANSWER_TAG_INSTRUCTION",
+ANSWER_TAG_INSTRUCTION = _prompt_from_env(
+    "ANSWER_TAG_INSTRUCTION",
     "Put your final answer inside <answer> tags. Example: <answer>(A)</answer>",
 )
 
-A1_THINK_ANSWER_INSTRUCTION = _prompt_from_env(
-    "A1_THINK_ANSWER_INSTRUCTION",
+THINK_ANSWER_INSTRUCTION = _prompt_from_env(
+    "THINK_ANSWER_INSTRUCTION",
     "The reasoning process MUST BE enclosed within <think> </think> tags. "
     "The final answer MUST BE put in <answer> </answer> tags.",
 )
@@ -144,9 +144,9 @@ def build_initial_answer_prompt(
     """
     parts = [question]
     if use_think_answer_tags:
-        parts.append(A1_THINK_ANSWER_INSTRUCTION)
+        parts.append(THINK_ANSWER_INSTRUCTION)
     elif use_answer_tag_only:
-        parts.append(A1_ANSWER_TAG_INSTRUCTION)
+        parts.append(ANSWER_TAG_INSTRUCTION)
     return _user_message_with_image("\n\n".join(parts))
 
 
@@ -218,12 +218,12 @@ def build_refiner_prompt(
     if use_think_answer_tags:
         parts.append(
             "Re-examine the image and either correct your answer or keep "
-            "it if you believe it is right. " + A1_THINK_ANSWER_INSTRUCTION
+            "it if you believe it is right. " + THINK_ANSWER_INSTRUCTION
         )
     elif use_answer_tag_only:
         parts.append(
             "Re-examine the image and either correct your answer or keep "
-            "it if you believe it is right. " + A1_ANSWER_TAG_INSTRUCTION
+            "it if you believe it is right. " + ANSWER_TAG_INSTRUCTION
         )
     else:
         parts.append(

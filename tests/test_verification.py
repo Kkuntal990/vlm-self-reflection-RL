@@ -4,8 +4,8 @@ import pytest
 
 from vlm_grpo.config import FeedbackRewardWeights
 from vlm_grpo.prompts import (
-    A1_ANSWER_TAG_INSTRUCTION,
-    A1_THINK_ANSWER_INSTRUCTION,
+    ANSWER_TAG_INSTRUCTION,
+    THINK_ANSWER_INSTRUCTION,
     F1_VERIFIER_INSTRUCTION,
     build_critic_prompt,
     build_initial_answer_prompt,
@@ -278,14 +278,14 @@ class TestPatternAStructure:
         msgs = build_initial_answer_prompt("What color?", use_think_answer_tags=True)
         text = msgs[0]["content"][-1]["text"]
         assert "What color?" in text
-        assert A1_THINK_ANSWER_INSTRUCTION in text
+        assert THINK_ANSWER_INSTRUCTION in text
         assert "<think>" in text
         assert "<answer>" in text
 
     def test_a1_answer_tag_only_still_works(self) -> None:
         msgs = build_initial_answer_prompt("What color?", use_answer_tag_only=True)
         text = msgs[0]["content"][-1]["text"]
-        assert A1_ANSWER_TAG_INSTRUCTION in text
+        assert ANSWER_TAG_INSTRUCTION in text
         assert "<think>" not in text
 
     def test_a1_image_in_user(self) -> None:
@@ -327,7 +327,7 @@ class TestPatternAStructure:
         assert "Question: What color?" in text
         assert "Your previous answer: Blue" in text
         assert "Feedback on your previous answer: INCORRECT. Brown." in text
-        assert A1_THINK_ANSWER_INSTRUCTION in text
+        assert THINK_ANSWER_INSTRUCTION in text
 
 
 class TestCompletionAppend:
