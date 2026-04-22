@@ -99,6 +99,11 @@ class RolloutConfig:
     response_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
     feedback_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
     use_binary_verification: bool = False
+    # Single-turn GRPO baseline. When True, only A1 is generated and trained;
+    # F1 and A2 are stubbed (empty F1, A2=A1) and their losses are zeroed out
+    # in the trainer. Used to isolate the effect of self-reflection against a
+    # pure correctness+format reward baseline.
+    baseline_mode: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

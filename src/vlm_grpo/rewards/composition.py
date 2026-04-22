@@ -1024,6 +1024,114 @@ class TrajectoryFeedbackRewardBreakdown:
         return asdict(self)
 
 
+def compute_baseline_response_reward_breakdown(
+    a1_text: str,
+    ground_truth: str,
+    answer_type: str,
+    choices: str,
+    weights: Any,
+    use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
+) -> TrajectoryResponseRewardBreakdown:
+    """Compute response reward for a single-turn (A1-only) baseline trajectory.
+
+    Baseline training does not generate F1 or A2; the reward is just
+    correctness + format on A1. Returns a TrajectoryResponseRewardBreakdown
+    so the trainer's existing aggregation code paths can consume it without
+    special-casing a new dataclass.
+
+    Reward components (all scored on A1 text):
+        - a1_correctness: {-1, +1} binary correctness
+        - a2_format: format score on A1 (semantics: "final answer format").
+          Uses the same strict tag check as the multi-turn path so the
+          baseline vs self-reflection comparison is apples-to-apples.
+
+    All other component keys (a2_correctness, no_regression, minimal_edit)
+    are filled with 0.0 for schema compatibility and are ignored by the
+    baseline-mode trainer branch.
+
+    Args:
+        a1_text: The A1 completion text.
+        ground_truth: Ground truth answer.
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open").
+        choices: MCQ choices string (empty for non-MCQ).
+        weights: ResponseRewardWeights instance. Use w_a1_correctness and
+            w_a2_format; set the others to 0 in the yaml.
+        use_think_answer_tags: Whether the A1 prompt instructs <think>+<answer>.
+        use_answer_tag_only: Whether the A1 prompt instructs <answer> only.
+
+    Returns:
+        TrajectoryResponseRewardBreakdown with a1_correct/a2_correct both
+        reflecting A1's verdict (A2 doesn't exist, so it is aliased for
+        logging symmetry).
+    """
+    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    a1_correct = a1_result.is_correct
+
+    r_format = _compute_refiner_format_reward(
+        a1_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+    )
+    format_valid = r_format > 0
+
+    r_a1 = 1.0 if a1_correct else -1.0
+
+    a1_extracted = extract_answer_from_text(
+        a1_text, answer_type, choices, require_answer_tag=use_answer_tag_only
+    )
+
+    components = {
+        "a1_correctness": r_a1,
+        "a2_correctness": 0.0,
+        "no_regression": 0.0,
+        "a2_format": r_format,
+        "minimal_edit": 0.0,
+    }
+    weighted_components = {
+        "a1_correctness": r_a1 * weights.w_a1_correctness,
+        "a2_correctness": 0.0,
+        "no_regression": 0.0,
+        "a2_format": r_format * weights.w_a2_format,
+        "minimal_edit": 0.0,
+    }
+    total_reward = sum(weighted_components.values())
+
+    return TrajectoryResponseRewardBreakdown(
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+        a1_correct=a1_correct,
+        a2_correct=a1_correct,  # A2 doesn't exist; alias for logging symmetry
+        a2_extracted=a1_extracted,
+        a2_format_valid=format_valid,
+    )
+
+
+def make_baseline_feedback_placeholder() -> TrajectoryFeedbackRewardBreakdown:
+    """Zero feedback breakdown used for per-K slot symmetry in baseline_mode.
+
+    Returned one-per-trajectory so rollout result `feedback_rewards` and
+    `feedback_breakdowns` keep the same length as `response_breakdowns` and
+    the shared metrics/logging code works without special-casing. The
+    baseline trainer branch never generates or trains F1 so these values
+    are never consumed for gradient updates.
+
+    Returns:
+        TrajectoryFeedbackRewardBreakdown with all zeros.
+    """
+    zero_components = {
+        "downstream": 0.0,
+        "calibration": 0.0,
+        "format": 0.0,
+        "tag_penalty": 0.0,
+    }
+    return TrajectoryFeedbackRewardBreakdown(
+        total_reward=0.0,
+        components=zero_components,
+        weighted_components=dict(zero_components),
+        feedback_format_valid=True,
+    )
+
+
 def compute_response_reward_breakdown(
     a1_text: str,
     a2_text: str,

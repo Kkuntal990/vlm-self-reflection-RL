@@ -42,8 +42,10 @@ from vlm_grpo.rewards.composition import (
     CriticRewardBreakdown,
     TrajectoryFeedbackRewardBreakdown,
     TrajectoryResponseRewardBreakdown,
+    compute_baseline_response_reward_breakdown,
     compute_feedback_reward_breakdown,
     compute_response_reward_breakdown,
+    make_baseline_feedback_placeholder,
 )
 
 logging.basicConfig(
@@ -421,11 +423,13 @@ def generate_self_reflection_rollout(
             # repeat_interleave: [q0]*k + [q1]*k + ... -> chunk_size*k prompts
             use_tags = config.use_think_answer_tags
             use_answer_only = getattr(config, "use_answer_tag_only", False)
+            baseline_mode = getattr(config, "baseline_mode", False)
             a1_prompts = [
                 build_initial_answer_prompt(
                     q,
                     use_think_answer_tags=use_tags,
                     use_answer_tag_only=use_answer_only,
+                    baseline_mode=baseline_mode,
                 )
                 for q in chunk_qs
                 for _ in range(k)
@@ -467,6 +471,15 @@ def generate_self_reflection_rollout(
                 config.temperature,
             )
             all_a1s.extend(chunk_a1s)
+
+            if baseline_mode:
+                # Single-turn baseline: no F1, no A2, ever. Nothing is
+                # generated, tokenized, or trained beyond A1.
+                logger.info(
+                    f"Baseline rollout (A1 only): {chunk_end}/{n} samples "
+                    f"(gen_batch={chunk_size}, k={k})"
+                )
+                continue
 
             # Step 2: Generate F1 for each trajectory.
             use_binary = getattr(config, "use_binary_verification", False)
@@ -518,13 +531,15 @@ def generate_self_reflection_rollout(
     # instead of running N individual generate() calls.
     from vlm_grpo.rewards.judge_llm import is_enabled, llm_judge_score_batch
 
+    baseline_mode = getattr(config, "baseline_mode", False)
     if is_enabled():
         judge_pairs: list[tuple[str, str]] = []
         for i in range(n):
             gt = ground_truths[i]
             for j in range(k):
                 judge_pairs.append((all_a1s[i * k + j], gt))
-                judge_pairs.append((all_a2s[i * k + j], gt))
+                if not baseline_mode:
+                    judge_pairs.append((all_a2s[i * k + j], gt))
         llm_judge_score_batch(judge_pairs)
 
     # Step 5: Compute rewards and assemble results, one per sample.
@@ -532,8 +547,6 @@ def generate_self_reflection_rollout(
     for i in range(n):
         traj_slice = slice(i * k, (i + 1) * k)
         answer1s = all_a1s[traj_slice]
-        feedbacks = all_f1s[traj_slice]
-        answer2s = all_a2s[traj_slice]
 
         result = SelfReflectionRolloutResult(
             sample_index=sample_indices[i],
@@ -544,6 +557,36 @@ def generate_self_reflection_rollout(
             choices=choices_list[i],
             dataset_name=dataset_names[i],
         )
+
+        if baseline_mode:
+            # A1-only baseline: no F1, no A2. Rewards are correctness +
+            # format on A1; feedback slots are zero placeholders so the
+            # per-K list length invariant (needed by metrics and the
+            # trainer's grouping logic) still holds.
+            for a1 in answer1s:
+                resp_bd = compute_baseline_response_reward_breakdown(
+                    a1_text=a1,
+                    ground_truth=ground_truths[i],
+                    answer_type=answer_types[i],
+                    choices=choices_list[i],
+                    weights=response_weights,
+                    use_think_answer_tags=config.use_think_answer_tags,
+                    use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
+                )
+                fb_bd = make_baseline_feedback_placeholder()
+                result.response_rewards.append(resp_bd.total_reward)
+                result.feedback_rewards.append(fb_bd.total_reward)
+                result.response_breakdowns.append(resp_bd)
+                result.feedback_breakdowns.append(fb_bd)
+
+            result.answer1s = list(answer1s)
+            result.feedbacks = [""] * len(answer1s)
+            result.answer2s = [""] * len(answer1s)
+            results.append(result)
+            continue
+
+        feedbacks = all_f1s[traj_slice]
+        answer2s = all_a2s[traj_slice]
 
         for a1, f1, a2 in zip(answer1s, feedbacks, answer2s):
             resp_bd = compute_response_reward_breakdown(

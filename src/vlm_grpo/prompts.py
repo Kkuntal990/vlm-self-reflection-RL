@@ -19,6 +19,7 @@ Prompt Override via Environment Variables:
         VL_ASSISTANT_PROMPT          → VL_ASSISTANT_SYSTEM_PROMPT
         VL_ASSISTANT_PROMPT_TAGS     → VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
         VL_ASSISTANT_PROMPT_ANS_TAG  → VL_ASSISTANT_SYSTEM_PROMPT_WITH_ANSWER_TAG
+        VL_ASSISTANT_BASELINE_PROMPT → VL_ASSISTANT_BASELINE_INSTRUCTION (appended to user)
         FEEDBACK_CRITIC_PROMPT       → FEEDBACK_CRITIC_SYSTEM_PROMPT
         BINARY_VERIFIER_PROMPT       → BINARY_VERIFICATION_SYSTEM_PROMPT
         FEEDBACK_VERIFIER_PROMPT     → FEEDBACK_VERIFIER_SYSTEM_PROMPT
@@ -43,6 +44,7 @@ Usage:
     # Log-prob computation (prompt + completion)
     full = build_prompt_with_completion(a1_prompt, "Gray")
 """
+
 import os
 
 
@@ -139,6 +141,22 @@ VL_ASSISTANT_SYSTEM_PROMPT_WITH_ANSWER_TAG = _prompt_from_env(
     "Example: <answer>(A)</answer>",
 )
 
+# Baseline single-turn instruction. Appended to the USER message (not the
+# system role) so the chat template falls back to the model's default system
+# prompt ("You are a helpful assistant." for Qwen2.5-VL). This keeps A1
+# inference identical to how the model was pretrained/aligned, with the
+# task-specific tag-format instruction delivered per-turn in the user text.
+# With --use_think_answer_tags, the format reward scores the full
+# <think>...</think><answer>...</answer> structure
+# (+0.5 valid / -0.5 tags present but bad inner / -1.0 missing).
+VL_ASSISTANT_BASELINE_INSTRUCTION = _prompt_from_env(
+    "VL_ASSISTANT_BASELINE_PROMPT",
+    "You FIRST think about the reasoning process as an internal monologue "
+    "and then provide the final answer. The reasoning process MUST BE "
+    "enclosed within <think> </think> tags. The final answer MUST BE put "
+    "in <answer> </answer> tags.",
+)
+
 
 # Backward-compatible aliases
 REFINER_SYSTEM_PROMPT = VL_ASSISTANT_SYSTEM_PROMPT
@@ -153,21 +171,45 @@ def build_initial_answer_prompt(
     question: str,
     use_think_answer_tags: bool = False,
     use_answer_tag_only: bool = False,
+    baseline_mode: bool = False,
 ) -> list[dict]:
     """Build prompt for initial answer (A1) generation.
 
-    Matches inference script Turn 0:
+    Non-baseline path matches inference script Turn 0:
         System: VL assistant prompt
         User: [image] + question [+ tag instruction if enabled]
+
+    Baseline path omits the system message so the chat template uses the
+    model's default system prompt, and appends the baseline instruction
+    (VL_ASSISTANT_BASELINE_INSTRUCTION) to the user text:
+        User: [image] + question + "\\n\\n" + baseline instruction
 
     Args:
         question: The visual question (cleaned, no <image> tag)
         use_think_answer_tags: If True, use <think>+<answer> tag format
         use_answer_tag_only: If True, use <answer> tag only (no <think>)
+        baseline_mode: If True, use the single-turn baseline layout
+            (no system message, instruction appended to user). Takes
+            precedence over the tag-format flags.
 
     Returns:
         List of message dicts for A1 generation
     """
+    if baseline_mode:
+        instruction = VL_ASSISTANT_BASELINE_INSTRUCTION.strip()
+        user_text = question.strip()
+        if instruction:
+            user_text = f"{user_text}\n\n{instruction}"
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ]
+
     if use_think_answer_tags:
         system_prompt = VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS
     elif use_answer_tag_only:

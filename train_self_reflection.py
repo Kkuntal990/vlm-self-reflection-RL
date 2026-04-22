@@ -172,6 +172,16 @@ def parse_args() -> argparse.Namespace:
         "instead of open critique. Auto-disables think/answer tags.",
     )
     parser.add_argument(
+        "--baseline_mode",
+        action="store_true",
+        help="Single-turn GRPO baseline. A1 only — no F1, no A2 anywhere in "
+        "rollout, tokenization, forward pass, or loss. A1 uses the baseline "
+        "system prompt and is trained on correctness + format rewards. The "
+        "baseline reward path uses --w_a1_correctness for correctness and "
+        "--w_a2_format for format; set the others (and all feedback weights) "
+        "to 0.",
+    )
+    parser.add_argument(
         "--w_verification_accuracy",
         type=float,
         default=0.0,
@@ -320,7 +330,9 @@ def main() -> None:
     # so the model has positive incentive to use tags (range +0.5 to -1.0).
     # User can still override explicitly with --w_a2_format.
     w_a2_format = args.w_a2_format
-    if (args.use_think_answer_tags or getattr(args, "use_answer_tag_only", False)) and w_a2_format == 0.15:
+    if (
+        args.use_think_answer_tags or getattr(args, "use_answer_tag_only", False)
+    ) and w_a2_format == 0.15:
         w_a2_format = 0.5
         logger.info("Auto-increased w_a2_format to 0.5 for tag mode")
 
@@ -337,6 +349,31 @@ def main() -> None:
             args.w_verification_accuracy = 1.0
             logger.info("Auto-set w_verification_accuracy to 1.0 for binary verification")
         logger.info("Pipeline mode: V8 Binary Verification (A1→F1:CORRECT/INCORRECT→A2)")
+
+    # Single-turn GRPO baseline auto-config
+    if args.baseline_mode:
+        if args.use_binary_verification:
+            logger.warning("--baseline_mode overrides --use_binary_verification to False")
+            args.use_binary_verification = False
+        # --use_think_answer_tags and --use_answer_tag_only are honored: they
+        # select which format reward variant is applied to A1. The system
+        # prompt itself is always the baseline prompt (baseline_mode takes
+        # precedence in build_initial_answer_prompt), so the yaml chooses
+        # whether the baseline instructs <think>+<answer> or <answer>-only.
+        # Force SCoRe-style per-turn advantages so A1 gets the full response
+        # reward and A2 can be zeroed out cleanly in the trainer.
+        if not args.separate_turn_loss:
+            args.separate_turn_loss = True
+            logger.info("Auto-enabled --separate_turn_loss for baseline mode")
+        # SCoRe Stage I freeze doesn't apply to the baseline.
+        if args.freeze_a1_steps > 0:
+            logger.warning(
+                "--baseline_mode overrides --freeze_a1_steps=%d to 0 "
+                "(no separate A1/A2 turns to stage)",
+                args.freeze_a1_steps,
+            )
+            args.freeze_a1_steps = 0
+        logger.info("Pipeline mode: BASELINE (single-turn A1 only, correctness+format)")
 
     response_weights = ResponseRewardWeights(
         w_a1_correctness=args.w_a1_correctness,
@@ -369,6 +406,7 @@ def main() -> None:
         response_alpha=args.response_alpha,
         feedback_alpha=args.feedback_alpha,
         use_binary_verification=args.use_binary_verification,
+        baseline_mode=args.baseline_mode,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -479,6 +517,9 @@ def main() -> None:
                 feedback_weights,
                 reward_shaping_alpha=args.reward_shaping_alpha,
                 use_binary_verification=args.use_binary_verification,
+                baseline_mode=args.baseline_mode,
+                use_answer_tag_only=getattr(args, "use_answer_tag_only", False),
+                use_think_answer_tags=args.use_think_answer_tags,
             )
         return
 
@@ -736,6 +777,9 @@ def _run_sanity_check(
     feedback_weights: object,
     reward_shaping_alpha: float = 0.0,
     use_binary_verification: bool = False,
+    baseline_mode: bool = False,
+    use_answer_tag_only: bool = False,
+    use_think_answer_tags: bool = False,
 ) -> None:
     """Run sanity check with synthetic (A1, F1, A2) tuples.
 
@@ -747,11 +791,25 @@ def _run_sanity_check(
         feedback_weights: Feedback reward weights
         reward_shaping_alpha: SCoRe-style shaped reward alpha
         use_binary_verification: If True, use binary verification test cases
+        baseline_mode: If True, exercise the A1-only baseline reward path
+        use_answer_tag_only: Whether A1 uses <answer>-tag-only format
+        use_think_answer_tags: Whether A1 uses <think>+<answer> format
     """
     from vlm_grpo.rewards.composition import (
+        compute_baseline_response_reward_breakdown,
         compute_feedback_reward_breakdown,
         compute_response_reward_breakdown,
     )
+
+    if baseline_mode:
+        _run_baseline_sanity_check(
+            dataset,
+            response_weights,
+            compute_baseline_response_reward_breakdown,
+            use_answer_tag_only=use_answer_tag_only,
+            use_think_answer_tags=use_think_answer_tags,
+        )
+        return
 
     logger.info("=" * 70)
     mode = "BINARY VERIFICATION" if use_binary_verification else "two-reward self-reflection"
@@ -864,6 +922,75 @@ def _run_sanity_check(
     logger.info("  RW_bad_feedback:   Large negative resp reward, large negative fb reward")
     logger.info("  WR_helpful_feedback: Positive resp reward (WR fix), high fb reward (+)")
     logger.info("  WW_useless_feedback: Negative resp reward, negative fb reward")
+    logger.info("=" * 70)
+
+
+def _run_baseline_sanity_check(
+    dataset: list[dict],
+    response_weights: object,
+    compute_baseline_fn: object,
+    use_answer_tag_only: bool = False,
+    use_think_answer_tags: bool = False,
+) -> None:
+    """Sanity check for the A1-only baseline reward path.
+
+    Args:
+        dataset: List of sample dicts.
+        response_weights: ResponseRewardWeights instance.
+        compute_baseline_fn: compute_baseline_response_reward_breakdown callable.
+        use_answer_tag_only: Whether A1 uses <answer>-tag-only format.
+        use_think_answer_tags: Whether A1 uses <think>+<answer> format.
+    """
+    logger.info("=" * 70)
+    logger.info("SANITY CHECK MODE (A1-only baseline)")
+    logger.info("=" * 70)
+    logger.info(f"Response weights: {response_weights.to_dict()}")
+    logger.info("")
+
+    num_samples = min(len(dataset), 10)
+    for i in range(num_samples):
+        sample = dataset[i]
+        gt = sample["ground_truth"]
+        a_type = sample["answer_type"]
+        ch = sample["choices"]
+        ds = sample["dataset_name"]
+
+        logger.info(f"--- Sample {i} ---")
+        logger.info(f"  GT: {gt} | Type: {a_type} | Dataset: {ds}")
+
+        # When tag format is requested, wrap the synthetic answers so the
+        # format reward is exercised; otherwise pass raw.
+        def _wrap(answer: str) -> str:
+            if use_think_answer_tags:
+                return f"<think>I see {answer} in the image.</think><answer>{answer}</answer>"
+            if use_answer_tag_only:
+                return f"<answer>{answer}</answer>"
+            return answer
+
+        test_cases = {
+            "correct_answer": _wrap(gt),
+            "wrong_answer": _wrap("ZZZ_WRONG_ANSWER"),
+            "correct_no_format": gt,
+        }
+
+        for case_name, a1 in test_cases.items():
+            bd = compute_baseline_fn(
+                a1_text=a1,
+                ground_truth=gt,
+                answer_type=a_type,
+                choices=ch,
+                weights=response_weights,
+                use_think_answer_tags=use_think_answer_tags,
+                use_answer_tag_only=use_answer_tag_only,
+            )
+            logger.info(f"  [{case_name}] reward={bd.total_reward:+.2f}")
+            logger.info(f"    components={bd.components}")
+            logger.info(f"    a1_correct={bd.a1_correct} format_valid={bd.a2_format_valid}")
+
+        logger.info("")
+
+    logger.info("=" * 70)
+    logger.info("EXPECTED: correct_answer > wrong_answer; format_valid tracks tag presence.")
     logger.info("=" * 70)
 
 

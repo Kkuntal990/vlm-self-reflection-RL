@@ -655,29 +655,56 @@ class SelfReflectionGRPOTrainer:
                     break
 
             use_tags = self.config.rollout.use_think_answer_tags
-            for a1, f1, a2 in zip(result.answer1s, result.feedbacks, result.answer2s):
-                a1_prompt = build_initial_answer_prompt(
-                    result.question, use_think_answer_tags=use_tags
-                )
-                a1_full = build_prompt_with_completion(a1_prompt, a1)
+            use_answer_only = getattr(self.config.rollout, "use_answer_tag_only", False)
+            baseline_mode_cfg = getattr(self.config.rollout, "baseline_mode", False)
+            use_binary = getattr(self.config.rollout, "use_binary_verification", False)
 
-                use_binary = getattr(self.config.rollout, "use_binary_verification", False)
-                f1_prompt = build_critic_prompt(
-                    result.question,
-                    a1,
-                    model_type=model_type,
-                    use_binary_verification=use_binary,
-                )
-                f1_full = build_prompt_with_completion(f1_prompt, f1)
+            if baseline_mode_cfg:
+                # Baseline: A1-only. Build A1 prompt+completion per trajectory.
+                # No F1 or A2 anywhere — no prompt, no tokenization, no loss.
+                for a1 in result.answer1s:
+                    a1_prompt = build_initial_answer_prompt(
+                        result.question,
+                        use_think_answer_tags=use_tags,
+                        use_answer_tag_only=use_answer_only,
+                        baseline_mode=True,
+                    )
+                    a1_full = build_prompt_with_completion(a1_prompt, a1)
+                    trajectory_data.append({"a1_full": a1_full, "image": image})
+            else:
+                for a1, f1, a2 in zip(result.answer1s, result.feedbacks, result.answer2s):
+                    a1_prompt = build_initial_answer_prompt(
+                        result.question,
+                        use_think_answer_tags=use_tags,
+                        use_answer_tag_only=use_answer_only,
+                    )
+                    a1_full = build_prompt_with_completion(a1_prompt, a1)
 
-                a2_prompt = build_refiner_prompt(
-                    result.question, a1, f1, use_think_answer_tags=use_tags
-                )
-                a2_full = build_prompt_with_completion(a2_prompt, a2)
+                    f1_prompt = build_critic_prompt(
+                        result.question,
+                        a1,
+                        model_type=model_type,
+                        use_binary_verification=use_binary,
+                    )
+                    f1_full = build_prompt_with_completion(f1_prompt, f1)
 
-                trajectory_data.append(
-                    {"a1_full": a1_full, "f1_full": f1_full, "a2_full": a2_full, "image": image}
-                )
+                    a2_prompt = build_refiner_prompt(
+                        result.question,
+                        a1,
+                        f1,
+                        use_think_answer_tags=use_tags,
+                        use_answer_tag_only=use_answer_only,
+                    )
+                    a2_full = build_prompt_with_completion(a2_prompt, a2)
+
+                    trajectory_data.append(
+                        {
+                            "a1_full": a1_full,
+                            "f1_full": f1_full,
+                            "a2_full": a2_full,
+                            "image": image,
+                        }
+                    )
 
         if not all_resp_rewards:
             self.global_step += 1
@@ -742,33 +769,47 @@ class SelfReflectionGRPOTrainer:
 
                     image = load_image_safe(entry.sample["image_path"])
 
-                    for a1, f1, a2 in zip(rr.answer1s, rr.feedbacks, rr.answer2s):
-                        a1_prompt = build_initial_answer_prompt(
-                            rr.question, use_think_answer_tags=use_tags
-                        )
-                        a1_full = build_prompt_with_completion(a1_prompt, a1)
-                        f1_prompt = build_critic_prompt(
-                            rr.question,
-                            a1,
-                            model_type=model_type,
-                            use_binary_verification=use_binary,
-                        )
-                        f1_full = build_prompt_with_completion(f1_prompt, f1)
-                        a2_prompt = build_refiner_prompt(
-                            rr.question,
-                            a1,
-                            f1,
-                            use_think_answer_tags=use_tags,
-                        )
-                        a2_full = build_prompt_with_completion(a2_prompt, a2)
-                        trajectory_data.append(
-                            {
-                                "a1_full": a1_full,
-                                "f1_full": f1_full,
-                                "a2_full": a2_full,
-                                "image": image,
-                            }
-                        )
+                    if baseline_mode_cfg:
+                        for a1 in rr.answer1s:
+                            a1_prompt = build_initial_answer_prompt(
+                                rr.question,
+                                use_think_answer_tags=use_tags,
+                                use_answer_tag_only=use_answer_only,
+                                baseline_mode=True,
+                            )
+                            a1_full = build_prompt_with_completion(a1_prompt, a1)
+                            trajectory_data.append({"a1_full": a1_full, "image": image})
+                    else:
+                        for a1, f1, a2 in zip(rr.answer1s, rr.feedbacks, rr.answer2s):
+                            a1_prompt = build_initial_answer_prompt(
+                                rr.question,
+                                use_think_answer_tags=use_tags,
+                                use_answer_tag_only=use_answer_only,
+                            )
+                            a1_full = build_prompt_with_completion(a1_prompt, a1)
+                            f1_prompt = build_critic_prompt(
+                                rr.question,
+                                a1,
+                                model_type=model_type,
+                                use_binary_verification=use_binary,
+                            )
+                            f1_full = build_prompt_with_completion(f1_prompt, f1)
+                            a2_prompt = build_refiner_prompt(
+                                rr.question,
+                                a1,
+                                f1,
+                                use_think_answer_tags=use_tags,
+                                use_answer_tag_only=use_answer_only,
+                            )
+                            a2_full = build_prompt_with_completion(a2_prompt, a2)
+                            trajectory_data.append(
+                                {
+                                    "a1_full": a1_full,
+                                    "f1_full": f1_full,
+                                    "a2_full": a2_full,
+                                    "image": image,
+                                }
+                            )
 
                     rollout_results.append(rr)
 
@@ -777,8 +818,18 @@ class SelfReflectionGRPOTrainer:
         fb_rewards_t = torch.tensor(all_fb_rewards, device=self.device)
         loss_type = getattr(self.config, "loss_type", "grpo")
         separate_turns = getattr(self.config, "separate_turn_loss", False)
+        baseline_mode = getattr(self.config.rollout, "baseline_mode", False)
 
-        if separate_turns:
+        # Single-turn baseline: route the full response reward through A1 and
+        # zero out A2/F1 losses. F1 and A2 are stubbed in rollout (F1="n/a",
+        # A2=A1); they still go through forward passes for tensor shape sanity
+        # but produce no gradient signal.
+        if baseline_mode:
+            separate_turns = True
+            resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
+            a1_advantages = resp_advantages
+            a2_advantages = torch.zeros_like(resp_advantages)
+        elif separate_turns:
             # SCoRe-style: separate advantages for A1 and A2.
             # A1 reward = a1_correctness only (so wrong A1 gets negative advantage).
             # A2 reward = everything else (correctness, no_regression, format, edit).
@@ -840,18 +891,31 @@ class SelfReflectionGRPOTrainer:
 
         imgs = [t["image"] for t in trajectory_data]
         a1_pretok = self._preprocess_trajectory_texts([t["a1_full"] for t in trajectory_data], imgs)
-        a2_pretok = self._preprocess_trajectory_texts([t["a2_full"] for t in trajectory_data], imgs)
-        f1_pretok = self._preprocess_trajectory_texts([t["f1_full"] for t in trajectory_data], imgs)
+        if baseline_mode:
+            # A1-only baseline: never tokenize A2 or F1.
+            a2_pretok = None
+            f1_pretok = None
+        else:
+            a2_pretok = self._preprocess_trajectory_texts(
+                [t["a2_full"] for t in trajectory_data], imgs
+            )
+            f1_pretok = self._preprocess_trajectory_texts(
+                [t["f1_full"] for t in trajectory_data], imgs
+            )
 
         # Completion token lengths from pre-tokenized data (token count, not word count).
         # full_lens - prompt_lens = number of completion tokens per trajectory.
         # Tracks length hacking where wrong answers grow longer (Dr. GRPO key finding).
         a1_toks = [f - p for f, p in zip(a1_pretok["full_lens"], a1_pretok["prompt_lens"])]
-        f1_toks = [f - p for f, p in zip(f1_pretok["full_lens"], f1_pretok["prompt_lens"])]
-        a2_toks = [f - p for f, p in zip(a2_pretok["full_lens"], a2_pretok["prompt_lens"])]
         avg_a1_toks = sum(a1_toks) / max(len(a1_toks), 1)
-        avg_f1_toks = sum(f1_toks) / max(len(f1_toks), 1)
-        avg_a2_toks = sum(a2_toks) / max(len(a2_toks), 1)
+        if baseline_mode:
+            avg_f1_toks = 0.0
+            avg_a2_toks = 0.0
+        else:
+            f1_toks = [f - p for f, p in zip(f1_pretok["full_lens"], f1_pretok["prompt_lens"])]
+            a2_toks = [f - p for f, p in zip(a2_pretok["full_lens"], a2_pretok["prompt_lens"])]
+            avg_f1_toks = sum(f1_toks) / max(len(f1_toks), 1)
+            avg_a2_toks = sum(a2_toks) / max(len(a2_toks), 1)
 
         logger.info(f"  Computing old/ref log-probs for {n_traj} trajectories...")
 
@@ -863,15 +927,24 @@ class SelfReflectionGRPOTrainer:
         ref_fb_lps_list: list[Any] = []
 
         with torch.no_grad():
-            # Combine a1/a2/f1 into one forward pass per mini-batch (3x fewer GPU ops)
-            for mb_s in range(0, n_traj, inner_mini_bs):
-                mb_e = min(mb_s + inner_mini_bs, n_traj)
-                a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
-                    [a1_pretok, a2_pretok, f1_pretok], unwrapped_model, mb_s, mb_e
-                )
-                old_a1_lps_list += a1_lps
-                old_a2_lps_list += a2_lps
-                old_fb_lps_list += fb_lps
+            if baseline_mode:
+                # A1-only: single forward pass per mini-batch.
+                for mb_s in range(0, n_traj, inner_mini_bs):
+                    mb_e = min(mb_s + inner_mini_bs, n_traj)
+                    (a1_lps,) = self._forward_from_pretokenized_multi(
+                        [a1_pretok], unwrapped_model, mb_s, mb_e
+                    )
+                    old_a1_lps_list += a1_lps
+            else:
+                # Combine a1/a2/f1 into one forward pass per mini-batch (3x fewer GPU ops)
+                for mb_s in range(0, n_traj, inner_mini_bs):
+                    mb_e = min(mb_s + inner_mini_bs, n_traj)
+                    a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
+                        [a1_pretok, a2_pretok, f1_pretok], unwrapped_model, mb_s, mb_e
+                    )
+                    old_a1_lps_list += a1_lps
+                    old_a2_lps_list += a2_lps
+                    old_fb_lps_list += fb_lps
 
             # Ref log-probs: only needed when kl_coeff > 0
             if self.config.kl_coeff > 0:
@@ -881,33 +954,54 @@ class SelfReflectionGRPOTrainer:
                 else:
                     ref_m = self.ref_model
 
-                for mb_s in range(0, n_traj, inner_mini_bs):
-                    mb_e = min(mb_s + inner_mini_bs, n_traj)
-                    a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
-                        [a1_pretok, a2_pretok, f1_pretok], ref_m, mb_s, mb_e
-                    )
-                    ref_a1_lps_list += a1_lps
-                    ref_a2_lps_list += a2_lps
-                    ref_fb_lps_list += fb_lps
+                if baseline_mode:
+                    for mb_s in range(0, n_traj, inner_mini_bs):
+                        mb_e = min(mb_s + inner_mini_bs, n_traj)
+                        (a1_lps,) = self._forward_from_pretokenized_multi(
+                            [a1_pretok], ref_m, mb_s, mb_e
+                        )
+                        ref_a1_lps_list += a1_lps
+                else:
+                    for mb_s in range(0, n_traj, inner_mini_bs):
+                        mb_e = min(mb_s + inner_mini_bs, n_traj)
+                        a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
+                            [a1_pretok, a2_pretok, f1_pretok], ref_m, mb_s, mb_e
+                        )
+                        ref_a1_lps_list += a1_lps
+                        ref_a2_lps_list += a2_lps
+                        ref_fb_lps_list += fb_lps
 
                 if self.ref_model is None:
                     unwrapped_model.enable_adapter_layers()
 
             # Per-token log-probs: keep as lists of variable-length tensors.
-            if separate_turns:
+            if baseline_mode:
+                # A1-only baseline: only A1 log-probs exist. old_a2_lps and
+                # old_fb_lps are unused in the baseline loss branch.
+                old_a1_lps = old_a1_lps_list
+                old_a2_lps = None
+                old_resp_lps = old_a1_lps_list
+                old_fb_lps = None
+            elif separate_turns:
                 # Separate A1 and A2 for per-turn loss
                 old_a1_lps = old_a1_lps_list
                 old_a2_lps = old_a2_lps_list
+                old_resp_lps = [
+                    torch.cat([a1, a2]) for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)
+                ]
+                old_fb_lps = old_fb_lps_list
             else:
                 old_a1_lps = None
                 old_a2_lps = None
-            old_resp_lps = [torch.cat([a1, a2]) for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)]
-            old_fb_lps = old_fb_lps_list  # already list of per-token tensors
+                old_resp_lps = [
+                    torch.cat([a1, a2]) for a1, a2 in zip(old_a1_lps_list, old_a2_lps_list)
+                ]
+                old_fb_lps = old_fb_lps_list
 
             if self.config.kl_coeff > 0:
                 ref_a1_lps = ref_a1_lps_list
-                ref_a2_lps = ref_a2_lps_list
-                ref_fb_lps = ref_fb_lps_list
+                ref_a2_lps = ref_a2_lps_list if not baseline_mode else None
+                ref_fb_lps = ref_fb_lps_list if not baseline_mode else None
             else:
                 ref_a1_lps = None
                 ref_a2_lps = None
@@ -952,16 +1046,28 @@ class SelfReflectionGRPOTrainer:
 
             # 3 batched forward passes per mini-batch (a1, a2, f1), reusing
             # pre-tokenized strings so no chat-template overhead per pass.
+            # Baseline mode only runs the A1 pass.
             for mb_start in range(0, n_traj_inner, inner_mini_bs):
                 mb_end = min(mb_start + inner_mini_bs, n_traj_inner)
 
-                mb_a1_lps, mb_a2_lps, mb_fb_lps = self._forward_from_pretokenized_multi(
-                    [a1_pretok, a2_pretok, f1_pretok],
-                    inner_model,
-                    mb_start,
-                    mb_end,
-                    accumulate_entropy=True,
-                )
+                if baseline_mode:
+                    (mb_a1_lps,) = self._forward_from_pretokenized_multi(
+                        [a1_pretok],
+                        inner_model,
+                        mb_start,
+                        mb_end,
+                        accumulate_entropy=True,
+                    )
+                    mb_a2_lps = None
+                    mb_fb_lps = None
+                else:
+                    mb_a1_lps, mb_a2_lps, mb_fb_lps = self._forward_from_pretokenized_multi(
+                        [a1_pretok, a2_pretok, f1_pretok],
+                        inner_model,
+                        mb_start,
+                        mb_end,
+                        accumulate_entropy=True,
+                    )
 
                 # Token-level GRPO loss (standard formulation).
                 # Per-token ratios produce non-zero gradients even with
@@ -975,6 +1081,48 @@ class SelfReflectionGRPOTrainer:
                 mb_loss = None
                 for j in range(mb_end - mb_start):
                     ti = mb_start + j
+
+                    if baseline_mode:
+                        # A1-only loss: PPO-clipped surrogate on A1 alone.
+                        a1_new = mb_a1_lps[j]
+                        a1_ratio_raw = torch.nan_to_num(
+                            a1_new - old_a1_lps[ti].detach(),
+                            nan=0.0,
+                            posinf=20.0,
+                            neginf=-20.0,
+                        )
+                        a1_ratio = torch.exp(torch.clamp(a1_ratio_raw, -20.0, 20.0))
+                        a1_clipped = torch.clamp(a1_ratio, 1 - clip_range, 1 + clip_range)
+                        traj_resp_loss = -torch.min(
+                            a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]
+                        ).mean()
+                        self._resp_total_tokens += a1_ratio.numel()
+                        self._resp_clipped_tokens += (a1_ratio != a1_clipped).sum().item()
+
+                        traj_fb_loss = torch.zeros((), device=a1_new.device)
+
+                        if self.config.kl_coeff > 0 and ref_a1_lps is not None:
+                            raw = torch.nan_to_num(
+                                ref_a1_lps[ti].detach() - a1_new,
+                                nan=0.0,
+                                posinf=20.0,
+                                neginf=-20.0,
+                            )
+                            clamped = torch.clamp(raw, -20.0, 20.0)
+                            a1_kl = (torch.exp(clamped) - clamped - 1).mean()
+                            a1_kl_c = self.config.kl_coeff * getattr(
+                                self.config, "a1_kl_coeff", 1.0
+                            )
+                            traj_kl_loss = a1_kl_c * a1_kl
+                        else:
+                            traj_kl_loss = torch.zeros((), device=a1_new.device)
+
+                        traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
+                        mb_loss = traj_loss if mb_loss is None else mb_loss + traj_loss
+                        epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
+                        epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
+                        epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
+                        continue
 
                     fb_new = mb_fb_lps[j]
 
