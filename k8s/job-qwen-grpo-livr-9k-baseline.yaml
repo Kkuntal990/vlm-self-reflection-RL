@@ -199,24 +199,26 @@ spec:
           value: "200704"
 
         # Reward weights — baseline isolates correctness + format on A1.
-        # The baseline reward path uses:
-        #   - w_a1_correctness  * r_correct_on_A1     (binary ±1)
-        #   - w_a2_format       * r_format_on_A1
+        # Weights are a convex combination summing to 1.0 so the reward
+        # magnitude is bounded on [-1, 1] (matches SFT-style outcome signals).
+        #   - w_a1_correctness = 0.9 * r_correct_on_A1   (binary ±1)
+        #   - w_a2_format      = 0.1 * r_format_on_A1
         # With --use_think_answer_tags, r_format ∈ {+0.5 valid, -0.5 tags
         # present but bad inner, -1.0 tags missing}. Combined reward spread:
-        #   correct+valid_tags: +1.5 | wrong+valid_tags: -0.5
-        #   correct+no_tags:     0.0 | wrong+no_tags:    -2.0
+        #   correct+valid_tags: +0.95 | wrong+valid_tags:    -0.85
+        #   correct+no_tags:    +0.80 | wrong+tags_bad_inner: -0.95
+        #                              | wrong+no_tags:       -1.00
         # All other component keys are always zero by construction.
         - name: REWARD_SHAPING_ALPHA
           value: "0.0"
         - name: W_A1_CORRECTNESS
-          value: "1.0"
+          value: "0.9"
         - name: W_A2_CORRECTNESS
           value: "0.0"
         - name: W_NO_REGRESSION
           value: "0.0"
         - name: W_A2_FORMAT
-          value: "1.0"
+          value: "0.1"
         - name: W_MINIMAL_EDIT
           value: "0.0"
         - name: W_DOWNSTREAM
