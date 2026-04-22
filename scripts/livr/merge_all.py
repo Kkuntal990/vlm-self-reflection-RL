@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge all 9 LIVR task JSONLs into a single dataset file.
+"""Merge all 10 LIVR task JSONLs into a single dataset file.
 
 Concatenates per-task JSONLs, shuffles, and writes the merged output.
 Optionally trims each task to exactly N samples.
@@ -27,6 +27,7 @@ TASK_FILES = [
     "livr_semantic_correspondence.jsonl",
     "livr_functional_correspondence.jsonl",
     "livr_relative_reflectance.jsonl",
+    "livr_relative_depth.jsonl",
     "livr_visual_similarity.jsonl",
 ]
 

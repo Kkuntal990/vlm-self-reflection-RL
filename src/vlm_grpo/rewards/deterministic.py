@@ -14,13 +14,31 @@ Usage:
 
 import re
 
-# Feedback calibration keyword patterns
+# Feedback calibration keyword patterns.
+#
+# Hedged-positive patterns ("partially correct", "on the right track, but")
+# are counted as NEGATIVE because they precede corrections in >90% of cases.
+# These are checked first and excluded from positive matching.
+_HEDGED_POSITIVE_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\bpartially correct\b",
+        r"\bmostly correct\b",
+        r"\bmostly accurate\b",
+        r"\bon the right track\b",
+        r"\bclose\b.*\bbut\b",
+        r"\bcorrect\b.*\bbut\b.*\b(?:should|could|need|better|more|however)\b",
+        r"\bcorrect answer (?:is|should be|would be)\b",
+        r"\bright answer (?:is|should be|would be)\b",
+    ]
+]
+
 _POSITIVE_FEEDBACK_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
         r"\bcorrect\b",
         r"\baccurate\b",
-        r"\bright\b",
+        r"\b(?:you(?:'re| are)|that(?:'s| is)) right\b",
         r"\bno change needed\b",
         r"\bno changes? (?:are |is )?(?:needed|necessary|required)\b",
         r"\bwell done\b",
@@ -109,7 +127,7 @@ def match_numeric(
         return False
 
     if gt_val == 0:
-        return abs(pred_val) < tolerance
+        return abs(pred_val) <= tolerance
 
     return abs(pred_val - gt_val) / max(abs(gt_val), 1e-10) <= tolerance
 
@@ -142,6 +160,8 @@ def match_answer(
         return match_yesno(predicted, ground_truth)
     elif answer_type == "numeric":
         return match_numeric(predicted, ground_truth, tolerance)
+    elif answer_type == "counting":
+        return match_numeric(predicted, ground_truth, tolerance=0.0)
     else:
         # Open-ended: direct comparison (both already normalized/lowercase)
         if predicted == ground_truth:

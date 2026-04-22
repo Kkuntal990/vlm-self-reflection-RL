@@ -1,0 +1,338 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-grpo-livr-9k-v8-verify
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: grpo-trainer
+        model: qwen2-5-vl-7b
+        task: livr-perception-grpo-v8
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: huggingface/trl:0.29.0
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "========================================="
+          echo "Qwen2.5-VL-7B LIVR Perception GRPO v8"
+          echo "Changes: binary verification (CORRECT/INCORRECT), no think tags"
+          echo "Model: ${MODEL_ID}"
+          echo "Dataset: ${DATASET_PATH}"
+          echo "Output: ${OUTPUT_DIR}"
+          echo "GPUs: ${NUM_GPUS}"
+          echo "========================================="
+
+          # GPU check
+          nvidia-smi
+          echo ""
+
+          # Install dependencies
+          pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
+
+          # Clone and install project (pinned commit to match crashed run's prompt)
+          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          cd /workspace/vlm-self-reflection-RL
+          git checkout ${GIT_COMMIT:-a02b147}
+          pip install -e . 2>&1 | tail -3
+
+          # Create output dir
+          mkdir -p "${OUTPUT_DIR}"
+
+          # Run training
+          accelerate launch \
+            --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
+            --num_processes=${NUM_GPUS:-4} \
+            train_self_reflection.py \
+            --model_id "${MODEL_ID}" \
+            --model_type qwen2vl \
+            --dataset_path "${DATASET_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            --image_base_dir "${IMAGE_BASE_DIR}" \
+            --use_vllm \
+            --use_answer_tag_only \
+            --use_binary_verification \
+            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.50} \
+            --max_samples ${MAX_SAMPLES:-0} \
+            --k_samples ${K_SAMPLES:-8} \
+            --max_completion_length ${MAX_COMPLETION_LENGTH:-256} \
+            --a1_max_completion_length ${A1_MAX_COMPLETION:-32} \
+            --f1_max_completion_length ${F1_MAX_COMPLETION:-16} \
+            --a2_max_completion_length ${A2_MAX_COMPLETION:-32} \
+            --temperature ${TEMPERATURE:-1.0} \
+            --feedback_temperature ${FEEDBACK_TEMPERATURE:-1.0} \
+            --a2_temperature ${A2_TEMPERATURE:-1.0} \
+            --learning_rate ${LEARNING_RATE:-1e-6} \
+            --per_device_train_batch_size ${BATCH_SIZE:-2} \
+            --gradient_accumulation_steps ${GRAD_ACC:-2} \
+            --num_train_epochs ${EPOCHS:-1} \
+            --num_inner_epochs ${INNER_EPOCHS:-1} \
+            --kl_coeff ${KL_COEFF:-0.0} \
+            --a1_kl_coeff ${A1_KL_COEFF:-1.0} \
+            --a2_kl_coeff ${A2_KL_COEFF:-1.0} \
+            --fb_kl_coeff ${FB_KL_COEFF:-1.0} \
+            ${SEPARATE_TURN_LOSS:+--separate_turn_loss} \
+            --clip_range ${CLIP_RANGE:-0.2} \
+            --loss_type ${LOSS_TYPE:-dr_grpo} \
+            --lora_r ${LORA_R:-64} \
+            --lora_alpha ${LORA_ALPHA:-128} \
+            --freeze_vision_tower \
+            --max_pixels ${MAX_PIXELS:-401408} \
+            --min_pixels ${MIN_PIXELS:-200704} \
+            --w_a1_correctness ${W_A1_CORRECTNESS:-1.0} \
+            --w_a2_correctness ${W_A2_CORRECTNESS:-1.0} \
+            --w_no_regression ${W_NO_REGRESSION:-1.0} \
+            --w_a2_format ${W_A2_FORMAT:-0.5} \
+            --w_minimal_edit ${W_MINIMAL_EDIT:-0.0} \
+            --w_downstream ${W_DOWNSTREAM:-1.0} \
+            --w_calibration ${W_CALIBRATION:-0.0} \
+            --w_fb_format ${W_FB_FORMAT:-0.15} \
+            --w_fb_tag_penalty ${W_FB_TAG_PENALTY:-0.0} \
+            --w_verification_accuracy ${W_VERIFICATION_ACCURACY:-1.0} \
+            --reward_shaping_alpha ${REWARD_SHAPING_ALPHA:-10.0} \
+            --freeze_a1_steps ${FREEZE_A1_STEPS:-100} \
+            --logging_steps ${LOGGING_STEPS:-10} \
+            --save_steps ${SAVE_STEPS:-250} \
+            --seed ${SEED:-42} \
+            --debug \
+            ${RESUME_CHECKPOINT:+--resume_from_checkpoint "$RESUME_CHECKPOINT"} \
+            2>&1 | tee -a "${OUTPUT_DIR}/training.log"
+
+          echo "=== Training complete ==="
+
+        env:
+        # Model and data
+        - name: MODEL_ID
+          value: "Qwen/Qwen2.5-VL-7B-Instruct"
+        - name: DATASET_PATH
+          value: "/outputs/livr_data/livr_perception_mixed.jsonl"
+        - name: OUTPUT_DIR
+          value: "/outputs/grpo_qwen_livr_v8b"
+        - name: IMAGE_BASE_DIR
+          value: "/outputs/image_base"
+
+        # v8: binary verification + shaped reward + SCoRe Stage I
+        - name: SEPARATE_TURN_LOSS
+          value: "1"
+        - name: KL_COEFF
+          value: "0.02"
+        - name: A1_KL_COEFF
+          value: "150.0"
+        - name: A2_KL_COEFF
+          value: "1.0"
+        - name: FB_KL_COEFF
+          value: "1.0"
+
+        # GRPO core
+        - name: K_SAMPLES
+          value: "8"
+        - name: LOSS_TYPE
+          value: "dr_grpo"
+        - name: CLIP_RANGE
+          value: "0.2"
+        - name: INNER_EPOCHS
+          value: "1"
+
+        # Generation (reduced token limits for binary mode)
+        - name: MAX_SAMPLES
+          value: "0"
+        - name: MAX_COMPLETION_LENGTH
+          value: "256"
+        - name: A1_MAX_COMPLETION
+          value: "256"
+        - name: F1_MAX_COMPLETION
+          value: "256"
+        - name: A2_MAX_COMPLETION
+          value: "256"
+        - name: TEMPERATURE
+          value: "1.0"
+        - name: FEEDBACK_TEMPERATURE
+          value: "1.0"
+        - name: A2_TEMPERATURE
+          value: "0.7"
+
+        # Optimization
+        - name: LEARNING_RATE
+          value: "1e-6"
+        - name: BATCH_SIZE
+          value: "2"
+        - name: GRAD_ACC
+          value: "2"
+        - name: EPOCHS
+          value: "1"
+        - name: NUM_GPUS
+          value: "4"
+
+        # LoRA
+        - name: LORA_R
+          value: "64"
+        - name: LORA_ALPHA
+          value: "128"
+
+        # vLLM
+        - name: VLLM_GPU_MEM
+          value: "0.50"
+        # Pinned commit — v8b was trained with BINARY_VERIFIER prompt (no tags).
+        # Do NOT update without a fresh run: the LoRA adapter is tied to this prompt.
+        - name: GIT_COMMIT
+          value: "a02b147"
+
+        # === System Prompts (override Python defaults) ===
+        # v8: answer-tag-only A1/A2 + binary CORRECT/INCORRECT F1 (no feedback tags).
+        - name: VL_ASSISTANT_PROMPT_ANS_TAG
+          value: |
+            You are a visual question answering assistant. Look at the image carefully and answer the question. When given feedback on your previous answer, re-examine the image and either correct your answer or keep it if you believe it is right.
+
+            Put your final answer inside <answer> tags.
+            Example: <answer>(A)</answer>
+        - name: BINARY_VERIFIER_PROMPT
+          value: |
+            You are a visual question answering verifier. Given an image, a question, and the user's answer, determine whether the answer is correct or incorrect. State your verdict as CORRECT or INCORRECT and briefly explain why.
+
+        # Qwen2.5-VL image resolution
+        - name: MAX_PIXELS
+          value: "401408"
+        - name: MIN_PIXELS
+          value: "200704"
+
+        # SCoRe Stage I: freeze A1 policy loss for N steps
+        - name: FREEZE_A1_STEPS
+          value: "280"
+
+        # v8b: binary verification, shaped α=5, no-tag fix, lower KL, a2_temp=0.7
+        - name: REWARD_SHAPING_ALPHA
+          value: "5.0"
+        - name: W_A1_CORRECTNESS
+          value: "1.0"
+        - name: W_A2_CORRECTNESS
+          value: "1.0"
+        - name: W_NO_REGRESSION
+          value: "1.0"
+        - name: W_A2_FORMAT
+          value: "2.0"
+        - name: W_MINIMAL_EDIT
+          value: "0.3"
+        - name: W_DOWNSTREAM
+          value: "1.0"
+        - name: W_CALIBRATION
+          value: "0.0"
+        - name: W_FB_FORMAT
+          value: "0.0"
+        - name: W_FB_TAG_PENALTY
+          value: "0.5"
+        - name: W_VERIFICATION_ACCURACY
+          value: "1.0"
+
+        # Resume from last good checkpoint (crash at step 1190)
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_livr_v8b/checkpoint-1000"
+
+        # Logging
+        - name: LOGGING_STEPS
+          value: "10"
+        - name: SAVE_STEPS
+          value: "250"
+        - name: SEED
+          value: "42"
+
+        # LLM Judge disabled for MCQ
+        - name: VLM_USE_LLM_JUDGE
+          value: "0"
+
+        # HuggingFace
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+
+        # Python and CUDA
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: ""
+        - name: NCCL_TIMEOUT
+          value: "1800"
+        - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+          value: "1800"
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        - name: DO_NOT_TRACK
+          value: "1"
+        - name: VLLM_ENABLE_V1_MULTIPROCESSING
+          value: "0"
+        - name: WANDB_PROJECT
+          value: "vlm-self-reflection-grpo"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-api-key
+              key: key
+        - name: WANDB_RUN_NAME
+          value: "grpo-livr-9k-v8b-verify"
+
+        resources:
+          limits:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+          requests:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+
+        volumeMounts:
+        - name: cache
+          mountPath: /cache
+        - name: outputs
+          mountPath: /outputs
+        - name: dev-shm
+          mountPath: /dev/shm
+
+      tolerations:
+      - key: nautilus.io/reservation
+        operator: Exists
+        effect: NoSchedule
+      - key: nautilus.io/hardware
+        operator: Equal
+        value: large-gpu
+      - effect: PreferNoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      - key: nautilus.io/issue
+        operator: Exists
+        effect: NoSchedule
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+
+      volumes:
+      - name: cache
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: ms-swift-outputs-pvc
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi

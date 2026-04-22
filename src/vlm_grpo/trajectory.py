@@ -20,12 +20,14 @@ import re
 # Tag extraction patterns for <think>...</think><answer>...</answer> format
 _ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
 _THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IGNORECASE)
+# Feedback tag pattern for F1 verdict: <feedback>CORRECT</feedback> or <feedback>INCORRECT</feedback>
+_FEEDBACK_TAG_PATTERN = re.compile(r"<feedback>\s*(.*?)\s*</feedback>", re.DOTALL | re.IGNORECASE)
 
 # Answer extraction patterns (case-insensitive for a-f / A-F)
 _MCQ_LETTER_PATTERN = re.compile(r"[A-Fa-f]")
-_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.)\s*$")
-# Matches "(A)", "(b)" or "A.", "b." at word boundary
-_MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)|([A-Fa-f])\.)")
+_MCQ_STRICT_PATTERN = re.compile(r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])[.\s]?)\s*$")
+# Matches "(A)", "(b)" or standalone "A.", "b." (not inside words like "presented.")
+_MCQ_OPTION_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)|(?<!\w)([A-Fa-f])\.)")
 # Captures "(A) Yes" or "a. Yes" → letter + answer_text
 _MCQ_LETTER_AND_TEXT_PATTERN = re.compile(r"(?:\(([A-Fa-f])\)\s*|([A-Fa-f])\.\s*)(.*)", re.DOTALL)
 # Matches "The answer is X" / "answer: X" / "Answer is X" / "answer:X" patterns
@@ -34,6 +36,15 @@ _MCQ_ANSWER_IS_PATTERN = re.compile(
 )
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
+_NUMBER_WORDS: dict[str, str] = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15",
+}
+_NUMBER_WORD_PATTERN = re.compile(
+    r"\b(" + "|".join(_NUMBER_WORDS.keys()) + r")\b", re.IGNORECASE
+)
 
 # Hedging detection patterns for yes/no answers
 _HEDGING_PATTERNS = [
@@ -171,10 +182,39 @@ def has_think_answer_tags(text: str) -> bool:
     return bool(_THINK_TAG_PATTERN.search(text) and _ANSWER_TAG_PATTERN.search(text))
 
 
+def extract_from_feedback_tags(text: str) -> str:
+    """Extract verdict from <feedback>...</feedback> tags.
+
+    Args:
+        text: Raw F1 output, possibly containing <feedback> tags.
+
+    Returns:
+        Content inside <feedback> tags (e.g. "CORRECT" or "INCORRECT"),
+        or empty string if no tags found.
+    """
+    match = _FEEDBACK_TAG_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def has_feedback_tags(text: str) -> bool:
+    """Check whether text contains <feedback> tags.
+
+    Args:
+        text: Raw F1 output.
+
+    Returns:
+        True if <feedback> tags are present.
+    """
+    return bool(_FEEDBACK_TAG_PATTERN.search(text))
+
+
 def extract_answer_from_text(
     text: str,
     answer_type: str,
     choices: str = "",
+    require_answer_tag: bool = False,
 ) -> str:
     """Liberal extraction of answer from text for correctness scoring.
 
@@ -182,6 +222,10 @@ def extract_answer_from_text(
     NOT by format reward. This intentionally recovers answers from prose
     like "The answer is B" so correctness can still be evaluated even
     when format is wrong.
+
+    When require_answer_tag=True (answer-tag-only mode), extraction only
+    works from <answer> tag content. If no tag is found, returns "" (failed)
+    to prevent false positives from stray letters in prose like "A hen".
 
     For MCQ: extracts single letter (A-F), rejects multiple different letters.
     For YesNo: extracts "Yes" or "No", rejects hedging.
@@ -192,10 +236,15 @@ def extract_answer_from_text(
         text: Raw answer text
         answer_type: Expected answer type ("mcq", "yesno", "numeric", "open")
         choices: Optional comma-separated MCQ choices
+        require_answer_tag: If True, return "" when <answer> tags are missing
 
     Returns:
         Normalized answer string, or empty string if extraction failed
     """
+    # When answer tags required, only extract from tag content
+    if require_answer_tag and not _ANSWER_TAG_PATTERN.search(text):
+        return ""
+
     # Extract from <answer> tags first to avoid matching stray letters
     # in <think> sections (e.g., "reflectance." → false 'E' match)
     text = extract_from_answer_tags(text)
@@ -206,8 +255,8 @@ def extract_answer_from_text(
         return _extract_mcq_answer(text)
     elif answer_type == "yesno":
         return _extract_yesno_answer(text)
-    elif answer_type == "numeric":
-        return _extract_numeric_answer(text)
+    elif answer_type in ("numeric", "counting"):
+        return _extract_numeric_answer(text, allow_words=answer_type == "counting")
     else:
         return text
 
@@ -277,19 +326,27 @@ def _extract_yesno_answer(text: str) -> str:
     return "Yes" if answer == "yes" else "No"
 
 
-def _extract_numeric_answer(text: str) -> str:
+def _extract_numeric_answer(text: str, allow_words: bool = False) -> str:
     """Extract numeric answer from text.
 
     Args:
         text: Raw answer text
+        allow_words: If True, also match number words (e.g., "six" -> "6").
+            Used for counting tasks where models may spell out numbers.
 
     Returns:
         Number string, or empty string if extraction failed
     """
     match = _NUMERIC_PATTERN.search(text)
-    if not match:
-        return ""
-    return match.group(0)
+    if match:
+        return match.group(0)
+
+    if allow_words:
+        word_match = _NUMBER_WORD_PATTERN.search(text)
+        if word_match:
+            return _NUMBER_WORDS[word_match.group(1).lower()]
+
+    return ""
 
 
 def extract_mcq_letter_and_text(text: str) -> tuple[str, str]:

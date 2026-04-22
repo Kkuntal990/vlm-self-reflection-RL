@@ -93,6 +93,12 @@ class RolloutConfig:
     a2_temperature: float = 1.0
     batch_size: int = 8
     use_think_answer_tags: bool = False
+    use_answer_tag_only: bool = False
+    use_improvement_reward: bool = False
+    reward_shaping_alpha: float = 0.0
+    response_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
+    feedback_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
+    use_binary_verification: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -147,7 +153,7 @@ class ResponseRewardWeights:
     w_a2_correctness: float = 1.0
     w_no_regression: float = 2.0
     w_a2_format: float = 0.15
-    w_minimal_edit: float = 0.3
+    w_minimal_edit: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -163,18 +169,20 @@ class FeedbackRewardWeights:
               + w_format * R_format
 
     Attributes:
-        w_downstream: Weight for downstream-aware reward (dominant)
-        w_calibration: Weight for calibration tiebreaker (keyword-based
-            assessment of whether F1 correctly identifies A1 correctness).
-            Kept small to avoid formulaic language but breaks reward ties
-            across K trajectories since feedback text varies.
-        w_format: Weight for format compliance
+        w_downstream: Weight for downstream-aware reward (dominant).
+            Transition-shaped: WR=+3, RR=+1, RW=-1.5, WW=-1.
+        w_calibration: Weight for keyword-based calibration. Disabled by
+            default (0.0) — literature consensus is outcome-based rewards
+            only for feedback. Kept in code for experimentation.
+        w_format: Weight for format compliance (word count penalty)
+        w_tag_penalty: Weight for F1 tag leakage penalty
     """
 
     w_downstream: float = 2.0
-    w_calibration: float = 0.2
+    w_calibration: float = 0.0
     w_format: float = 0.15
     w_tag_penalty: float = 0.5
+    w_verification_accuracy: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -209,6 +217,10 @@ class SelfReflectionConfig:
         lora_alpha: LoRA alpha
         lora_target_modules: Target modules for LoRA
         kl_coeff: KL divergence coefficient for GRPO (0.0 disables KL)
+        a1_kl_coeff: KL multiplier for A1 turn (SCoRe-style anchor, relative to kl_coeff)
+        a2_kl_coeff: KL multiplier for A2 turn (relative to kl_coeff)
+        fb_kl_coeff: KL multiplier for F1 turn (relative to kl_coeff)
+        separate_turn_loss: If True, compute separate advantages for A1 vs A2
         clip_range: Policy ratio clipping range
         loss_type: GRPO loss variant ("grpo" or "dr_grpo")
         freeze_vision_tower: Whether to freeze the vision encoder
@@ -243,6 +255,16 @@ class SelfReflectionConfig:
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
     )
     kl_coeff: float = 0.05
+    a1_kl_coeff: float = 1.0
+    a2_kl_coeff: float = 1.0
+    fb_kl_coeff: float = 1.0
+    separate_turn_loss: bool = False
+    use_ssr: bool = False
+    ssr_buffer_size: int = 64
+    ssr_alpha: float = 1.0
+    use_improvement_reward: bool = False
+    reward_shaping_alpha: float = 0.0
+    freeze_a1_steps: int = 0
     clip_range: float = 0.2
     loss_type: str = "grpo"
     freeze_vision_tower: bool = False

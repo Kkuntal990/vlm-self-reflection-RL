@@ -54,6 +54,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_response_alpha(config: Any) -> float:
+    """Get shaped reward alpha for response (A2). Falls back to shared alpha."""
+    a = getattr(config, "response_alpha", -1.0)
+    if a >= 0:
+        return a
+    return getattr(config, "reward_shaping_alpha", 0.0)
+
+
+def _get_feedback_alpha(config: Any) -> float:
+    """Get shaped reward alpha for feedback (F1). Falls back to shared alpha."""
+    a = getattr(config, "feedback_alpha", -1.0)
+    if a >= 0:
+        return a
+    return getattr(config, "reward_shaping_alpha", 0.0)
+
+
 # =============================================================================
 # Rollout Data Structures
 # =============================================================================
@@ -404,9 +420,15 @@ def generate_self_reflection_rollout(
             # Step 1: Generate K A1s for every sample in the chunk.
             # repeat_interleave: [q0]*k + [q1]*k + ... -> chunk_size*k prompts
             use_tags = config.use_think_answer_tags
+            use_answer_only = getattr(config, "use_answer_tag_only", False)
             a1_prompts = [
-                build_initial_answer_prompt(q, use_think_answer_tags=use_tags)
-                for q in chunk_qs for _ in range(k)
+                build_initial_answer_prompt(
+                    q,
+                    use_think_answer_tags=use_tags,
+                    use_answer_tag_only=use_answer_only,
+                )
+                for q in chunk_qs
+                for _ in range(k)
             ]
             imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
 
@@ -447,8 +469,14 @@ def generate_self_reflection_rollout(
             all_a1s.extend(chunk_a1s)
 
             # Step 2: Generate F1 for each trajectory.
+            use_binary = getattr(config, "use_binary_verification", False)
             f1_prompts = [
-                build_critic_prompt(chunk_qs[i], chunk_a1s[i * k + j], model_type=model_type)
+                build_critic_prompt(
+                    chunk_qs[i],
+                    chunk_a1s[i * k + j],
+                    model_type=model_type,
+                    use_binary_verification=use_binary,
+                )
                 for i in range(chunk_size)
                 for j in range(k)
             ]
@@ -463,8 +491,11 @@ def generate_self_reflection_rollout(
             # Step 3: Generate A2 for each trajectory.
             a2_prompts = [
                 build_refiner_prompt(
-                    chunk_qs[i], chunk_a1s[i * k + j], chunk_f1s[i * k + j],
+                    chunk_qs[i],
+                    chunk_a1s[i * k + j],
+                    chunk_f1s[i * k + j],
                     use_think_answer_tags=use_tags,
+                    use_answer_tag_only=use_answer_only,
                 )
                 for i in range(chunk_size)
                 for j in range(k)
@@ -523,6 +554,8 @@ def generate_self_reflection_rollout(
                 choices=choices_list[i],
                 weights=response_weights,
                 use_think_answer_tags=config.use_think_answer_tags,
+                use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
+                reward_shaping_alpha=_get_response_alpha(config),
             )
             fb_bd = compute_feedback_reward_breakdown(
                 feedback_text=f1,
@@ -532,6 +565,9 @@ def generate_self_reflection_rollout(
                 answer_type=answer_types[i],
                 choices=choices_list[i],
                 weights=feedback_weights,
+                use_improvement_reward=getattr(config, "use_improvement_reward", False),
+                reward_shaping_alpha=_get_feedback_alpha(config),
+                use_binary_verification=getattr(config, "use_binary_verification", False),
             )
             result.response_rewards.append(resp_bd.total_reward)
             result.feedback_rewards.append(fb_bd.total_reward)

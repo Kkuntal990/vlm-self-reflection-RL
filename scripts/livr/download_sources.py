@@ -269,6 +269,28 @@ def download_mid() -> None:
     logger.info(f"[{name}] Done (may need manual scene downloads).")
 
 
+def download_nyuv2() -> None:
+    """Download NYUv2 depth dataset from HuggingFace."""
+    name = "nyuv2"
+    if _is_done(name):
+        logger.info(f"[{name}] Already downloaded, skipping.")
+        return
+
+    out_dir = os.path.join(BASE_DIR, name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    logger.info(f"[{name}] Loading from HuggingFace sayakpaul/nyu_depth_v2...")
+    from datasets import load_dataset
+
+    ds = load_dataset("sayakpaul/nyu_depth_v2", split="train", trust_remote_code=True)
+    save_path = os.path.join(out_dir, "dataset")
+    ds.save_to_disk(save_path)
+    logger.info(f"[{name}] Saved {len(ds)} samples to {save_path}")
+
+    _mark_done(name)
+    logger.info(f"[{name}] Done.")
+
+
 def download_nights() -> None:
     """Download DreamSim NIGHTS triplet dataset."""
     name = "nights"
@@ -313,6 +335,7 @@ ALL_DATASETS = {
     "spair71k": download_spair71k,
     "funkpoint": download_funkpoint,
     "mid": download_mid,
+    "nyuv2": download_nyuv2,
     "nights": download_nights,
 }
 

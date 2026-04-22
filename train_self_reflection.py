@@ -77,6 +77,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to validation JSONL",
     )
     parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.0,
+        help="Fraction of training data to hold out for validation (e.g. 0.1). "
+        "Ignored when --val_dataset_path is provided.",
+    )
+    parser.add_argument(
         "--image_base_dir",
         type=str,
         default="/outputs/image_base",
@@ -125,6 +132,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--kl_coeff", type=float, default=0.05)
+    parser.add_argument("--a1_kl_coeff", type=float, default=1.0)
+    parser.add_argument("--a2_kl_coeff", type=float, default=1.0)
+    parser.add_argument("--fb_kl_coeff", type=float, default=1.0)
+    parser.add_argument("--separate_turn_loss", action="store_true")
+    parser.add_argument(
+        "--use_ssr", action="store_true", help="Enable Selective Sample Replay (VL-Rethinker)"
+    )
+    parser.add_argument("--ssr_buffer_size", type=int, default=64)
+    parser.add_argument("--ssr_alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--use_improvement_reward",
+        action="store_true",
+        help="Use R(A2)-R(A1) improvement reward for F1 (Critique-GRPO)",
+    )
+    parser.add_argument(
+        "--reward_shaping_alpha",
+        type=float,
+        default=0.0,
+        help="SCoRe-style shaped reward alpha: R(A2)+α*(R(A2)-R(A1)). "
+        "Overrides --use_improvement_reward when > 0.",
+    )
+    parser.add_argument(
+        "--response_alpha",
+        type=float,
+        default=-1.0,
+        help="Shaped reward alpha for response (A2). -1 means use --reward_shaping_alpha.",
+    )
+    parser.add_argument(
+        "--feedback_alpha",
+        type=float,
+        default=-1.0,
+        help="Shaped reward alpha for feedback (F1). -1 means use --reward_shaping_alpha.",
+    )
+    parser.add_argument(
+        "--use_binary_verification",
+        action="store_true",
+        help="V8: Binary verification mode. F1 outputs CORRECT/INCORRECT "
+        "instead of open critique. Auto-disables think/answer tags.",
+    )
+    parser.add_argument(
+        "--w_verification_accuracy",
+        type=float,
+        default=0.0,
+        help="Weight for F1 verification accuracy reward (v8 binary mode)",
+    )
+    parser.add_argument(
+        "--freeze_a1_steps",
+        type=int,
+        default=0,
+        help="Freeze A1 policy loss for N steps (SCoRe Stage I)",
+    )
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument(
         "--num_inner_epochs",
@@ -149,6 +207,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use <think>...</think><answer>...</answer> tag format for A1/A2 generation. "
         "Enables structured reasoning with format reward for tags.",
+    )
+    parser.add_argument(
+        "--use_answer_tag_only",
+        action="store_true",
+        help="Use <answer>...</answer> tag only (no <think>). Model reasons freely, "
+        "wraps final answer in <answer> tags for structured extraction.",
     )
     parser.add_argument("--min_pixels", type=int, default=200704, help="Min pixels per image")
     parser.add_argument(
@@ -177,18 +241,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_a2_correctness", type=float, default=1.0)
     parser.add_argument("--w_no_regression", type=float, default=2.0)
     parser.add_argument("--w_a2_format", type=float, default=0.15)
-    parser.add_argument("--w_minimal_edit", type=float, default=0.3)
+    parser.add_argument("--w_minimal_edit", type=float, default=0.0)
 
     # Feedback reward weights
     parser.add_argument("--w_downstream", type=float, default=2.0)
-    parser.add_argument("--w_calibration", type=float, default=0.2)
+    parser.add_argument("--w_calibration", type=float, default=0.0)
     parser.add_argument("--w_fb_format", type=float, default=0.15)
     parser.add_argument("--w_fb_tag_penalty", type=float, default=0.0)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--val_check_interval", type=int, default=500)
 
     # Resume from checkpoint
     parser.add_argument(
@@ -219,14 +282,17 @@ def main() -> None:
     """Main training entry point."""
     args = parse_args()
 
-    from accelerate import Accelerator
+    from datetime import timedelta
+
+    from accelerate import Accelerator, InitProcessGroupKwargs
 
     from vlm_grpo.utils import set_seed, setup_environment
 
     setup_environment()
     set_seed(args.seed)
 
-    accelerator = Accelerator()
+    ddp_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=1800))
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
     # Suppress verbose logging on non-main processes
     if not accelerator.is_main_process:
@@ -254,9 +320,23 @@ def main() -> None:
     # so the model has positive incentive to use tags (range +0.5 to -1.0).
     # User can still override explicitly with --w_a2_format.
     w_a2_format = args.w_a2_format
-    if args.use_think_answer_tags and w_a2_format == 0.15:
+    if (args.use_think_answer_tags or getattr(args, "use_answer_tag_only", False)) and w_a2_format == 0.15:
         w_a2_format = 0.5
-        logger.info("Auto-increased w_a2_format to 0.5 for think/answer tag mode")
+        logger.info("Auto-increased w_a2_format to 0.5 for tag mode")
+
+    # v8 binary verification auto-config
+    if args.use_binary_verification:
+        if args.use_think_answer_tags:
+            logger.warning("--use_binary_verification overrides --use_think_answer_tags to False")
+            args.use_think_answer_tags = False
+        # Token limits are NOT auto-reduced — yaml value is respected.
+        # (The earlier auto-reduce to 16 silently truncated F1 explanations
+        # even when the yaml specified 256. Always trust the yaml.)
+        # Auto-set verification accuracy weight if not explicitly set
+        if args.w_verification_accuracy == 0.0:
+            args.w_verification_accuracy = 1.0
+            logger.info("Auto-set w_verification_accuracy to 1.0 for binary verification")
+        logger.info("Pipeline mode: V8 Binary Verification (A1→F1:CORRECT/INCORRECT→A2)")
 
     response_weights = ResponseRewardWeights(
         w_a1_correctness=args.w_a1_correctness,
@@ -270,6 +350,7 @@ def main() -> None:
         w_calibration=args.w_calibration,
         w_format=args.w_fb_format,
         w_tag_penalty=args.w_fb_tag_penalty,
+        w_verification_accuracy=args.w_verification_accuracy,
     )
     rollout_config = RolloutConfig(
         k_samples=args.k_samples,
@@ -282,6 +363,12 @@ def main() -> None:
         a2_temperature=args.a2_temperature,
         batch_size=args.rollout_batch_size or args.per_device_train_batch_size,
         use_think_answer_tags=args.use_think_answer_tags,
+        use_answer_tag_only=getattr(args, "use_answer_tag_only", False),
+        use_improvement_reward=args.use_improvement_reward,
+        reward_shaping_alpha=args.reward_shaping_alpha,
+        response_alpha=args.response_alpha,
+        feedback_alpha=args.feedback_alpha,
+        use_binary_verification=args.use_binary_verification,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -302,6 +389,16 @@ def main() -> None:
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         kl_coeff=args.kl_coeff,
+        a1_kl_coeff=args.a1_kl_coeff,
+        a2_kl_coeff=args.a2_kl_coeff,
+        fb_kl_coeff=args.fb_kl_coeff,
+        separate_turn_loss=args.separate_turn_loss,
+        use_ssr=args.use_ssr,
+        ssr_buffer_size=args.ssr_buffer_size,
+        ssr_alpha=args.ssr_alpha,
+        use_improvement_reward=args.use_improvement_reward,
+        reward_shaping_alpha=args.reward_shaping_alpha,
+        freeze_a1_steps=args.freeze_a1_steps,
         clip_range=args.clip_range,
         loss_type=args.loss_type,
         freeze_vision_tower=args.freeze_vision_tower,
@@ -312,7 +409,7 @@ def main() -> None:
         sanity_check_samples=args.sanity_check_samples,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
-        val_check_interval=args.val_check_interval,
+        val_check_interval=args.save_steps,
         seed=args.seed,
     )
 
@@ -348,6 +445,13 @@ def main() -> None:
     else:
         logger.info(f"Training dataset: {len(train_dataset)} samples")
 
+    # Shuffle training data to avoid task-type clustering.
+    # Fixed seed ensures identical order across accelerate processes.
+    import random
+
+    random.Random(args.seed).shuffle(train_dataset)
+    logger.info("Shuffled training dataset")
+
     val_dataset = None
     if args.val_dataset_path:
         val_dataset = load_self_reflection_dataset(
@@ -357,11 +461,25 @@ def main() -> None:
             max_pixels=img_max_pixels,
         )
         logger.info(f"Validation dataset: {len(val_dataset)} samples")
+    elif args.val_split > 0:
+        n_val = max(1, int(len(train_dataset) * args.val_split))
+        val_dataset = train_dataset[-n_val:]
+        train_dataset = train_dataset[:-n_val]
+        logger.info(
+            f"Split: {len(train_dataset)} train, {len(val_dataset)} val "
+            f"({args.val_split:.0%} held out)"
+        )
 
     # Sanity check mode (main process only)
     if args.sanity_check_samples > 0:
         if accelerator.is_main_process:
-            _run_sanity_check(train_dataset, response_weights, feedback_weights)
+            _run_sanity_check(
+                train_dataset,
+                response_weights,
+                feedback_weights,
+                reward_shaping_alpha=args.reward_shaping_alpha,
+                use_binary_verification=args.use_binary_verification,
+            )
         return
 
     # Load model + ref model
@@ -616,6 +734,8 @@ def _run_sanity_check(
     dataset: list[dict],
     response_weights: object,
     feedback_weights: object,
+    reward_shaping_alpha: float = 0.0,
+    use_binary_verification: bool = False,
 ) -> None:
     """Run sanity check with synthetic (A1, F1, A2) tuples.
 
@@ -625,6 +745,8 @@ def _run_sanity_check(
         dataset: List of sample dicts
         response_weights: Response reward weights
         feedback_weights: Feedback reward weights
+        reward_shaping_alpha: SCoRe-style shaped reward alpha
+        use_binary_verification: If True, use binary verification test cases
     """
     from vlm_grpo.rewards.composition import (
         compute_feedback_reward_breakdown,
@@ -632,7 +754,8 @@ def _run_sanity_check(
     )
 
     logger.info("=" * 70)
-    logger.info("SANITY CHECK MODE (two-reward self-reflection)")
+    mode = "BINARY VERIFICATION" if use_binary_verification else "two-reward self-reflection"
+    logger.info(f"SANITY CHECK MODE ({mode})")
     logger.info("=" * 70)
     logger.info(f"Response weights: {response_weights.to_dict()}")
     logger.info(f"Feedback weights: {feedback_weights.to_dict()}")
@@ -651,28 +774,52 @@ def _run_sanity_check(
         logger.info(f"  GT: {gt} | Type: {a_type} | Dataset: {ds}")
 
         # Synthetic trajectory scenarios
-        test_cases = {
-            "RR_good_feedback": {
-                "a1": gt,
-                "f1": "The answer is correct and well-supported by the image.",
-                "a2": gt,
-            },
-            "RW_bad_feedback": {
-                "a1": gt,
-                "f1": "The answer is incorrect, it should be changed completely.",
-                "a2": "ZZZ_WRONG_ANSWER",
-            },
-            "WR_helpful_feedback": {
-                "a1": "ZZZ_WRONG_ANSWER",
-                "f1": f"The answer is incorrect. The correct answer should be {gt}.",
-                "a2": gt,
-            },
-            "WW_useless_feedback": {
-                "a1": "ZZZ_WRONG_ANSWER",
-                "f1": "Looks fine to me.",
-                "a2": "ZZZ_STILL_WRONG",
-            },
-        }
+        if use_binary_verification:
+            test_cases = {
+                "RR_correct_verify": {
+                    "a1": gt,
+                    "f1": "CORRECT",
+                    "a2": gt,
+                },
+                "RW_wrong_verify": {
+                    "a1": gt,
+                    "f1": "INCORRECT",
+                    "a2": "ZZZ_WRONG_ANSWER",
+                },
+                "WR_correct_verify": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": "INCORRECT",
+                    "a2": gt,
+                },
+                "WW_sycophantic_verify": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": "CORRECT",
+                    "a2": "ZZZ_STILL_WRONG",
+                },
+            }
+        else:
+            test_cases = {
+                "RR_good_feedback": {
+                    "a1": gt,
+                    "f1": "The answer is correct and well-supported by the image.",
+                    "a2": gt,
+                },
+                "RW_bad_feedback": {
+                    "a1": gt,
+                    "f1": "The answer is incorrect, it should be changed completely.",
+                    "a2": "ZZZ_WRONG_ANSWER",
+                },
+                "WR_helpful_feedback": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": f"The answer is incorrect. The correct answer should be {gt}.",
+                    "a2": gt,
+                },
+                "WW_useless_feedback": {
+                    "a1": "ZZZ_WRONG_ANSWER",
+                    "f1": "Looks fine to me.",
+                    "a2": "ZZZ_STILL_WRONG",
+                },
+            }
 
         for case_name, traj in test_cases.items():
             resp_bd = compute_response_reward_breakdown(
@@ -682,6 +829,7 @@ def _run_sanity_check(
                 answer_type=a_type,
                 choices=ch,
                 weights=response_weights,
+                reward_shaping_alpha=reward_shaping_alpha,
             )
             fb_bd = compute_feedback_reward_breakdown(
                 feedback_text=traj["f1"],
@@ -691,6 +839,8 @@ def _run_sanity_check(
                 answer_type=a_type,
                 choices=ch,
                 weights=feedback_weights,
+                reward_shaping_alpha=reward_shaping_alpha,
+                use_binary_verification=use_binary_verification,
             )
 
             logger.info(f"  [{case_name}]")
