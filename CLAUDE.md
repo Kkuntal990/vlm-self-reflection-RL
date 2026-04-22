@@ -45,43 +45,67 @@ Multi-turn GRPO training pipeline for VLM self-reflection, using a custom SelfRe
 - User: feedback1
 - Model generates A2
 
-### Two-Reward Design
+### Two-Reward Design [SCoRe¹, Critique-GRPO²]
 
-GRPO uses two separate reward signals per trajectory — one for response quality (drives A1+A2 log-prob update), one for feedback quality (drives F1 log-prob update). Rewards are computed in `src/vlm_grpo/rewards/composition.py`.
+GRPO³ uses two separate reward signals per trajectory — one for response quality (drives A1+A2 log-prob update), one for feedback quality (drives F1 log-prob update)². Rewards are computed in `src/vlm_grpo/rewards/composition.py`.
 
 **Response Reward** = w_a1 * R_a1 + w_a2 * R_a2 + w_noreg * R_noreg + w_fmt * R_fmt + w_edit * R_edit
 
-- `a1_correctness`: Binary — is A1 correct? (+1 / -1)
-- `a2_correctness`: Binary for MCQ/YesNo/Numeric (+1 / -1), continuous for counting/open (2*score - 1)
-- `no_regression`: Did A2 maintain or improve on A1? MCQ-aware: deterministic types RW=-2/WR=+3, open-ended RW=-3/WR=+2
-- `a2_format`: Without tags: penalty-only (0 / -1). With tags: +0.5 / -0.5 / -1.0
-- `minimal_edit`: Only when both A1 and A2 are correct — rewards keeping the answer stable (0 to +1)
+- `a1_correctness`: Binary — is A1 correct? (+1 / -1). First-turn accuracy anchor, prevents Stage I collapse¹
+- `a2_correctness`: Binary for MCQ/YesNo/Numeric (+1 / -1), continuous for counting/open (2*score - 1). Standard GRPO outcome reward³
+- `no_regression`: Did A2 maintain or improve on A1? Shaped improvement reward `α·(r_a2 − r_a1)`¹ with asymmetric RW/WR values⁵. MCQ-aware: deterministic types RW=-2/WR=+3, open-ended RW=-3/WR=+2
+- `a2_format`: Without tags: penalty-only (0 / -1). With tags: +0.5 / -0.5 / -1.0. `<think>/<answer>` tag format reward⁴
+- `minimal_edit`: Only when both A1 and A2 are correct — rewards keeping the answer stable (0 to +1). Over-refinement mitigation⁶
 
 **Feedback Reward** = w_down * R_down + w_cal * R_cal + w_fmt * R_fmt
 
-- `downstream`: Did F1 lead to a correct A2? MCQ-aware: deterministic RW=-1.5/WR=+3, open-ended RW=-2/WR=+2
-- `calibration`: Does F1 correctly assess A1's correctness? Keyword-based, 7 discrete values (-1 to +1). Key variance-breaker — without it, downstream alone causes 50-75% zero-variance K-groups
-- `fb_format`: De-coupled from calibration (pure word count): empty/<3 words=-2, 3-6 words=-1, >6 words=0
+- `downstream`: Did F1 lead to a correct A2? F1's value is its effect on downstream A2 correctness². MCQ-aware: deterministic RW=-1.5/WR=+3, open-ended RW=-2/WR=+2⁵
+- `calibration`: Does F1 correctly assess A1's correctness? Self-critique signal⁶. Keyword-based, 7 discrete values (-1 to +1). Key variance-breaker — without it, downstream alone causes 50-75% zero-variance K-groups⁷
+- `fb_format`: De-coupled from calibration (pure word count): empty/<3 words=-2, 3-6 words=-1, >6 words=0. Format anchor⁴
 
 #### Reward Components
 
 **Response Reward:**
 
-| Component | Raw Range | Logic |
-|-----------|-----------|-------|
-| a1_correctness | {-1, +1} | Binary correct/wrong |
-| a2_correctness | [-1, +1] | Binary for MCQ/YesNo/Numeric; continuous for counting/open |
-| no_regression | {-3..+3} | Deterministic: RW:-2, WW:0, RR:+1, WR:+3. Open: RW:-3, WW:0, RR:+1, WR:+2 |
-| a2_format | {-1..+0.5} | No tags: 0/-1. With tags: +0.5 (valid), -0.5 (bad inner), -1.0 (no tags) |
-| minimal_edit | [0, +1] | `max(1 - 0.5*edit_dist, 0)`, only when both A1 and A2 correct |
+| Component | Raw Range | Logic | Source |
+|-----------|-----------|-------|--------|
+| a1_correctness | {-1, +1} | Binary correct/wrong | SCoRe Stage I¹ |
+| a2_correctness | [-1, +1] | Binary for MCQ/YesNo/Numeric; continuous for counting/open | GRPO³ |
+| no_regression | {-3..+3} | Deterministic: RW:-2, WW:0, RR:+1, WR:+3. Open: RW:-3, WW:0, RR:+1, WR:+2 | SCoRe shaping¹ + ReST-MCTS asymmetry⁵ |
+| a2_format | {-1..+0.5} | No tags: 0/-1. With tags: +0.5 (valid), -0.5 (bad inner), -1.0 (no tags) | DeepSeek-R1⁴ |
+| minimal_edit | [0, +1] | `max(1 - 0.5*edit_dist, 0)`, only when both A1 and A2 correct | Self-Refine⁶ |
 
 **Feedback Reward:**
 
-| Component | Raw Range | Logic |
-|-----------|-----------|-------|
-| downstream | {-2..+3} | Deterministic: RW:-1.5, WW:-1, RR:+1, WR:+3. Open: RW:-2, WW:-1, RR:+1, WR:+2 |
-| calibration | [-1, +1] | 7 discrete values from keyword matching (positive/negative/mixed/doubt/neutral) |
-| fb_format | {-2, -1, 0} | Pure word count (de-coupled from calibration): <3:-2, 3-6:-1, >6:0 |
+| Component | Raw Range | Logic | Source |
+|-----------|-----------|-------|--------|
+| downstream | {-2..+3} | Deterministic: RW:-1.5, WW:-1, RR:+1, WR:+3. Open: RW:-2, WW:-1, RR:+1, WR:+2 | Critique-GRPO² + ReST-MCTS⁵ |
+| calibration | [-1, +1] | 7 discrete values from keyword matching (positive/negative/mixed/doubt/neutral) | Self-Refine⁶ |
+| fb_format | {-2, -1, 0} | Pure word count (de-coupled from calibration): <3:-2, 3-6:-1, >6:0 | DeepSeek-R1⁴ |
+
+#### Implementation Details
+
+- **Loss**: Dr. GRPO⁷ (`--loss_type dr_grpo`) — removes std normalization to avoid low-variance reward bias
+- **KL estimator**: Schulman k3⁸ unbiased estimator `exp(Δ) − Δ − 1`, applied per-turn with independent `a1_kl_coeff`, `a2_kl_coeff`, `fb_kl_coeff`¹
+
+#### References
+
+1. **SCoRe** — Kumar et al., "Training Language Models to Self-Correct via Reinforcement Learning" (2024). [arXiv:2409.12917](https://arxiv.org/abs/2409.12917)
+   → Shaped reward `α·(r_a2 − r_a1)`, Stage I first-turn KL anchor, Stage II self-correction regularizer
+2. **Critique-GRPO** — Zhang et al., "Critique-GRPO: Advancing LLM Reasoning with Natural Language and Numerical Feedback" (2025). [arXiv:2506.03106](https://arxiv.org/abs/2506.03106)
+   → Two-reward design (separate response + feedback heads), downstream-aware feedback reward
+3. **GRPO** — Shao et al., "DeepSeekMath" (2024). [arXiv:2402.03300](https://arxiv.org/abs/2402.03300)
+   → Group Relative Policy Optimization, advantage = reward − group mean
+4. **DeepSeek-R1** — Guo et al., "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via RL" (2025). [arXiv:2501.12948](https://arxiv.org/abs/2501.12948)
+   → `<think>/<answer>` format reward, β=0.001 KL anchor
+5. **ReST-MCTS** — Zhang et al., "ReST-MCTS*: LLM Self-Training via Process Reward Guided Tree Search" (2024). [arXiv:2406.03816](https://arxiv.org/abs/2406.03816)
+   → Asymmetric verification penalties (reward correction > penalize regression)
+6. **Self-Refine** — Madaan et al., "Self-Refine: Iterative Refinement with Self-Feedback" (2023). [arXiv:2303.17651](https://arxiv.org/abs/2303.17651)
+   → Over-refinement failure mode, stability when already correct
+7. **Dr. GRPO** — Liu et al., "Understanding R1-Zero-Like Training: A Critical Perspective" (2025). [arXiv:2503.20783](https://arxiv.org/abs/2503.20783)
+   → Remove std normalization from GRPO (fixes low-variance-group bias)
+8. **Schulman k3 KL estimator** — Schulman, "Approximating KL Divergence" (2020). [joschu.net/blog/kl-approx](http://joschu.net/blog/kl-approx.html)
+   → Unbiased, always-positive `exp(Δ) − Δ − 1` used in per-turn KL
 
 ### Prompt Mismatch Warning
 The balanced_70k dataset's `messages` contain a system prompt with `Thought: [reasoning] / Answer: [final answer]` format. This is NOT the prompt used during GRPO training. GRPO hardcodes its own prompts in `prompts.py`. If you switch to using the dataset's messages, the prompt format will change.
