@@ -117,8 +117,8 @@ class TestRolloutConfig:
     def test_defaults(self) -> None:
         config = RolloutConfig()
         assert config.k_samples == 4
-        assert config.temperature == 0.7
-        assert config.a2_temperature == 0.0
+        assert config.temperature == 1.0
+        assert config.a2_temperature == 1.0
         assert config.batch_size == 8
 
     def test_custom(self) -> None:

@@ -204,16 +204,63 @@ Do NOT exec into training job pods for log analysis — use the helper pod which
 
 1. **Lazy Imports in Model Classes**: Do NOT move imports from `__init__` methods to module level in model wrapper classes.
 
-## Key Files
+## Repository Structure
 
-- `train_self_reflection.py` - Main training entry point
-- `src/vlm_grpo/critic_grpo.py` - SelfReflectionGRPOTrainer
-- `src/vlm_grpo/rewards/composition.py` - Response + feedback reward composition
-- `src/vlm_grpo/rewards/correctness.py` - A2 correctness reward
-- `src/vlm_grpo/rewards/feedback.py` - Feedback calibration + downstream reward
-- `src/vlm_grpo/rewards/stability.py` - No-regression + minimal edit rewards
-- `src/vlm_grpo/rewards/verifier.py` - Deterministic answer verification
-- `src/vlm_grpo/rewards/deterministic.py` - MCQ/YesNo/numeric answer matching
-- `src/vlm_grpo/trajectory.py` - Answer extraction and normalization
-- `src/vlm_grpo/prompts.py` - Prompt builders (A1, critic, refiner)
-- `src/vlm_grpo/data.py` - Dataset loading
+```
+.
+├── train_self_reflection.py      # Main training entry point
+├── pyproject.toml                # Package + tooling config (ruff, mypy, pytest)
+├── uv.lock                       # Locked dependency versions
+├── CLAUDE.md                     # This file
+├── experiments.md                # Experiment log (v1 → v9b)
+│
+├── src/vlm_grpo/                 # Installable package
+│   ├── config.py                 # Dataclasses: RolloutConfig, ResponseRewardWeights, FeedbackRewardWeights
+│   ├── critic_grpo.py            # SelfReflectionGRPOTrainer: GRPO loop, per-turn KL, policy update
+│   ├── data.py                   # Dataset loading + answer_type detection
+│   ├── prompts.py                # A1 / F1 / A2 prompt builders + system prompts
+│   ├── rollout.py                # HF generate() rollout engine (3 turns per sample)
+│   ├── vllm_rollout.py           # vLLM rollout engine with sleep-mode for GPU sharing
+│   ├── trajectory.py             # Answer extraction, tag parsing, MCQ letter normalization
+│   ├── utils.py                  # Seeding, env setup, normalized edit distance
+│   └── rewards/
+│       ├── composition.py        # Combines all rewards into Response + Feedback breakdowns
+│       ├── correctness.py        # A2 correctness reward (binary / continuous)
+│       ├── deterministic.py      # MCQ / YesNo / numeric answer matching
+│       ├── feedback.py           # F1 calibration + downstream-aware reward
+│       ├── judge_llm.py          # Optional LLM judge (enabled via VLM_USE_LLM_JUDGE=1)
+│       ├── stability.py          # No-regression + minimal-edit rewards
+│       └── verifier.py           # Top-level verify_answer dispatcher (deterministic + judge)
+│
+├── tests/                        # pytest suite mirroring src/vlm_grpo structure
+│   ├── test_binary_verification.py  # Binary CORRECT/INCORRECT verdict pipeline
+│   ├── test_correctness.py          # A2 correctness reward
+│   ├── test_deterministic.py        # MCQ / YesNo / numeric matchers
+│   ├── test_feedback.py             # Calibration + downstream
+│   ├── test_rollout.py              # RolloutConfig + batch rollout
+│   ├── test_stability.py            # No-regression + minimal-edit
+│   ├── test_trajectory.py           # Tag parsing + answer extraction
+│   ├── test_two_traj_composition.py # End-to-end response + feedback composition
+│   └── test_verifier.py             # Dispatcher + judge integration
+│
+├── scripts/
+│   ├── data/                     # Dataset construction
+│   │   ├── livr/                 # LIVR perception MCQ builders (9 tasks + merge)
+│   │   ├── convert_livr_to_sharegpt.py   # JSONL → ShareGPT format
+│   │   └── upload_livr_mixed_to_hf.py    # HuggingFace dataset upload
+│   ├── preference/               # Preference data for offline alignment (SFT / DPO)
+│   │   ├── build_feedback_preference_data.py
+│   │   └── build_pairwise_preference_data.py
+│   └── ops/                      # Cluster / training ops helpers
+│       ├── auto_resume_monitor.sh
+│       └── monitor_training.sh
+│
+└── k8s/                          # Kubernetes configs
+    ├── job-qwen-grpo-livr-9k-v8.yaml    # Current: v8 binary verification
+    ├── job-qwen-grpo-livr-9k-v9.yaml    # Current: v9 rebalanced rewards + <feedback> tags
+    ├── job-qwen-grpo-livr-9k-v9b.yaml   # Current: v9b v8b rerun with token-cap fix
+    ├── jupyter-1gpu-dev.yaml            # Dev helper pod (PVC mount)
+    ├── multi_gpu.yaml                   # Accelerate multi-GPU launch config
+    ├── deepspeed_zero3.yaml             # Accelerate + DeepSpeed ZeRO-3 launch config
+    └── ds_zero3_config.json             # DeepSpeed ZeRO-3 engine config
+```
