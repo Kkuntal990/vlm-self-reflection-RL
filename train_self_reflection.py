@@ -499,6 +499,16 @@ def main() -> None:
     model.gradient_checkpointing_enable()
     logger.info("Gradient checkpointing enabled on policy model")
 
+    # Barrier before PEFT wrap: each rank loads the model independently from
+    # HF cache; without a barrier, if load timing differs across ranks, PEFT's
+    # module-order discovery in `get_peft_model` can produce inconsistent
+    # trainable-param lists → DDP `_verify_params_across_processes` crashes on
+    # shape mismatch (observed v10-base/v10-r1init 2026-04-22, NCCL timeout on
+    # SeqNum=1/2 collective, `params[0] sizes [64, 1280]` — LoRA on ViT).
+    if accelerator.num_processes > 1:
+        logger.info("Pre-PEFT barrier: syncing all ranks on model load")
+        accelerator.wait_for_everyone()
+
     # Apply LoRA
     if not args.no_peft:
         from peft import LoraConfig, get_peft_model
@@ -524,6 +534,20 @@ def main() -> None:
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
         logger.info(f"LoRA applied (r={args.lora_r}, alpha={args.lora_alpha})")
+
+        # Post-PEFT sanity barrier + shape hash: helps diagnose future
+        # param-shape mismatches by logging a per-rank hash of (name, shape)
+        # tuples. All ranks must produce the same hash, else DDP will crash.
+        if accelerator.num_processes > 1:
+            trainable_shapes = [
+                (n, tuple(p.shape)) for n, p in model.named_parameters() if p.requires_grad
+            ]
+            shape_hash = hash(tuple(trainable_shapes))
+            logger.info(
+                f"Rank {accelerator.process_index}: "
+                f"{len(trainable_shapes)} trainable params, shape_hash={shape_hash}"
+            )
+            accelerator.wait_for_everyone()
 
     # Create optimizer and prepare for distributed training
     from torch.optim import AdamW
