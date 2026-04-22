@@ -135,8 +135,7 @@ def main() -> None:
 
         choices_str = " ".join(formatted_choices)
         question = (
-            f"Which painting shares the same art style as the reference painting? "
-            f"{choices_str}"
+            f"Which painting shares the same art style as the reference painting? {choices_str}"
         )
 
         record = make_livr_record(

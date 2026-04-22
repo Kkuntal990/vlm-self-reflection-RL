@@ -45,10 +45,10 @@ def _cut_quadrants(img: Image.Image) -> list[Image.Image]:
     w, h = img.size
     hw, hh = w // 2, h // 2
     return [
-        img.crop((0, 0, hw, hh)),       # TL
-        img.crop((hw, 0, w, hh)),        # TR
-        img.crop((0, hh, hw, h)),        # BL
-        img.crop((hw, hh, w, h)),        # BR
+        img.crop((0, 0, hw, hh)),  # TL
+        img.crop((hw, 0, w, hh)),  # TR
+        img.crop((0, hh, hw, h)),  # BL
+        img.crop((hw, hh, w, h)),  # BR
     ]
 
 
@@ -122,10 +122,7 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     # List COCO images
-    all_images = sorted([
-        f for f in os.listdir(args.images_dir)
-        if f.endswith((".jpg", ".png"))
-    ])
+    all_images = sorted([f for f in os.listdir(args.images_dir) if f.endswith((".jpg", ".png"))])
     logger.info(f"Found {len(all_images)} COCO images")
 
     rng.shuffle(all_images)

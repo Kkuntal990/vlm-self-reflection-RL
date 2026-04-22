@@ -162,7 +162,8 @@ def _build_from_images(
 
             # 3-way MCQ
             distractors = [
-                t for t in [
+                t
+                for t in [
                     "Point 1 (red) has higher reflectance",
                     "Point 2 (blue) has higher reflectance",
                     "Both points have similar reflectance",
@@ -170,9 +171,7 @@ def _build_from_images(
                 if t != correct_text
             ]
 
-            correct_letter, formatted_choices, _ = shuffle_choices(
-                correct_text, distractors, rng
-            )
+            correct_letter, formatted_choices, _ = shuffle_choices(correct_text, distractors, rng)
 
             choices_str = " ".join(formatted_choices)
             question = (

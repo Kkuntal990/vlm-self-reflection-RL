@@ -83,9 +83,7 @@ def main() -> None:
     logger.info(f"Filtered to {len(filtered)} samples with count in [{MIN_COUNT}, {MAX_COUNT}]")
 
     if len(filtered) < args.n_samples:
-        logger.warning(
-            f"Only {len(filtered)} samples available, requested {args.n_samples}"
-        )
+        logger.warning(f"Only {len(filtered)} samples available, requested {args.n_samples}")
 
     rng.shuffle(filtered)
     selected = filtered[: args.n_samples]

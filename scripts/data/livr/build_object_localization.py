@@ -134,7 +134,9 @@ def main() -> None:
         if MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC:
             valid_anns.append((ann, img_info))
 
-    logger.info(f"Found {len(valid_anns)} annotations with area in [{MIN_AREA_FRAC}, {MAX_AREA_FRAC}]")
+    logger.info(
+        f"Found {len(valid_anns)} annotations with area in [{MIN_AREA_FRAC}, {MAX_AREA_FRAC}]"
+    )
 
     rng.shuffle(valid_anns)
     selected = valid_anns[: args.n_samples]

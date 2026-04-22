@@ -29,7 +29,10 @@ class TestFeedbackTagExtraction:
         assert extract_from_feedback_tags("<feedback>CORRECT</feedback> Good job.") == "CORRECT"
 
     def test_extract_incorrect(self) -> None:
-        assert extract_from_feedback_tags("<feedback>INCORRECT</feedback> Should be (B).") == "INCORRECT"
+        assert (
+            extract_from_feedback_tags("<feedback>INCORRECT</feedback> Should be (B).")
+            == "INCORRECT"
+        )
 
     def test_case_insensitive(self) -> None:
         assert extract_from_feedback_tags("<Feedback>correct</Feedback>") == "correct"
@@ -87,29 +90,42 @@ class TestVerificationAccuracyReward:
 
     # Primary path: <feedback> tags
     def test_tag_correct_a1_right(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "<feedback>CORRECT</feedback> Well done.", a1_is_correct=True
-        ) == 1.0
+        assert (
+            compute_verification_accuracy_reward(
+                "<feedback>CORRECT</feedback> Well done.", a1_is_correct=True
+            )
+            == 1.0
+        )
 
     def test_tag_correct_a1_wrong(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "<feedback>CORRECT</feedback> Looks good.", a1_is_correct=False
-        ) == -1.0
+        assert (
+            compute_verification_accuracy_reward(
+                "<feedback>CORRECT</feedback> Looks good.", a1_is_correct=False
+            )
+            == -1.0
+        )
 
     def test_tag_incorrect_a1_wrong(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "<feedback>INCORRECT</feedback> Should be (B).", a1_is_correct=False
-        ) == 1.0
+        assert (
+            compute_verification_accuracy_reward(
+                "<feedback>INCORRECT</feedback> Should be (B).", a1_is_correct=False
+            )
+            == 1.0
+        )
 
     def test_tag_incorrect_a1_right(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "<feedback>INCORRECT</feedback> Wrong.", a1_is_correct=True
-        ) == -1.0
+        assert (
+            compute_verification_accuracy_reward(
+                "<feedback>INCORRECT</feedback> Wrong.", a1_is_correct=True
+            )
+            == -1.0
+        )
 
     def test_tag_invalid_verdict(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "<feedback>MAYBE</feedback>", a1_is_correct=True
-        ) == 0.0
+        assert (
+            compute_verification_accuracy_reward("<feedback>MAYBE</feedback>", a1_is_correct=True)
+            == 0.0
+        )
 
     # Fallback path: text search (no tags)
     def test_fallback_correct(self) -> None:
@@ -119,14 +135,20 @@ class TestVerificationAccuracyReward:
         assert compute_verification_accuracy_reward("INCORRECT", a1_is_correct=False) == 1.0
 
     def test_fallback_embedded(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "The answer appears incorrect", a1_is_correct=False
-        ) == 1.0
+        assert (
+            compute_verification_accuracy_reward(
+                "The answer appears incorrect", a1_is_correct=False
+            )
+            == 1.0
+        )
 
     def test_no_verdict_returns_zero(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "The painting shows blue tones", a1_is_correct=True
-        ) == 0.0
+        assert (
+            compute_verification_accuracy_reward(
+                "The painting shows blue tones", a1_is_correct=True
+            )
+            == 0.0
+        )
 
     def test_empty_returns_zero(self) -> None:
         assert compute_verification_accuracy_reward("", a1_is_correct=True) == 0.0

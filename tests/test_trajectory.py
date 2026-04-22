@@ -327,7 +327,9 @@ class TestMCQEndToEnd:
     # --- Perfect format: <think>...<answer>(X)</answer> ---
 
     def test_perfect_format_correct(self) -> None:
-        text = "<think>The second image matches the Impressionist style.</think><answer>(A)</answer>"
+        text = (
+            "<think>The second image matches the Impressionist style.</think><answer>(A)</answer>"
+        )
         assert extract_answer_from_text(text, "mcq") == "A"
         extracted = normalize_answer(extract_from_answer_tags(text))
         assert match_answer(extracted, "a", "mcq") is True
@@ -532,9 +534,17 @@ class TestCountingEndToEnd:
     def test_counting_word_to_number_all(self) -> None:
         """Verify all supported number words."""
         for word, digit in [
-            ("zero", "0"), ("one", "1"), ("two", "2"), ("three", "3"),
-            ("four", "4"), ("five", "5"), ("six", "6"), ("seven", "7"),
-            ("eight", "8"), ("nine", "9"), ("ten", "10"),
+            ("zero", "0"),
+            ("one", "1"),
+            ("two", "2"),
+            ("three", "3"),
+            ("four", "4"),
+            ("five", "5"),
+            ("six", "6"),
+            ("seven", "7"),
+            ("eight", "8"),
+            ("nine", "9"),
+            ("ten", "10"),
         ]:
             assert extract_answer_from_text(word, "counting") == digit, f"Failed for {word}"
 

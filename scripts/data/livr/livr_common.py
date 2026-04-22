@@ -26,12 +26,12 @@ OPTION_LETTERS = ["A", "B", "C", "D", "E", "F"]
 
 # Colors for annotations (RGB)
 OPTION_COLORS = [
-    (255, 0, 0),      # Red
-    (0, 0, 255),      # Blue
-    (0, 180, 0),      # Green
-    (255, 165, 0),    # Orange
-    (148, 0, 211),    # Violet
-    (0, 206, 209),    # Cyan
+    (255, 0, 0),  # Red
+    (0, 0, 255),  # Blue
+    (0, 180, 0),  # Green
+    (255, 165, 0),  # Orange
+    (148, 0, 211),  # Violet
+    (0, 206, 209),  # Cyan
 ]
 
 # Default JPEG quality for composite images
@@ -123,10 +123,7 @@ def shuffle_choices(
     correct_letter = OPTION_LETTERS[correct_pos]
 
     ordered_texts = [all_texts[i] for i in indices]
-    formatted = [
-        f"({OPTION_LETTERS[j]}) {ordered_texts[j]}"
-        for j in range(len(ordered_texts))
-    ]
+    formatted = [f"({OPTION_LETTERS[j]}) {ordered_texts[j]}" for j in range(len(ordered_texts))]
     return correct_letter, formatted, ordered_texts
 
 
@@ -153,8 +150,7 @@ def generate_numeric_distractors(
         List of distractor integers.
     """
     candidates = [
-        v for v in range(max(min_val, correct - 5), min(max_val, correct + 5) + 1)
-        if v != correct
+        v for v in range(max(min_val, correct - 5), min(max_val, correct + 5) + 1) if v != correct
     ]
     if len(candidates) < n_distractors:
         candidates = [v for v in range(min_val, max_val + 1) if v != correct]
@@ -321,12 +317,8 @@ def create_side_by_side(
     # Resize both to same height
     l_ratio = target_height / left.height
     r_ratio = target_height / right.height
-    l_resized = left.resize(
-        (int(left.width * l_ratio), target_height), Image.LANCZOS
-    )
-    r_resized = right.resize(
-        (int(right.width * r_ratio), target_height), Image.LANCZOS
-    )
+    l_resized = left.resize((int(left.width * l_ratio), target_height), Image.LANCZOS)
+    r_resized = right.resize((int(right.width * r_ratio), target_height), Image.LANCZOS)
 
     total_w = l_resized.width + r_resized.width + 3 * padding
     total_h = target_height + label_h + 2 * padding

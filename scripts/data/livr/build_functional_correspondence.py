@@ -177,12 +177,17 @@ def _build_from_spair_fallback(args: argparse.Namespace, rng: random.Random) -> 
             color = OPTION_COLORS[j]
             label = f"({OPTION_LETTERS[j]})"
             tgt_annotated = draw_keypoint(
-                tgt_annotated, int(pt[0]), int(pt[1]),
-                color=color, radius=10, label=label,
+                tgt_annotated,
+                int(pt[0]),
+                int(pt[1]),
+                color=color,
+                radius=10,
+                label=label,
             )
 
         composite = create_side_by_side(
-            src_annotated, tgt_annotated,
+            src_annotated,
+            tgt_annotated,
             left_label=f"Object 1 (red dot = functional point)",
             right_label=f"Object 2 (find same function)",
             target_height=350,
@@ -210,7 +215,9 @@ def _build_from_spair_fallback(args: argparse.Namespace, rng: random.Random) -> 
         records.append(record)
 
         if len(records) % 200 == 0:
-            logger.info(f"Processed {len(records)}/{args.n_samples} functional correspondence samples")
+            logger.info(
+                f"Processed {len(records)}/{args.n_samples} functional correspondence samples"
+            )
 
     return records
 

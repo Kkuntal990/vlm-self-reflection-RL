@@ -110,8 +110,6 @@ def compute_feedback_calibration_reward(
     return 0.0
 
 
-
-
 def compute_downstream_aware_reward(
     feedback_text: str,
     a2_extracted: str,

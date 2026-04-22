@@ -173,12 +173,17 @@ def main() -> None:
             color = OPTION_COLORS[j]
             label = f"({OPTION_LETTERS[j]})"
             tgt_annotated = draw_keypoint(
-                tgt_annotated, int(pt[0]), int(pt[1]),
-                color=color, radius=10, label=label,
+                tgt_annotated,
+                int(pt[0]),
+                int(pt[1]),
+                color=color,
+                radius=10,
+                label=label,
             )
 
         composite = create_side_by_side(
-            src_annotated, tgt_annotated,
+            src_annotated,
+            tgt_annotated,
             left_label=f"Source {category} (red dot = query)",
             right_label=f"Target {category} (find match)",
             target_height=350,
@@ -206,7 +211,9 @@ def main() -> None:
         records.append(record)
 
         if len(records) % 200 == 0:
-            logger.info(f"Processed {len(records)}/{args.n_samples} semantic correspondence samples")
+            logger.info(
+                f"Processed {len(records)}/{args.n_samples} semantic correspondence samples"
+            )
 
     write_jsonl(records, args.output_jsonl)
     logger.info(f"Built {len(records)} semantic correspondence MCQ samples.")

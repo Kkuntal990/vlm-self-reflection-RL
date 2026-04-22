@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--src", default="/outputs/hf_staging/livr_mixed/livr_perception_mixed.jsonl")
-    parser.add_argument("--dst", default="/outputs/hf_staging/livr_mixed/livr_perception_mixed_sharegpt.jsonl")
+    parser.add_argument(
+        "--src", default="/outputs/hf_staging/livr_mixed/livr_perception_mixed.jsonl"
+    )
+    parser.add_argument(
+        "--dst", default="/outputs/hf_staging/livr_mixed/livr_perception_mixed_sharegpt.jsonl"
+    )
     parser.add_argument("--repo_id", default="Kkuntal990/LIVR_mixed")
     parser.add_argument("--path_in_repo", default="livr_perception_mixed_sharegpt.jsonl")
     args = parser.parse_args()

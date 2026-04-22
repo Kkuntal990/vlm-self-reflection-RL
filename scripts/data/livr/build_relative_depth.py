@@ -91,8 +91,10 @@ def _build_from_huggingface(
 
     logger.info("Loading NYUv2 from HuggingFace (streaming mode)...")
     ds = load_dataset(
-        "sayakpaul/nyu_depth_v2", split="train",
-        trust_remote_code=True, streaming=True,
+        "sayakpaul/nyu_depth_v2",
+        split="train",
+        trust_remote_code=True,
+        streaming=True,
     )
 
     # Collect samples into memory (only keep what we need)
@@ -265,7 +267,8 @@ def _build_records(
 
             # 3-way MCQ
             distractors = [
-                t for t in [
+                t
+                for t in [
                     "Point 1 (red) is closer to the camera",
                     "Point 2 (blue) is closer to the camera",
                     "Both points are at about the same distance",
@@ -273,9 +276,7 @@ def _build_records(
                 if t != correct_text
             ]
 
-            correct_letter, formatted_choices, _ = shuffle_choices(
-                correct_text, distractors, rng
-            )
+            correct_letter, formatted_choices, _ = shuffle_choices(correct_text, distractors, rng)
 
             choices_str = " ".join(formatted_choices)
             question = (

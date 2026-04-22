@@ -241,17 +241,37 @@ def _assess_calibration(f1_text: str, a1_correct: bool) -> bool:
     text_lower = f1_text.lower()
 
     # Hedged positives count as negative
-    hedged = any(p in text_lower for p in [
-        "partially correct", "mostly correct", "on the right track",
-    ])
-    has_positive = any(p in text_lower for p in [
-        "correct", "accurate", "well done", "good answer",
-        "no change needed",
-    ])
-    has_negative = any(p in text_lower for p in [
-        "incorrect", "wrong", "error", "mistake", "should be",
-        "not correct", "not accurate", "reconsider",
-    ])
+    hedged = any(
+        p in text_lower
+        for p in [
+            "partially correct",
+            "mostly correct",
+            "on the right track",
+        ]
+    )
+    has_positive = any(
+        p in text_lower
+        for p in [
+            "correct",
+            "accurate",
+            "well done",
+            "good answer",
+            "no change needed",
+        ]
+    )
+    has_negative = any(
+        p in text_lower
+        for p in [
+            "incorrect",
+            "wrong",
+            "error",
+            "mistake",
+            "should be",
+            "not correct",
+            "not accurate",
+            "reconsider",
+        ]
+    )
 
     if hedged:
         # Hedged positive → treating as negative
@@ -296,9 +316,9 @@ def _score_critique(
     cal_score = 1.0 if calibration_correct else -1.0
 
     if not a1_correct and a2_correct:
-        downstream = 2.0   # WR: critique fixed the error
+        downstream = 2.0  # WR: critique fixed the error
     elif a1_correct and a2_correct:
-        downstream = 0.5   # RR: critique preserved correctness
+        downstream = 0.5  # RR: critique preserved correctness
     elif a1_correct and not a2_correct:
         downstream = -2.0  # RW: critique caused regression
     else:
@@ -360,7 +380,9 @@ def generate_critiques(
 
     # Load dataset
     samples = load_self_reflection_dataset(
-        dataset_path, image_base_dir=image_base_dir, max_samples=max_questions,
+        dataset_path,
+        image_base_dir=image_base_dir,
+        max_samples=max_questions,
     )
     logger.info(f"Loaded {len(samples)} LIVR questions")
 
@@ -377,13 +399,14 @@ def generate_critiques(
 
     greedy_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
     diverse_params = SamplingParams(
-        temperature=critique_temperature, max_tokens=max_tokens,
-        top_p=0.9, n=k_critiques,
+        temperature=critique_temperature,
+        max_tokens=max_tokens,
+        top_p=0.9,
+        n=k_critiques,
     )
 
     output_path = os.path.join(output_dir, "critique_candidates.jsonl")
-    stats = {"total": 0, "mixed": 0, "all_good": 0, "all_bad": 0,
-             "a1_correct": 0, "a1_wrong": 0}
+    stats = {"total": 0, "mixed": 0, "all_good": 0, "all_bad": 0, "a1_correct": 0, "a1_wrong": 0}
 
     with open(output_path, "w") as fout:
         for i, sample in enumerate(samples):
@@ -398,7 +421,11 @@ def generate_critiques(
             # Step 1a: Generate A1 (greedy)
             a1_prompt = build_initial_answer_prompt(question)
             a1_text = _generate_single(
-                llm, processor, a1_prompt, image_path, greedy_params,
+                llm,
+                processor,
+                a1_prompt,
+                image_path,
+                greedy_params,
             )
             a1_extracted = extract_answer_from_text(a1_text, answer_type)
             a1_result = verify_answer(a1_text, gt, answer_type)
@@ -411,10 +438,16 @@ def generate_critiques(
 
             # Step 1b: Generate K F1 critiques (diverse)
             f1_prompt = build_critic_prompt(
-                question, a1_text, model_type="qwen2vl",
+                question,
+                a1_text,
+                model_type="qwen2vl",
             )
             f1_texts = _generate_multiple(
-                llm, processor, f1_prompt, image_path, diverse_params,
+                llm,
+                processor,
+                f1_prompt,
+                image_path,
+                diverse_params,
                 k_critiques,
             )
 
@@ -423,7 +456,11 @@ def generate_critiques(
             for f1_text in f1_texts:
                 a2_prompt = build_refiner_prompt(question, a1_text, f1_text)
                 a2_text = _generate_single(
-                    llm, processor, a2_prompt, image_path, greedy_params,
+                    llm,
+                    processor,
+                    a2_prompt,
+                    image_path,
+                    greedy_params,
                 )
                 a2_extracted = extract_answer_from_text(a2_text, answer_type)
                 a2_result = verify_answer(a2_text, gt, answer_type)
@@ -435,15 +472,17 @@ def generate_critiques(
                 # "Good" = calibration correct AND no regression
                 is_good = cal_correct and not (a1_correct and not a2_correct)
 
-                critiques.append(CritiqueCandidate(
-                    f1_text=f1_text,
-                    a2_text=a2_text,
-                    a2_extracted=a2_extracted,
-                    a2_correct=a2_correct,
-                    calibration_correct=cal_correct,
-                    is_good=is_good,
-                    score=score,
-                ))
+                critiques.append(
+                    CritiqueCandidate(
+                        f1_text=f1_text,
+                        a2_text=a2_text,
+                        a2_extracted=a2_extracted,
+                        a2_correct=a2_correct,
+                        calibration_correct=cal_correct,
+                        is_good=is_good,
+                        score=score,
+                    )
+                )
 
             qc = QuestionCritiques(
                 sample_index=sample.get("sample_index", i),
@@ -495,7 +534,9 @@ def _generate_single(
     from PIL import Image
 
     prompt_text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
     image = Image.open(image_path).convert("RGB")
 
@@ -530,7 +571,9 @@ def _generate_multiple(
     from PIL import Image
 
     prompt_text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
     image = Image.open(image_path).convert("RGB")
 
@@ -599,19 +642,21 @@ def build_feedback_pairs(
 
         n_pairs = min(max_pairs_per_question, len(good), len(bad))
         for pi in range(n_pairs):
-            pairs.append(FeedbackPreferenceSample(
-                question=q["question"],
-                image_path=q["image_path"],
-                ground_truth=q["ground_truth"],
-                a1_text=q["a1_text"],
-                a1_correct=q["a1_correct"],
-                chosen_f1=good[pi % len(good)]["f1_text"],
-                rejected_f1=bad[pi % len(bad)]["f1_text"],
-                chosen_score=good[pi % len(good)]["score"],
-                rejected_score=bad[pi % len(bad)]["score"],
-                dataset_name=q.get("dataset_name", "livr"),
-                source_sample_index=q.get("sample_index", 0),
-            ))
+            pairs.append(
+                FeedbackPreferenceSample(
+                    question=q["question"],
+                    image_path=q["image_path"],
+                    ground_truth=q["ground_truth"],
+                    a1_text=q["a1_text"],
+                    a1_correct=q["a1_correct"],
+                    chosen_f1=good[pi % len(good)]["f1_text"],
+                    rejected_f1=bad[pi % len(bad)]["f1_text"],
+                    chosen_score=good[pi % len(good)]["score"],
+                    rejected_score=bad[pi % len(bad)]["score"],
+                    dataset_name=q.get("dataset_name", "livr"),
+                    source_sample_index=q.get("sample_index", 0),
+                )
+            )
 
     # Shuffle pairs
     random.shuffle(pairs)
@@ -689,12 +734,8 @@ def evaluate_sycophancy(
                 ww_count += 1
 
     n = max(total_critiques, 1)
-    a1_wrong_total = sum(
-        len(q["critiques"]) for q in questions if not q["a1_correct"]
-    )
-    a1_right_total = sum(
-        len(q["critiques"]) for q in questions if q["a1_correct"]
-    )
+    a1_wrong_total = sum(len(q["critiques"]) for q in questions if not q["a1_correct"])
+    a1_right_total = sum(len(q["critiques"]) for q in questions if q["a1_correct"])
 
     metrics = {
         "total_questions": len(questions),
@@ -712,12 +753,14 @@ def evaluate_sycophancy(
     logger.info(f"  Total questions: {len(questions)}")
     logger.info(f"  Total critiques: {total_critiques}")
     logger.info(f"  Calibration accuracy: {metrics['calibration_accuracy']:.1%}")
-    logger.info(f"  Sycophancy rate (says correct when A1 wrong): "
-                f"{metrics['sycophancy_rate']:.1%}")
-    logger.info(f"  False negative rate (says wrong when A1 right): "
-                f"{metrics['false_negative_rate']:.1%}")
-    logger.info(f"  WR: {metrics['wr_rate']:.1%}  RW: {metrics['rw_rate']:.1%}  "
-                f"RR: {metrics['rr_rate']:.1%}  WW: {metrics['ww_rate']:.1%}")
+    logger.info(f"  Sycophancy rate (says correct when A1 wrong): {metrics['sycophancy_rate']:.1%}")
+    logger.info(
+        f"  False negative rate (says wrong when A1 right): {metrics['false_negative_rate']:.1%}"
+    )
+    logger.info(
+        f"  WR: {metrics['wr_rate']:.1%}  RW: {metrics['rw_rate']:.1%}  "
+        f"RR: {metrics['rr_rate']:.1%}  WW: {metrics['ww_rate']:.1%}"
+    )
 
     return metrics
 

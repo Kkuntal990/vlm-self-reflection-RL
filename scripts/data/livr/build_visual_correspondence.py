@@ -114,10 +114,7 @@ def main() -> None:
     np_rng = np.random.RandomState(args.seed)
 
     # List source images
-    all_images = sorted([
-        f for f in os.listdir(args.images_dir)
-        if f.endswith((".jpg", ".png"))
-    ])
+    all_images = sorted([f for f in os.listdir(args.images_dir) if f.endswith((".jpg", ".png"))])
     logger.info(f"Found {len(all_images)} source images")
 
     rng.shuffle(all_images)
@@ -151,8 +148,9 @@ def main() -> None:
 
         tgt_correct = _warp_point((src_x, src_y), H)
 
-        if not (margin <= tgt_correct[0] <= sw - margin and
-                margin <= tgt_correct[1] <= sh - margin):
+        if not (
+            margin <= tgt_correct[0] <= sw - margin and margin <= tgt_correct[1] <= sh - margin
+        ):
             continue
 
         # Generate 3 distractor points
@@ -161,15 +159,17 @@ def main() -> None:
             for _ in range(50):
                 dx = tgt_correct[0] + np_rng.uniform(-80, 80)
                 dy = tgt_correct[1] + np_rng.uniform(-80, 80)
-                dist = ((dx - tgt_correct[0])**2 + (dy - tgt_correct[1])**2) ** 0.5
+                dist = ((dx - tgt_correct[0]) ** 2 + (dy - tgt_correct[1]) ** 2) ** 0.5
                 if dist > 25 and margin <= dx <= sw - margin and margin <= dy <= sh - margin:
                     distractors.append((dx, dy))
                     break
             else:
-                distractors.append((
-                    max(margin, min(sw - margin, tgt_correct[0] + rng.choice([-50, 50]))),
-                    max(margin, min(sh - margin, tgt_correct[1] + rng.choice([-50, 50]))),
-                ))
+                distractors.append(
+                    (
+                        max(margin, min(sw - margin, tgt_correct[0] + rng.choice([-50, 50]))),
+                        max(margin, min(sh - margin, tgt_correct[1] + rng.choice([-50, 50]))),
+                    )
+                )
 
         # Shuffle
         all_points = [tgt_correct] + distractors
@@ -179,19 +179,26 @@ def main() -> None:
         correct_letter = OPTION_LETTERS[correct_pos]
         shuffled_points = [all_points[i] for i in indices]
 
-        src_annotated = draw_keypoint(src_img, src_x, src_y, color=(255, 0, 0), radius=10, label="Q")
+        src_annotated = draw_keypoint(
+            src_img, src_x, src_y, color=(255, 0, 0), radius=10, label="Q"
+        )
 
         tgt_annotated = tgt_img.copy()
         for j, pt in enumerate(shuffled_points):
             color = OPTION_COLORS[j]
             label = f"({OPTION_LETTERS[j]})"
             tgt_annotated = draw_keypoint(
-                tgt_annotated, int(pt[0]), int(pt[1]),
-                color=color, radius=10, label=label,
+                tgt_annotated,
+                int(pt[0]),
+                int(pt[1]),
+                color=color,
+                radius=10,
+                label=label,
             )
 
         composite = create_side_by_side(
-            src_annotated, tgt_annotated,
+            src_annotated,
+            tgt_annotated,
             left_label="Source (red dot = query point)",
             right_label="Target (find corresponding point)",
             target_height=350,
