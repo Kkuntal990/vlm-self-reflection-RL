@@ -565,7 +565,7 @@ def main() -> None:
             model_id=args.model_id,
             processor=processor,
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-            max_model_len=2048,
+            max_model_len=8192,
             max_pixels=args.max_pixels,
             min_pixels=args.min_pixels,
             seed=accelerator.process_index,
