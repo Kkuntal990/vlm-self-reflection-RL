@@ -50,6 +50,72 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Cross-rank metric aggregation (DDP)
+# =============================================================================
+
+# Metrics that represent cluster-wide counts and should be SUMmed across ranks
+# rather than averaged. Everything else is treated as a per-rank rate/mean and
+# averaged across ranks (valid because DDP gives equal batch sizes per rank).
+_SUM_REDUCE_KEYS: frozenset[str] = frozenset({"sr/total_trajectories"})
+
+
+def _dist_is_initialized() -> bool:
+    """Check whether torch.distributed is usable (multi-rank training).
+
+    Returns:
+        True if torch.distributed is available, initialized, and world_size > 1.
+    """
+    import torch
+
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return False
+    return torch.distributed.get_world_size() > 1
+
+
+def _reduce_metrics_across_ranks(metrics: dict[str, float]) -> dict[str, float]:
+    """All-reduce scalar metrics across DDP ranks.
+
+    Averages rate/mean-type metrics and sums count-type metrics (per
+    `_SUM_REDUCE_KEYS`). Non-scalar values are passed through unchanged.
+
+    Packs all scalars into one tensor for a single all_reduce call instead
+    of N per-key reductions — dramatically faster when there are many keys.
+
+    Safe on single-GPU runs (returns metrics unchanged).
+
+    Args:
+        metrics: Dict of metric name -> value (per-rank).
+
+    Returns:
+        Dict with identical keys; scalar values averaged (or summed) across
+        ranks. Non-scalar values (lists, strings) preserved as-is.
+    """
+    if not _dist_is_initialized():
+        return metrics
+
+    import torch
+
+    scalar_keys = [k for k, v in metrics.items() if isinstance(v, (int, float))]
+    if not scalar_keys:
+        return metrics
+
+    world_size = torch.distributed.get_world_size()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    values = torch.tensor(
+        [float(metrics[k]) for k in scalar_keys],
+        device=device,
+        dtype=torch.float32,
+    )
+    torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+
+    reduced = dict(metrics)
+    for i, k in enumerate(scalar_keys):
+        summed = float(values[i].item())
+        reduced[k] = summed if k in _SUM_REDUCE_KEYS else summed / world_size
+    return reduced
+
+
+# =============================================================================
 # Full Self-Reflection GRPO Trainer (two-reward, single model)
 # =============================================================================
 
@@ -407,9 +473,16 @@ class SelfReflectionGRPOTrainer:
                         "lengths/a1_tokens": step_result.rollout_metrics.get("sr/avg_a1_tokens", 0),
                         "lengths/f1_tokens": step_result.rollout_metrics.get("sr/avg_f1_tokens", 0),
                         "lengths/a2_tokens": step_result.rollout_metrics.get("sr/avg_a2_tokens", 0),
-                        # Feedback quality
-                        "feedback/format_valid_rate": metrics.get(
-                            "sr/feedback_format_valid_rate", 0
+                        # Format-violation rates (hard short-circuit hit rate).
+                        # Disambiguates "model failed to correct" from
+                        # "model failed to follow tag format" — critical
+                        # when reading rr/rw/wr/ww rates since short-circuit
+                        # forces a2_correct=False.
+                        "format_violations/a2_rate": metrics.get(
+                            "sr/a2_format_violation_rate", 0
+                        ),
+                        "format_violations/fb_rate": metrics.get(
+                            "sr/fb_format_violation_rate", 0
                         ),
                     }
 
@@ -429,6 +502,12 @@ class SelfReflectionGRPOTrainer:
                             "sr/resp_adv_abs_mean", 0
                         ),
                         "ema/fb_adv_abs": step_result.rollout_metrics.get("sr/fb_adv_abs_mean", 0),
+                        "ema/a2_fmt_violation": metrics.get(
+                            "sr/a2_format_violation_rate", 0
+                        ),
+                        "ema/fb_fmt_violation": metrics.get(
+                            "sr/fb_format_violation_rate", 0
+                        ),
                     }
                     for ema_key, raw_val in ema_sources.items():
                         wandb_dict[ema_key] = self._update_ema(ema_key, raw_val)
@@ -447,9 +526,8 @@ class SelfReflectionGRPOTrainer:
                         "sr/resp_a2_correctness_mean",
                         "sr/resp_no_regression_mean",
                         "sr/resp_a2_format_mean",
-                        "sr/resp_minimal_edit_mean",
                         "sr/fb_downstream_mean",
-                        "sr/fb_calibration_mean",
+                        "sr/fb_verification_mean",
                         "sr/fb_format_mean",
                     ]:
                         if key in metrics:
@@ -661,12 +739,10 @@ class SelfReflectionGRPOTrainer:
                 )
                 a1_full = build_prompt_with_completion(a1_prompt, a1)
 
-                use_binary = getattr(self.config.rollout, "use_binary_verification", False)
                 f1_prompt = build_critic_prompt(
                     result.question,
                     a1,
                     model_type=model_type,
-                    use_binary_verification=use_binary,
                 )
                 f1_full = build_prompt_with_completion(f1_prompt, f1)
 
@@ -751,7 +827,6 @@ class SelfReflectionGRPOTrainer:
                             rr.question,
                             a1,
                             model_type=model_type,
-                            use_binary_verification=use_binary,
                         )
                         f1_full = build_prompt_with_completion(f1_prompt, f1)
                         a2_prompt = build_refiner_prompt(
@@ -781,7 +856,7 @@ class SelfReflectionGRPOTrainer:
         if separate_turns:
             # SCoRe-style: separate advantages for A1 and A2.
             # A1 reward = a1_correctness only (so wrong A1 gets negative advantage).
-            # A2 reward = everything else (correctness, no_regression, format, edit).
+            # A2 reward = everything else (correctness, no_regression, format).
             a1_rewards_list = []
             a2_rewards_list = []
             for result in rollout_results:
@@ -791,7 +866,6 @@ class SelfReflectionGRPOTrainer:
                         rb.weighted_components.get("a2_correctness", 0.0)
                         + rb.weighted_components.get("no_regression", 0.0)
                         + rb.weighted_components.get("a2_format", 0.0)
-                        + rb.weighted_components.get("minimal_edit", 0.0)
                     )
                     a1_rewards_list.append(a1_r)
                     a2_rewards_list.append(a2_r)
@@ -1181,18 +1255,40 @@ class SelfReflectionGRPOTrainer:
                 if isinstance(val, list) and val:
                     rollout_metrics[key] = sum(val) / len(val)
 
+        # Aggregate metrics across DDP ranks so rank 0 logs the cluster-wide
+        # view (64 trajectories) instead of its local 16-trajectory slice.
+        # Per-rank view has ±10pp binomial noise on rate metrics; cross-rank
+        # averaging halves that before it reaches wandb / EMA.
+        rollout_metrics = _reduce_metrics_across_ranks(rollout_metrics)
+
         if self.scheduler is not None:
             self.scheduler.step()
 
         self.global_step += 1
+
+        # Also reduce scalar reward means so response/feedback_reward_mean
+        # reflect the global view (matches rollout_metrics).
+        resp_reward_global = resp_rewards_t.mean().item()
+        fb_reward_global = fb_rewards_t.mean().item()
+        if _dist_is_initialized():
+            import torch as _torch
+
+            vals = _torch.tensor(
+                [resp_reward_global, fb_reward_global],
+                device=self.device, dtype=_torch.float32,
+            )
+            _torch.distributed.all_reduce(vals, op=_torch.distributed.ReduceOp.SUM)
+            world_size = _torch.distributed.get_world_size()
+            resp_reward_global = float(vals[0].item()) / world_size
+            fb_reward_global = float(vals[1].item()) / world_size
 
         return SelfReflectionTrainStepResult(
             loss=(total_resp_loss + total_fb_loss + total_kl_loss) / num_inner,
             response_loss=total_resp_loss / num_inner,
             feedback_loss=total_fb_loss / num_inner,
             kl_loss=total_kl_loss / num_inner,
-            response_reward_mean=resp_rewards_t.mean().item(),
-            feedback_reward_mean=fb_rewards_t.mean().item(),
+            response_reward_mean=resp_reward_global,
+            feedback_reward_mean=fb_reward_global,
             rollout_metrics=rollout_metrics,
             global_step=self.global_step,
         )

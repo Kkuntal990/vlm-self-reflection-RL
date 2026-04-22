@@ -7,7 +7,6 @@ Tests cover all realistic Qwen2.5-VL output patterns:
 - Correctness matching: deterministic matching for MCQ and counting
 """
 
-import pytest
 
 from vlm_grpo.rewards.composition import (
     _compute_tag_format_reward,

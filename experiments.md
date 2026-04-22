@@ -135,19 +135,21 @@ The improvement-based reward `R_improve = R(A2) - R(A1)` fixes this by giving RR
 
 Quick reference for what changed between versions. All share: Qwen2.5-VL-7B, LIVR 9K MCQ, K=8, dr_grpo, LoRA r=64, separate_turn_loss, 4x A100.
 
-| | v1 | v2 | v3 | v4 | v5 | v6/v6b | v7 |
-|---|---|---|---|---|---|---|---|
-| **Key change** | Baseline + tags | Tag penalty | SCoRe KL | Drop cal/edit, shuffle | SSR buffer | Improve reward + freeze A1 | **Shaped fb reward** |
-| w_calibration | 0.2 | 0.2 | 1.0 | **0.0** | 0.0 | 0.0 | 0.0 |
-| w_minimal_edit | 0.3 | 0.3 | 0.3 | **0.0** | 0.0 | 0.0 | 0.0 |
-| w_tag_penalty | 0.0 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 |
-| KL (A1/A2/FB) | 0/0/0 | 0/0/0 | 0.2/0.01/0.01 | 0.2/0.02/0.02 | 0.2/0.02/0.02 | **20/0.02/0.02** | 20/0.02/0.02 |
-| Data shuffle | No | No | No | **Yes** | Yes | Yes | Yes |
-| KL /3.0 bug | Yes | Yes | Yes | **Fixed** | Fixed | Fixed | Fixed |
-| SSR | — | — | — | — | **buffer=64** | — | — |
-| Fb reward type | Transition | Transition | Transition | Transition | Transition | **Improvement** | **Shaped α=5** |
-| Freeze A1 | — | — | — | — | — | **280 steps** | 280 steps |
-| Status | Complete | Incomplete | Complete | Running | Crashed | **Running** | Planned |
+| | v1 | v2 | v3 | v4 | v5 | v6/v6b | v7b | v8b | v9 | v9b | v10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **Key change** | Baseline + tags | Tag penalty | SCoRe KL | Drop cal/edit, shuffle | SSR buffer | Improve reward + freeze A1 | Shaped α=5 + think | Binary verify (v8b) | Rebalanced + `<feedback>` | v8b + token-cap fix | **Revert to v8b (strip `<feedback>`)** |
+| w_calibration | 0.2 | 0.2 | 1.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| w_minimal_edit | 0.3 | 0.3 | 0.3 | 0.0 | 0.0 | 0.0 | 0.0 | 0.3 | 0.3 | 0.3 | 0.3 |
+| w_fb_format | — | — | — | — | — | — | — | 0.0 | **0.5** | 0.0 | 0.0 |
+| w_tag_penalty | 0.0 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 |
+| w_a2_correctness | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | **3.0** | 1.0 | 1.0 |
+| w_a2_format | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 0.5 | 2.0 | 2.0 | 2.0 | 2.0 | 2.0 |
+| KL (A1/A2/FB) | 0/0/0 | 0/0/0 | 0.2/0.01/0.01 | 0.2/0.02/0.02 | 0.2/0.02/0.02 | 20/0.02/0.02 | 150/1/1 | 150/1/1 | 150/1/1 | 150/1/1 | 150/1/1 |
+| reward_shaping_α | — | — | — | — | — | — | 5 | 5 | **3** | 5 | 5 |
+| Freeze A1 | — | — | — | — | — | 280 | 280 | 280 | 280 | 280 | 280 |
+| F1 format | freeform | freeform | freeform | freeform | freeform | freeform | freeform | binary | binary+`<feedback>` | binary | binary (no tags) |
+| F1 token cap | 256 | 256 | 256 | 256 | 256 | 256 | 256 | **16 (bug)** | 256 | 256 | 256 |
+| Status | Complete | Incomplete | Complete | Running | Crashed | Complete | Deleted | **Complete** | **Complete** | **Complete** | Planned |
 
 ---
 
@@ -285,70 +287,88 @@ v7 directly fixes #2 and #3. Problem #1 (sycophancy) requires architectural chan
 
 ---
 
-## v9: Rebalanced Rewards + `<feedback>` Tags (RUNNING, α=3 w_a2=3)
+## v9: Rebalanced Rewards + `<feedback>` Tags (COMPLETE)
 
 **Job**: `qwen-grpo-livr-9k-v9-balanced` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v9.yaml`
-**Date**: 2026-04-18 (fresh restart after F1 token cap bug fix) | Commit `f52b38d`
+**Date**: 2026-04-18 → 2026-04-19 (completed 2763/2763 samples, global_step 1381) | Commit `f52b38d`
 **Output**: `/outputs/grpo_qwen_livr_v9_fixed/`
 **WandB**: `grpo-livr-9k-v9-balanced-fixed`
 
-**Hypothesis**: Rebalance WR:RR ratio to ~2:1 (was 4.3:1 in v7b) via:
-- α reduced 5→3 (halves shaped amplification)
-- w_a2_correctness 1→3 (raises RR base so it stays positive in advantage)
-- `<feedback>` tags for deterministic F1 verdict extraction
-- w_fb_format 0→0.5 (incentivize `<feedback>` tag usage + explanations)
-- Added separate `response_alpha` / `feedback_alpha` params (currently both 3)
+**Changes from v8b**: α 5→3, w_a2_correctness 1→3, `<feedback>` tags for deterministic verdict extraction, w_fb_format 0→0.5. Target WR:RR ratio 2.1:1 (was 4.3:1 in v7b).
 
-**Expected A2 reward table**:
-| Transition | v9 | v8b/v9b (α=5) |
-|---|---|---|
-| RR same + tag | +5.3 | +1.5 |
-| WR + tag | +11.0 | +12.0 |
-| RW + tag | -7.0 | -9.0 |
-| WW + tag | -1.0 | -0.5 |
-| No tag | -4.0 | -4.0 |
+| Metric | First 10% | Mid 10% | Latest 10% | Delta (first→last) |
+|--------|-----------|---------|------------|----|
+| A1 Acc | 49.5% | 50.9% | 50.8% | +1.3pp |
+| A2 Acc | 43.9% | 49.2% | 49.2% | +5.3pp |
+| **Self-reflection Δ** | **-5.6pp** | -1.7pp | **-1.5pp** | improved but still negative |
+| WR rate | — | — | **19.6%** | — |
+| RW rate | — | — | **22.0%** | — |
+| Resp Reward | +1.04 | +1.70 | +1.79 | +0.75 |
+| FB Reward | +0.18 | +0.58 | +0.65 | +0.47 |
+| `<feedback>` tag rate | — | — | 99.9% | learned fully |
 
-**WR:RR ratio: 2.1:1** (both positive on hard Q).
-
-**Key infrastructure fixes from v8**:
-1. F1 token cap bug (auto-reduce to 16) removed → F1 explanations can reach 50-80 tokens
-2. Env-var prompts (commit `c9f6b7a`) → yaml is source of truth for prompts
-3. Commit pinning in yaml → reproducible runs
-
-**Progress at step ~670 (24%)**:
-| Window | resp_r | fb_r | rw_rate |
-|--------|---|---|---|
-| Pre-freeze (10-280) | +1.22 | +0.34 | 0.163 |
-| Post-freeze (280+) | +1.65 | +0.64 | 0.122 |
-
-Loss spikes: 2 (step 240, step 620) vs v9b's 4. Smoother training.
+**Worked**: F1 tag format learned perfectly (99.9%), resp reward grew early, no crashes.
+**Failed**: RW rate exploded to 22.0% (vs v8b's 14.7%), wiping out the small WR gain. A2 accuracy ended BELOW A1 — self-reflection actively hurting. `fb.downstream` went NEGATIVE (-0.10) in latest window despite 99.9% format compliance.
+**Root cause**: F1 memorized the `<feedback>` template but not calibration — confidently says "CORRECT" about wrong answers and A2 follows. The w_a2_correctness=3 also raised the A2 reward floor so much that the group mean is dominated by RR majority again (same failure mode as v3).
 
 ---
 
-## v9b: v8b Ablation with Bug Fix (RUNNING, in parallel)
+## v9b: v8b Ablation with F1 Token-Cap Bug Fix (COMPLETE)
 
 **Job**: `qwen-grpo-livr-9k-v9b-v8params` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v9b.yaml`
-**Date**: 2026-04-18 | Commit `f52b38d`
+**Date**: 2026-04-18 → 2026-04-19 (completed 2763/2763 samples, global_step 1381) | Commit `f52b38d`
 **Output**: `/outputs/grpo_qwen_livr_v9b/`
 **WandB**: `grpo-livr-9k-v9b-v8params-fixed`
 
-**Purpose**: Isolate the impact of the F1 token cap bug on v8b's design. Same parameters as v8b (α=5, w_a2=1, BINARY_VERIFIER prompt without `<feedback>` tags) but with the token cap bug fixed.
+**Purpose**: Isolate the impact of the F1 token cap bug on v8b's design. Byte-for-byte identical to v8b except commit `a02b147` (bug) → `f52b38d` (fixed); effective F1 token cap 16 → 256.
 
-**v8b vs v9b byte-for-byte identical except**:
-- Code commit: a02b147 (bug) → f52b38d (fixed)
-- Effective F1 token cap: 16 → 256
+| Metric | First 10% | Mid 10% | Latest 10% | Delta (first→last) |
+|--------|-----------|---------|------------|----|
+| A1 Acc | 48.4% | 50.5% | 50.3% | +1.9pp |
+| A2 Acc | 41.7% | 48.6% | 49.7% | +8.0pp |
+| **Self-reflection Δ** | **-6.7pp** | -1.9pp | **-0.6pp** | improved but still negative |
+| WR rate | — | — | **18.7%** | — |
+| RW rate | — | — | **19.6%** | — |
+| Resp Reward | +0.92 | +1.66 | +1.83 | +0.91 |
+| FB Reward | -0.68 | -0.04 | +0.19 | +0.87 |
 
-**3-way comparison goal**:
-- **v9 vs v9b**: does rebalanced reward design beat v8b-style once the bug is fixed?
-- **v9b vs v8b-final**: how much did the bug hurt v8b?
+**Worked**: Resp reward climbed steadily; fb reward recovered from deeply negative.
+**Failed**: With F1 given 256 tokens, longer explanations did NOT improve calibration. A2 still ends below A1. v8b-final (with the 16-token bug) outperformed v9b — longer F1 explanations gave the model more surface to be confidently wrong on.
+**Conclusion**: The F1 token-cap bug was incidental; the real issue is **calibration**, not bandwidth.
 
-**Progress at step ~670 (24%)**:
-| Metric | v9 | v9b | Gap |
-|--------|------|------|------|
-| Cumulative resp | +1.47 | +1.29 | +0.18 (v9) |
-| Cumulative fb | **+0.51** | **-0.13** | **+0.64** (v9) |
-| rw_rate avg | 0.139 | 0.132 | tied |
-| Loss spikes | 2 | 4 | v9 more stable |
+---
+
+## 3-Way Comparison: v8b vs v9 vs v9b (Latest 10%)
+
+| Metric | v8b (winner) | v9 | v9b |
+|---|---|---|---|
+| A1 / A2 acc | 49.1% / **52.3%** | 50.8% / 49.2% | 50.3% / 49.7% |
+| **Self-reflection Δ** | **+3.1pp** | **-1.5pp** | **-0.6pp** |
+| WR rate | 18.1% | 19.6% | 18.7% |
+| RW rate | **12.3%** | **22.0%** | **19.6%** |
+| resp_reward | **+2.14** | +1.79 | +1.83 |
+| fb.downstream | **+0.36** | **-0.10** | -0.06 |
+| fb.calibration | +0.38 | +0.26 | +0.25 |
+| resp.no_regression | **+0.43** | -0.02 | +0.06 |
+
+**Key diagnosis**: WR rate nudged up by only 0.6-1.5pp in v9/v9b, but RW rate jumped +7.3-9.7pp, net-negative. `fb.downstream` went from +0.36 (v8b) to negative. The `<feedback>` template got learned (99.9%) but calibration did NOT. Token-cap bug-fix alone (v9b) did not help — proof that the critic's problem is knowledge, not bandwidth.
+
+---
+
+## v10: Revert to v8b Baseline (Strip `<feedback>` Tags) — PLANNED
+
+**Branch**: `grpo-v10` | **YAML**: `k8s/job-qwen-grpo-livr-9k-v10.yaml`
+**Output**: `/outputs/grpo_qwen_livr_v10/`
+
+**Rationale**: v9's `<feedback>` tags and w_a2_correctness=3 degraded both WR:RR balance and self-reflection Δ. Return to the v8b configuration that produced the only positive Δ (+3.1pp) and iterate from there.
+
+**Changes from v9**:
+- Remove `<feedback>` tags from critic prompt, trajectory extraction, format reward, and tests
+- Restore v8b reward weights: α=5, w_a2_corr=1.0, w_noreg=1.0, w_fb_format=0.0, w_fb_tag_penalty=0.5
+- Keep binary CORRECT/INCORRECT F1 verdict (plain keyword, no tags)
+- Use `BINARY_VERIFIER_PROMPT` env var (not `FEEDBACK_VERIFIER_PROMPT`)
+
+**Hypothesis**: v8b-final result is reproducible on the token-cap-fixed code path (v9b confirms it's close; v10 will match the exact prompt + weights). Future v11+ ideas: DAPO dynamic sampling, SFT critic warmup, asymmetric clip-higher (see literature notes below).
 
 ---
 

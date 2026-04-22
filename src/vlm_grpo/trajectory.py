@@ -20,8 +20,14 @@ import re
 # Tag extraction patterns for <think>...</think><answer>...</answer> format
 _ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL | re.IGNORECASE)
 _THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL | re.IGNORECASE)
-# Feedback tag pattern for F1 verdict: <feedback>CORRECT</feedback> or <feedback>INCORRECT</feedback>
-_FEEDBACK_TAG_PATTERN = re.compile(r"<feedback>\s*(.*?)\s*</feedback>", re.DOTALL | re.IGNORECASE)
+
+# Boxed verdict extraction for F1 (matches LLaVA-Critic-R1 format):
+# `\boxed{CORRECT}` or `\boxed{INCORRECT}` (case-insensitive, whitespace tolerant).
+_BOXED_PATTERN = re.compile(r"\\boxed\{\s*(.*?)\s*\}", re.DOTALL | re.IGNORECASE)
+# Full think+boxed structure used by the F1 format reward.
+_THINK_BOXED_PATTERN = re.compile(
+    r"<think>.*?</think>.*?\\boxed\{.*?\}", re.DOTALL | re.IGNORECASE
+)
 
 # Answer extraction patterns (case-insensitive for a-f / A-F)
 _MCQ_LETTER_PATTERN = re.compile(r"[A-Fa-f]")
@@ -36,6 +42,17 @@ _MCQ_ANSWER_IS_PATTERN = re.compile(
 )
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
+
+# Strict patterns — match only when the WHOLE string is a clean atomic answer.
+# Used inside <answer> tags to prevent reward-hacking via prose like
+# "(B) is wrong, (A) is right" which the liberal cascade would parse as B.
+_MCQ_STRICT_ONLY_PATTERN = re.compile(
+    r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.?)\s*$"
+)
+# Pure integer/decimal (with optional sign), nothing else.
+_NUMERIC_STRICT_PATTERN = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*$")
+# Exact yes/no word as the full content.
+_YESNO_STRICT_PATTERN = re.compile(r"^\s*(yes|no)\.?\s*$", re.IGNORECASE)
 _NUMBER_WORDS: dict[str, str] = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
@@ -182,32 +199,36 @@ def has_think_answer_tags(text: str) -> bool:
     return bool(_THINK_TAG_PATTERN.search(text) and _ANSWER_TAG_PATTERN.search(text))
 
 
-def extract_from_feedback_tags(text: str) -> str:
-    """Extract verdict from <feedback>...</feedback> tags.
+def extract_from_boxed(text: str) -> str:
+    """Extract content from `\\boxed{...}`.
 
-    Args:
-        text: Raw F1 output, possibly containing <feedback> tags.
-
-    Returns:
-        Content inside <feedback> tags (e.g. "CORRECT" or "INCORRECT"),
-        or empty string if no tags found.
-    """
-    match = _FEEDBACK_TAG_PATTERN.search(text)
-    if match:
-        return match.group(1).strip()
-    return ""
-
-
-def has_feedback_tags(text: str) -> bool:
-    """Check whether text contains <feedback> tags.
+    Used to parse the verdict from F1 output in LLaVA-Critic-R1 format:
+    `<think>...</think> \\boxed{CORRECT}` / `\\boxed{INCORRECT}`.
 
     Args:
         text: Raw F1 output.
 
     Returns:
-        True if <feedback> tags are present.
+        Inner content of `\\boxed{}` (stripped), or empty string if absent.
     """
-    return bool(_FEEDBACK_TAG_PATTERN.search(text))
+    match = _BOXED_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def has_think_boxed(text: str) -> bool:
+    """Check whether text contains both <think></think> and `\\boxed{}`.
+
+    Used by the F1 format reward to verify LLaVA-Critic-R1-style structure.
+
+    Args:
+        text: Raw F1 output.
+
+    Returns:
+        True if the `<think>...</think> ... \\boxed{...}` structure matches.
+    """
+    return bool(_THINK_BOXED_PATTERN.search(text))
 
 
 def extract_answer_from_text(
@@ -215,28 +236,35 @@ def extract_answer_from_text(
     answer_type: str,
     choices: str = "",
     require_answer_tag: bool = False,
+    strict: bool = False,
 ) -> str:
-    """Liberal extraction of answer from text for correctness scoring.
+    """Extraction of answer from text for correctness scoring.
 
-    Searches within text to find an answer — used by correctness reward,
-    NOT by format reward. This intentionally recovers answers from prose
-    like "The answer is B" so correctness can still be evaluated even
-    when format is wrong.
+    Two modes:
 
-    When require_answer_tag=True (answer-tag-only mode), extraction only
-    works from <answer> tag content. If no tag is found, returns "" (failed)
-    to prevent false positives from stray letters in prose like "A hen".
+    - **Liberal** (`strict=False`): cascade through multiple patterns to
+      recover answers from prose like "The answer is B". Used for the
+      legacy no-tag path and for verifying ground-truth strings.
 
-    For MCQ: extracts single letter (A-F), rejects multiple different letters.
-    For YesNo: extracts "Yes" or "No", rejects hedging.
-    For Numeric: extracts first number.
-    For Open: returns text as-is (stripped).
+    - **Strict** (`strict=True`): match only when the extracted content
+      (from inside `<answer>` tags if present, or the whole text) is a
+      clean atomic answer. Prevents reward-hacking via prose hedging
+      like "(B) is wrong, (A) is right" (liberal picks B; strict rejects).
+      Used for RL correctness scoring in tag modes.
+
+    For MCQ strict: only `(A)` / `A` / `A.` as the whole string match.
+    For counting/numeric strict: pure integer/decimal only.
+    For yesno strict: exact `yes` / `no` word match (with optional period).
+    For open: strict returns text as-is (same as liberal).
 
     Args:
         text: Raw answer text
-        answer_type: Expected answer type ("mcq", "yesno", "numeric", "open")
-        choices: Optional comma-separated MCQ choices
-        require_answer_tag: If True, return "" when <answer> tags are missing
+        answer_type: Expected answer type ("mcq", "yesno", "numeric",
+            "counting", "open")
+        choices: Optional MCQ choices (unused, kept for API compat)
+        require_answer_tag: If True, return "" when `<answer>` tags are missing
+        strict: If True, only atomic clean answers are accepted inside the
+            tag content (no prose scanning)
 
     Returns:
         Normalized answer string, or empty string if extraction failed
@@ -251,6 +279,9 @@ def extract_answer_from_text(
     if not text:
         return ""
 
+    if strict:
+        return _extract_strict(text, answer_type)
+
     if answer_type == "mcq":
         return _extract_mcq_answer(text)
     elif answer_type == "yesno":
@@ -259,6 +290,38 @@ def extract_answer_from_text(
         return _extract_numeric_answer(text, allow_words=answer_type == "counting")
     else:
         return text
+
+
+def _extract_strict(text: str, answer_type: str) -> str:
+    """Strict atomic-answer extraction (no prose scanning).
+
+    Args:
+        text: Inner content from `<answer>` tag (already extracted)
+        answer_type: Expected answer type
+
+    Returns:
+        Normalized atomic answer, or empty string if content is not a
+        clean atomic answer of the expected type.
+    """
+    if answer_type == "mcq":
+        match = _MCQ_STRICT_ONLY_PATTERN.match(text)
+        if match:
+            letter = match.group(1) or match.group(2)
+            return letter.upper()
+        return ""
+    if answer_type == "yesno":
+        match = _YESNO_STRICT_PATTERN.match(text)
+        if match:
+            answer = match.group(1).lower()
+            return "Yes" if answer == "yes" else "No"
+        return ""
+    if answer_type in ("numeric", "counting"):
+        match = _NUMERIC_STRICT_PATTERN.match(text)
+        if match:
+            return match.group(1)
+        return ""
+    # Open: no structural constraint; return as-is.
+    return text.strip()
 
 
 def _extract_mcq_answer(text: str) -> str:

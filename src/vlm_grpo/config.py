@@ -14,7 +14,32 @@ Usage:
     )
 """
 
+import logging
 from dataclasses import asdict, dataclass, field
+
+logger = logging.getLogger(__name__)
+
+# Tolerance for weight-sum == 1.0 validation. Floating-point env-var parsing
+# commonly lands off by a few 1e-9; 1e-6 is strict enough to catch real mistakes.
+_WEIGHT_SUM_TOL = 1e-6
+
+
+def _validate_weight_sum(name: str, weights: dict[str, float]) -> None:
+    """Warn if the weights don't sum to 1.0.
+
+    Reward-weight sets in this pipeline are expected to be convex
+    combinations so the aggregate reward lives on a comparable scale
+    across experiments. This emits a warning on mismatch rather than
+    a hard error, so deliberate ablations remain possible.
+    """
+    total = sum(weights.values())
+    if abs(total - 1.0) > _WEIGHT_SUM_TOL:
+        logger.warning(
+            "%s weights sum to %.4f, expected 1.0. Components: %s",
+            name,
+            total,
+            weights,
+        )
 
 
 @dataclass
@@ -24,21 +49,18 @@ class RewardWeights:
     reward = w_final * R_final_correct
            + w_format * R_format
            + w_rw * R_no_regression
-           + w_edit * R_minimal_edit
            + w_fb * R_feedback_calibration
 
     Attributes:
         w_final: Weight for final answer correctness
         w_format: Weight for format compliance
         w_rw: Weight for no-regression penalty (highest by default)
-        w_edit: Weight for minimal edit reward
         w_fb: Weight for feedback calibration
     """
 
     w_final: float = 1.0
     w_format: float = 0.15
     w_rw: float = 2.0
-    w_edit: float = 0.3
     w_fb: float = 0.5
 
     def to_dict(self) -> dict:
@@ -47,7 +69,7 @@ class RewardWeights:
 
     def to_list(self) -> list[float]:
         """Return weights as ordered list for TRL reward_weights param."""
-        return [self.w_format, self.w_final, self.w_rw, self.w_edit, self.w_fb]
+        return [self.w_format, self.w_final, self.w_rw, self.w_fb]
 
 
 @dataclass
@@ -98,7 +120,6 @@ class RolloutConfig:
     reward_shaping_alpha: float = 0.0
     response_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
     feedback_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
-    use_binary_verification: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -139,21 +160,26 @@ class ResponseRewardWeights:
                + w_a2_correctness * R_a2_correct
                + w_no_regression * R_no_regression
                + w_a2_format * R_a2_format
-               + w_minimal_edit * R_minimal_edit
+
+    Weights must sum to 1.0 (convex combination). A `__post_init__`
+    warning fires otherwise. Raw α is applied inside R_no_regression,
+    so the *weighted* reward is not bounded by 1.0 — only the linear
+    combination is convex.
 
     Attributes:
         w_a1_correctness: Weight for A1 correctness
         w_a2_correctness: Weight for A2 correctness
-        w_no_regression: Weight for no-regression penalty (dominant)
+        w_no_regression: Weight for shaped α·(r_a2 − r_a1) term
         w_a2_format: Weight for A2 format compliance
-        w_minimal_edit: Weight for minimal edit reward
     """
 
-    w_a1_correctness: float = 1.0
-    w_a2_correctness: float = 1.0
-    w_no_regression: float = 2.0
-    w_a2_format: float = 0.15
-    w_minimal_edit: float = 0.0
+    w_a1_correctness: float = 0.25
+    w_a2_correctness: float = 0.25
+    w_no_regression: float = 0.25
+    w_a2_format: float = 0.25
+
+    def __post_init__(self) -> None:
+        _validate_weight_sum("ResponseRewardWeights", self.to_dict())
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -165,24 +191,29 @@ class FeedbackRewardWeights:
     """Weights for feedback reward (applied to F1 log-prob).
 
     reward_fb = w_downstream * R_downstream
-              + w_calibration * R_calibration
+              + w_verification_accuracy * R_verification
               + w_format * R_format
 
+    Weights must sum to 1.0 (convex combination). A `__post_init__`
+    warning fires otherwise. Raw α is applied inside R_downstream,
+    so the *weighted* reward is not bounded by 1.0.
+
     Attributes:
-        w_downstream: Weight for downstream-aware reward (dominant).
-            Transition-shaped: WR=+3, RR=+1, RW=-1.5, WW=-1.
-        w_calibration: Weight for keyword-based calibration. Disabled by
-            default (0.0) — literature consensus is outcome-based rewards
-            only for feedback. Kept in code for experimentation.
-        w_format: Weight for format compliance (word count penalty)
-        w_tag_penalty: Weight for F1 tag leakage penalty
+        w_downstream: Weight for downstream-aware reward.
+            Shaped: r_a2 + α·(r_a2 − r_a1). Gated on verdict calibration.
+        w_verification_accuracy: Weight for F1 verdict accuracy
+            (±1 based on whether F1 says CORRECT/INCORRECT and A1 is actually
+            right/wrong).
+        w_format: Weight for F1 format compliance (<think></think> +
+            \\boxed{VERDICT} structure, ±1).
     """
 
-    w_downstream: float = 2.0
-    w_calibration: float = 0.0
-    w_format: float = 0.15
-    w_tag_penalty: float = 0.5
-    w_verification_accuracy: float = 0.0
+    w_downstream: float = 0.45
+    w_verification_accuracy: float = 0.45
+    w_format: float = 0.1
+
+    def __post_init__(self) -> None:
+        _validate_weight_sum("FeedbackRewardWeights", self.to_dict())
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

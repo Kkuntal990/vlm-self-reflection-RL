@@ -332,6 +332,7 @@ def verify_answer(
     answer_type: str,
     choices: str = "",
     tolerance: float = 0.01,
+    strict: bool = False,
 ) -> MatchResult:
     """Verify a raw answer text against ground truth.
 
@@ -355,6 +356,11 @@ def verify_answer(
         answer_type: Answer type ("mcq", "yesno", "numeric", "counting", "open")
         choices: MCQ choices string
         tolerance: Numeric comparison tolerance
+        strict: If True, only accept clean atomic answers inside `<answer>`
+            tags for deterministic types. Rejects prose like
+            `"(B) is wrong, (A) is right"` which the liberal cascade
+            would parse as "B". Used for RL correctness scoring in tag
+            modes. Open-ended and ground-truth extraction ignore strict.
 
     Returns:
         MatchResult with verdict "CORRECT" or "WRONG"
@@ -364,13 +370,13 @@ def verify_answer(
     ground_truth = _extract_answer_portion(ground_truth)
 
     if answer_type == "mcq":
-        return _verify_mcq(raw_text, ground_truth, choices)
+        return _verify_mcq(raw_text, ground_truth, choices, strict=strict)
     elif answer_type == "yesno":
-        return _verify_yesno(raw_text, ground_truth)
+        return _verify_yesno(raw_text, ground_truth, strict=strict)
     elif answer_type == "counting":
-        return _verify_counting(raw_text, ground_truth)
+        return _verify_counting(raw_text, ground_truth, strict=strict)
     elif answer_type == "numeric":
-        return _verify_numeric(raw_text, ground_truth, tolerance)
+        return _verify_numeric(raw_text, ground_truth, tolerance, strict=strict)
     else:
         # Open-ended: multi-stage cascade
         extracted = raw_text.strip()
@@ -389,6 +395,7 @@ def _verify_mcq(
     raw_text: str,
     ground_truth: str,
     choices: str = "",
+    strict: bool = False,
 ) -> MatchResult:
     """MCQ verification with open-ended fallback (Rules 2, 3).
 
@@ -400,11 +407,13 @@ def _verify_mcq(
         raw_text: Raw answer text
         ground_truth: Ground truth string
         choices: MCQ choices string
+        strict: If True, pred extraction must be a clean atomic letter
+            inside the `<answer>` tag. GT extraction stays liberal.
 
     Returns:
         MatchResult
     """
-    pred_extracted = extract_answer_from_text(raw_text, "mcq", choices)
+    pred_extracted = extract_answer_from_text(raw_text, "mcq", choices, strict=strict)
     gt_extracted = extract_answer_from_text(ground_truth, "mcq", choices)
 
     # Both have letters → compare letters
@@ -459,6 +468,7 @@ def _verify_mcq(
 def _verify_yesno(
     raw_text: str,
     ground_truth: str,
+    strict: bool = False,
 ) -> MatchResult:
     """Yes/No verification with sentence-start and open-ended fallback (Rules 4, 5).
 
@@ -469,11 +479,36 @@ def _verify_yesno(
     Args:
         raw_text: Raw answer text
         ground_truth: Ground truth string
+        strict: If True, pred must be exactly `Yes` / `No` inside the
+            `<answer>` tag. Rejects any prose (including hedging).
 
     Returns:
         MatchResult
     """
     from vlm_grpo.trajectory import detect_hedging
+
+    # Strict mode: only atomic Yes/No inside <answer> tag.
+    if strict:
+        pred = extract_answer_from_text(raw_text, "yesno", strict=True)
+        if not pred:
+            return MatchResult(
+                answer_type="yesno", parse_ok=False, verdict=WRONG,
+                extracted="", score=None,
+            )
+        gt_match = _YESNO_START_PATTERN.match(ground_truth) or re.search(
+            r"\b(yes|no)\b", ground_truth, re.IGNORECASE
+        )
+        if not gt_match:
+            return MatchResult(
+                answer_type="yesno", parse_ok=True, verdict=WRONG,
+                extracted=pred, score=None,
+            )
+        gt = gt_match.group(1).lower()
+        verdict = CORRECT if pred.lower() == gt else WRONG
+        return MatchResult(
+            answer_type="yesno", parse_ok=True, verdict=verdict,
+            extracted=pred, score=None,
+        )
 
     # Anti-hacking: reject hedging predictions
     if detect_hedging(raw_text):
@@ -595,6 +630,7 @@ def _verify_yesno(
 def _verify_counting(
     raw_text: str,
     ground_truth: str,
+    strict: bool = False,
 ) -> MatchResult:
     """Counting verification: extract numbers from sentences (Rule 6).
 
@@ -605,10 +641,49 @@ def _verify_counting(
     Args:
         raw_text: Raw answer text
         ground_truth: Ground truth string
+        strict: If True, pred must be a pure integer/decimal inside the
+            `<answer>` tag. No prose scanning, no word-numbers.
 
     Returns:
         MatchResult
     """
+    # Strict mode: only atomic numeric answer inside <answer> tag.
+    if strict:
+        pred_str = extract_answer_from_text(raw_text, "counting", strict=True)
+        if not pred_str:
+            return MatchResult(
+                answer_type="counting", parse_ok=False, verdict=WRONG,
+                extracted="", score=None,
+            )
+        try:
+            pred_num: float | int = float(pred_str)
+            if pred_num == int(pred_num):
+                pred_num = int(pred_num)
+        except ValueError:
+            return MatchResult(
+                answer_type="counting", parse_ok=False, verdict=WRONG,
+                extracted="", score=None,
+            )
+        gt_num = _extract_number_from_sentence(ground_truth)
+        if gt_num is None:
+            return MatchResult(
+                answer_type="counting", parse_ok=False, verdict=WRONG,
+                extracted=str(pred_num), score=None,
+            )
+        # Reuse fuzzy scoring so near-misses still get partial signal,
+        # but skip the open-ended cascade — strict mode is atomic-only.
+        if pred_num == gt_num:
+            score = 1.0
+        else:
+            abs_error = abs(pred_num - gt_num)
+            denom = max(abs(gt_num), 3)
+            score = max(0.0, 1.0 - abs_error / denom)
+        verdict = CORRECT if score >= 0.75 else WRONG
+        return MatchResult(
+            answer_type="counting", parse_ok=True, verdict=verdict,
+            extracted=str(pred_num), score=score,
+        )
+
     pred_num = _extract_number_from_sentence(raw_text)
     gt_num = _extract_number_from_sentence(ground_truth)
 
@@ -651,6 +726,7 @@ def _verify_numeric(
     raw_text: str,
     ground_truth: str,
     tolerance: float = 0.01,
+    strict: bool = False,
 ) -> MatchResult:
     """Standard numeric verification.
 
@@ -658,11 +734,13 @@ def _verify_numeric(
         raw_text: Raw answer text
         ground_truth: Ground truth string
         tolerance: Numeric comparison tolerance
+        strict: If True, pred must be a pure integer/decimal inside the
+            `<answer>` tag. No prose scanning.
 
     Returns:
         MatchResult
     """
-    extracted = extract_answer_from_text(raw_text, "numeric")
+    extracted = extract_answer_from_text(raw_text, "numeric", strict=strict)
     if not extracted:
         return MatchResult(
             answer_type="numeric",

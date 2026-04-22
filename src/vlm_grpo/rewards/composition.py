@@ -35,10 +35,7 @@ from typing import Any
 
 from vlm_grpo.rewards.correctness import compute_a2_correctness_reward
 from vlm_grpo.rewards.feedback import compute_downstream_aware_reward
-from vlm_grpo.rewards.stability import (
-    compute_minimal_edit_reward,
-    compute_no_regression_reward,
-)
+from vlm_grpo.rewards.stability import compute_no_regression_reward
 from vlm_grpo.rewards.verifier import verify_answer
 from vlm_grpo.trajectory import (
     extract_answer_from_text,
@@ -64,23 +61,20 @@ class CriticRewardWeights:
     """Weights for critic reward composition.
 
     reward = w_downstream * R_downstream
-           + w_format * R_format
 
     Attributes:
-        w_downstream: Weight for downstream-aware reward (dominant)
-        w_format: Weight for format compliance
+        w_downstream: Weight for downstream-aware reward
     """
 
     w_downstream: float = 2.0
-    w_format: float = 0.15
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
 
     def to_list(self) -> list[float]:
-        """Return weights as ordered list: [format, downstream]."""
-        return [self.w_format, self.w_downstream]
+        """Return weights as ordered list: [downstream]."""
+        return [self.w_downstream]
 
 
 @dataclass
@@ -89,19 +83,16 @@ class RefinerRewardWeights:
 
     reward = w_correctness * R_correctness
            + w_no_regression * R_no_regression
-           + w_minimal_edit * R_minimal_edit
            + w_format * R_format
 
     Attributes:
         w_correctness: Weight for A2 correctness
         w_no_regression: Weight for no-regression penalty (dominant)
-        w_minimal_edit: Weight for minimal edit reward
         w_format: Weight for format compliance
     """
 
     w_correctness: float = 1.0
     w_no_regression: float = 2.0
-    w_minimal_edit: float = 0.3
     w_format: float = 0.15
 
     def to_dict(self) -> dict:
@@ -109,12 +100,11 @@ class RefinerRewardWeights:
         return asdict(self)
 
     def to_list(self) -> list[float]:
-        """Return weights as ordered list: [format, correctness, no_regression, minimal_edit]."""
+        """Return weights as ordered list: [format, correctness, no_regression]."""
         return [
             self.w_format,
             self.w_correctness,
             self.w_no_regression,
-            self.w_minimal_edit,
         ]
 
 
@@ -135,7 +125,6 @@ class CriticRewardBreakdown:
         a2_text: The A2 text generated from this feedback
         a2_extracted: Normalized A2 answer
         a2_correct: Whether A2 is correct
-        format_valid: Whether the feedback format was valid
     """
 
     total_reward: float
@@ -145,7 +134,6 @@ class CriticRewardBreakdown:
     a2_text: str
     a2_extracted: str
     a2_correct: bool
-    format_valid: bool
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -178,169 +166,8 @@ class RefinerRewardBreakdown:
 
 
 # =============================================================================
-# Critic Format Reward
+# F1 Verification Accuracy
 # =============================================================================
-
-# CJK character detection for proper word counting in Chinese/Japanese/Korean
-_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]")
-
-
-def _contains_cjk(text: str) -> bool:
-    """Check if text contains CJK characters.
-
-    Args:
-        text: Input text string
-
-    Returns:
-        True if any CJK characters are found
-    """
-    return bool(_CJK_CHAR_RE.search(text))
-
-
-def _count_content_units(text: str) -> int:
-    """Count content units: CJK characters + whitespace-delimited non-CJK tokens.
-
-    For pure English text, behaves like len(text.split()).
-    For CJK text, each CJK character counts as one unit (≈ one word).
-    For mixed text, combines both counts.
-
-    Args:
-        text: Input text string
-
-    Returns:
-        Content unit count
-    """
-    if not _contains_cjk(text):
-        return len(text.split())
-
-    count = 0
-    non_cjk_buf: list[str] = []
-    for ch in text:
-        if _CJK_CHAR_RE.match(ch):
-            if non_cjk_buf:
-                token = "".join(non_cjk_buf).strip()
-                if token:
-                    count += len(token.split())
-                non_cjk_buf = []
-            count += 1
-        else:
-            non_cjk_buf.append(ch)
-
-    if non_cjk_buf:
-        token = "".join(non_cjk_buf).strip()
-        if token:
-            count += len(token.split())
-
-    return count
-
-
-# Stance keywords: feedback must take a position on A1's correctness
-_CRITIC_FORMAT_STANCE_KEYWORDS: list[re.Pattern] = [
-    re.compile(p, re.IGNORECASE)
-    for p in [
-        r"\bcorrect\b",
-        r"\bwrong\b",
-        r"\bno change\b",
-        r"\bshould be\b",
-        r"\bincorrect\b",
-        r"\baccurate\b",
-    ]
-] + [
-    # Chinese stance keywords (no word boundaries needed for CJK)
-    re.compile(p)
-    for p in [
-        r"正确",
-        r"错误",
-        r"不正确",
-        r"准确",
-        r"应该",
-        r"修改",
-    ]
-]
-
-
-def compute_critic_format_reward(feedback_text: str) -> float:
-    """R_format for critic: pure structure check (no keyword overlap with calibration).
-
-    Penalty-only, based solely on word count. Stance keyword detection is
-    handled by calibration reward — keeping them separate avoids redundant
-    signals that reduce K-group variance.
-
-    Three-tier scoring:
-        Empty or <3 units  → -2.0  (heavy penalty for safe empty)
-        3-6 units          → -1.0  (too terse for useful feedback)
-        >6 units           →  0.0  (acceptable structure)
-
-    For CJK text, each character counts as one unit (≈ one word).
-
-    Args:
-        feedback_text: Feedback text from the critic
-
-    Returns:
-        Format reward in {-2.0, -1.0, 0.0}
-    """
-    stripped = feedback_text.strip()
-    if not stripped:
-        return -2.0
-
-    word_count = _count_content_units(stripped)
-    if word_count < 3:
-        return -2.0
-
-    if word_count <= 6:
-        return -1.0
-
-    return 0.0
-
-
-# Pattern for detecting think/answer tag leakage in F1 outputs.
-# The critic prompt has no tag instructions — tags here indicate
-# behavioral contamination from A1/A2 tag training.
-_F1_TAG_LEAKAGE_PATTERN = re.compile(r"</?(?:think|answer)>", re.IGNORECASE)
-
-
-def compute_f1_tag_penalty(feedback_text: str) -> float:
-    """Penalty for F1 using think/answer tags (role contamination).
-
-    The critic system prompt does not instruct tag usage. When F1 generates
-    <think>/<answer> tags, it's behavioral leakage from A1/A2 training that
-    wastes tokens on internal reasoning instead of direct feedback, producing
-    worse downstream outcomes (27.7% R→R vs 43.5% for plain F1).
-
-    Args:
-        feedback_text: Feedback text from the critic
-
-    Returns:
-        -2.0 if any think/answer tags found, 0.0 otherwise
-    """
-    if _F1_TAG_LEAKAGE_PATTERN.search(feedback_text):
-        return -2.0
-    return 0.0
-
-
-# ---- Binary Verification Rewards (v9: <feedback> tag based) ----
-
-
-def compute_verification_format_reward(feedback_text: str) -> float:
-    """R_format for binary verification: does F1 have <feedback> tags with valid verdict?
-
-    Binary: 1.0 if <feedback>CORRECT</feedback> or <feedback>INCORRECT</feedback>
-    present, 0.0 otherwise. Mirrors DeepSeek-R1 binary format convention.
-
-    Args:
-        feedback_text: Verification output from the model
-
-    Returns:
-        1.0 if format compliant, 0.0 if not
-    """
-    from vlm_grpo.trajectory import extract_from_feedback_tags, has_feedback_tags
-
-    if not has_feedback_tags(feedback_text):
-        return 0.0
-    verdict = extract_from_feedback_tags(feedback_text).upper()
-    if verdict in ("CORRECT", "INCORRECT"):
-        return 1.0
-    return 0.0
 
 
 def compute_verification_accuracy_reward(
@@ -349,9 +176,9 @@ def compute_verification_accuracy_reward(
 ) -> float:
     """R_verification: does F1's verdict match A1's actual correctness?
 
-    Extracts verdict from <feedback> tags first (deterministic). Falls back
-    to searching for CORRECT/INCORRECT anywhere in the text if no tags found
-    (handles early training before model learns tags).
+    Primary path: extract verdict from `\\boxed{...}` (LLaVA-Critic-R1 style,
+    deterministic).  Fallback: keyword scan on the full text — handles
+    early training before the model learns the boxed format.
 
     Args:
         feedback_text: Verification output from the model
@@ -362,31 +189,53 @@ def compute_verification_accuracy_reward(
         -1.0 if classification contradicts ground truth,
         0.0 if verdict cannot be determined
     """
-    from vlm_grpo.trajectory import extract_from_feedback_tags, has_feedback_tags
+    from vlm_grpo.trajectory import extract_from_boxed
 
-    # Primary: extract from <feedback> tags (clean, deterministic)
-    if has_feedback_tags(feedback_text):
-        verdict = extract_from_feedback_tags(feedback_text).upper()
-        if verdict == "INCORRECT":
-            return 1.0 if not a1_is_correct else -1.0
-        if verdict == "CORRECT":
-            return 1.0 if a1_is_correct else -1.0
-        return 0.0
+    # Primary: boxed verdict (deterministic).
+    boxed = extract_from_boxed(feedback_text).upper()
+    if boxed == "INCORRECT":
+        return 1.0 if not a1_is_correct else -1.0
+    if boxed == "CORRECT":
+        return 1.0 if a1_is_correct else -1.0
 
-    # Fallback: search for INCORRECT/CORRECT anywhere in text.
-    # Needed for early training before the model learns to use tags.
+    # Fallback: keyword scan on raw text.
     upper = feedback_text.upper()
     if not upper.strip():
         return 0.0
-    # Check INCORRECT first (contains CORRECT as substring)
     if "INCORRECT" in upper:
-        # Verify no standalone CORRECT exists (ambiguous)
+        # Reject ambiguous text that also asserts a standalone "CORRECT".
         standalone_correct = re.search(r"(?<!IN)CORRECT", upper)
         if not standalone_correct:
             return 1.0 if not a1_is_correct else -1.0
         return 0.0
     if "CORRECT" in upper:
         return 1.0 if a1_is_correct else -1.0
+    return 0.0
+
+
+def compute_feedback_format_reward(feedback_text: str) -> float:
+    """R_fb_format: does F1 follow the `<think>...</think> \\boxed{VERDICT}` format?
+
+    Mirrors LLaVA-Critic-R1's format reward (arXiv:2509.00676) but with
+    {+1, 0, -1} instead of {1, 0} so non-compliance carries a penalty
+    (matches the response-format-reward convention in this pipeline).
+
+    Args:
+        feedback_text: Raw F1 output
+
+    Returns:
+        +1.0 if structure is valid AND boxed content is CORRECT/INCORRECT,
+         0.0 if both tags+boxed present but boxed verdict is invalid (e.g.
+             `\\boxed{maybe}`),
+        -1.0 if think or boxed is missing entirely.
+    """
+    from vlm_grpo.trajectory import extract_from_boxed, has_think_boxed
+
+    if not has_think_boxed(feedback_text):
+        return -1.0
+    verdict = extract_from_boxed(feedback_text).upper()
+    if verdict in ("CORRECT", "INCORRECT"):
+        return 1.0
     return 0.0
 
 
@@ -402,7 +251,7 @@ def compute_critic_reward_breakdown(
 ) -> CriticRewardBreakdown:
     """Compute full reward breakdown for one critic completion.
 
-    Combines: downstream-aware and format rewards.
+    Combines downstream-aware reward only.
 
     Args:
         feedback_text: Feedback text from the critic
@@ -420,10 +269,6 @@ def compute_critic_reward_breakdown(
     # Extract normalized A2 answer
     a2_extracted = extract_answer_from_text(a2_text, answer_type, choices)
 
-    # Format reward (penalty-only: 0.0 = valid, negative = invalid)
-    r_format = compute_critic_format_reward(feedback_text)
-    format_valid = r_format >= 0
-
     # Downstream-aware reward (pass raw text for MCQ answer text matching)
     r_downstream = compute_downstream_aware_reward(
         feedback_text=feedback_text,
@@ -440,11 +285,9 @@ def compute_critic_reward_breakdown(
 
     # Compose weighted reward
     components = {
-        "format": r_format,
         "downstream": r_downstream,
     }
     weighted_components = {
-        "format": r_format * weights.w_format,
         "downstream": r_downstream * weights.w_downstream,
     }
     total_reward = sum(weighted_components.values())
@@ -457,7 +300,6 @@ def compute_critic_reward_breakdown(
         a2_text=a2_text,
         a2_extracted=a2_extracted,
         a2_correct=a2_correct,
-        format_valid=format_valid,
     )
 
 
@@ -479,7 +321,7 @@ def compute_refiner_reward_breakdown(
 ) -> RefinerRewardBreakdown:
     """Compute full reward breakdown for one refiner completion.
 
-    Combines: correctness, no-regression, minimal-edit, and format rewards.
+    Combines: correctness, no-regression, and format rewards.
 
     Args:
         a2_text: A2 text from the refiner
@@ -518,14 +360,6 @@ def compute_refiner_reward_breakdown(
         a1_is_correct=a1_is_correct,
     )
 
-    # Minimal-edit reward
-    r_minimal_edit = compute_minimal_edit_reward(
-        a1=answer1,
-        a2_extracted=a2_text,
-        ground_truth=ground_truth,
-        answer_type=answer_type,
-    )
-
     # Determine A2 correctness for logging
     a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a2_correct = a2_result.is_correct
@@ -535,13 +369,11 @@ def compute_refiner_reward_breakdown(
         "format": r_format,
         "correctness": r_correctness,
         "no_regression": r_no_regression,
-        "minimal_edit": r_minimal_edit,
     }
     weighted_components = {
         "format": r_format * weights.w_format,
         "correctness": r_correctness * weights.w_correctness,
         "no_regression": r_no_regression * weights.w_no_regression,
-        "minimal_edit": r_minimal_edit * weights.w_minimal_edit,
     }
     total_reward = sum(weighted_components.values())
 
@@ -915,50 +747,11 @@ def refiner_no_regression_reward_fn(
     return rewards
 
 
-def refiner_minimal_edit_reward_fn(
-    completions: list,
-    ground_truth: list[str] | None = None,
-    answer1: list[str] | None = None,
-    answer_type: list[str] | None = None,
-    choices: list[str] | None = None,
-    **kwargs: Any,
-) -> list[float]:
-    """TRL-compatible minimal-edit reward for refiner A2 completions.
-
-    Args:
-        completions: List of K completions from GRPOTrainer
-        ground_truth: List of ground truths (from dataset columns)
-        answer1: List of A1 answers (from dataset columns)
-        answer_type: List of answer types (from dataset columns)
-        choices: List of MCQ choices (from dataset columns)
-        **kwargs: Additional dataset columns (ignored)
-
-    Returns:
-        List of minimal-edit rewards, one per completion
-    """
-    rewards = []
-    for i, comp in enumerate(completions):
-        gt = ground_truth[i] if ground_truth else ""
-        a1 = answer1[i] if answer1 else ""
-        at = answer_type[i] if answer_type else "open"
-
-        a2_text = _extract_a2_text(comp)
-
-        r = compute_minimal_edit_reward(
-            a1=a1,
-            a2_extracted=a2_text,
-            ground_truth=gt,
-            answer_type=at,
-        )
-        rewards.append(r)
-    return rewards
-
-
 def get_refiner_reward_functions() -> list:
     """Return ordered list of TRL-compatible reward functions for refiner.
 
     Order matches RefinerRewardWeights.to_list():
-    [format, correctness, no_regression, minimal_edit]
+    [format, correctness, no_regression]
 
     Returns:
         List of reward function callables
@@ -967,7 +760,6 @@ def get_refiner_reward_functions() -> list:
         refiner_format_reward_fn,
         refiner_correctness_reward_fn,
         refiner_no_regression_reward_fn,
-        refiner_minimal_edit_reward_fn,
     ]
 
 
@@ -1011,13 +803,11 @@ class TrajectoryFeedbackRewardBreakdown:
         total_reward: Weighted sum of feedback components
         components: Dict mapping component name to raw reward value
         weighted_components: Dict mapping component name to weighted value
-        feedback_format_valid: Whether feedback is substantive
     """
 
     total_reward: float
     components: dict[str, float]
     weighted_components: dict[str, float]
-    feedback_format_valid: bool
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -1038,7 +828,7 @@ def compute_response_reward_breakdown(
     """Compute response reward for a single trajectory.
 
     Evaluates answer quality: A1 correctness, A2 correctness,
-    no-regression, format, and minimal edit.
+    no-regression, and format.
 
     Args:
         a1_text: Initial answer text
@@ -1052,35 +842,46 @@ def compute_response_reward_breakdown(
     Returns:
         TrajectoryResponseRewardBreakdown with all component scores
     """
-    # Verify A1 and A2 ONCE each.
-    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    # Strict extraction for correctness when tag mode is active.
+    # Prevents reward-hacking via prose like "(B) is wrong, (A) is right"
+    # inside <answer> tags (the liberal cascade picks "B" via first-match).
+    # Matches EasyR1 / VeRL-DAPO / LLaVA-Critic-R1 convention
+    # (hard-require tag + strict atomic extraction).
+    tag_mode = use_think_answer_tags or use_answer_tag_only
+
+    # Verify A1 with strict extraction when tag mode active.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=tag_mode)
     a1_correct = a1_result.is_correct
 
-    # A2: In answer-tag-only mode, extract from <answer> tags first.
-    # If no tags → correctness=0 (neutral), format=0 (neutral),
-    # but treat as WRONG for transitions (no-regression/downstream).
-    # Following DeepSeek-R1 convention: unextractable = no signal.
-    a2_has_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
+    # Check tag presence on A2. Short-circuit to penalty-only when required
+    # tags are missing — ensures the model cannot earn correctness credit
+    # for format-violating outputs (reward noise mitigation).
+    a2_has_answer_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
+    a2_has_think_tag = bool(re.search(r"<think>", a2_text, re.IGNORECASE))
 
-    if use_answer_tag_only and not a2_has_tag:
-        # No <answer> tag: hard short-circuit to penalty-only.
-        # -2.0 raw × w_a2_format ensures no-tag is always worse than
-        # the worst tagged outcome. Prevents the bug where neutral
-        # r_a2=0 leaks into shaped reward giving +5 for no-tag + A1W.
+    a2_tags_missing = False
+    if use_answer_tag_only and not a2_has_answer_tag:
+        a2_tags_missing = True
+    elif use_think_answer_tags and (not a2_has_think_tag or not a2_has_answer_tag):
+        a2_tags_missing = True
+
+    if a2_tags_missing:
+        # Required tag(s) missing: hard short-circuit to format penalty only.
+        # -2.0 raw × w_a2_format ensures no-tag is strictly worse than the
+        # worst tagged outcome. Correctness and no_regression zeroed — no
+        # differential signal on format-violating trajectories.
         _NO_TAG_PENALTY = -2.0
         components = {
             "a1_correctness": 0.0,
             "a2_correctness": 0.0,
             "no_regression": 0.0,
             "a2_format": _NO_TAG_PENALTY,
-            "minimal_edit": 0.0,
         }
         weighted_components = {
             "a1_correctness": 0.0,
             "a2_correctness": 0.0,
             "no_regression": 0.0,
             "a2_format": _NO_TAG_PENALTY * weights.w_a2_format,
-            "minimal_edit": 0.0,
         }
         return TrajectoryResponseRewardBreakdown(
             total_reward=_NO_TAG_PENALTY * weights.w_a2_format,
@@ -1092,7 +893,7 @@ def compute_response_reward_breakdown(
             a2_format_valid=False,
         )
     else:
-        a2_result = verify_answer(a2_text, ground_truth, answer_type)
+        a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
         a2_correct = a2_result.is_correct
 
         # Format reward
@@ -1136,35 +937,17 @@ def compute_response_reward_breakdown(
         else:
             r_no_reg = 2.0 if a2_correct else 0.0
 
-    # Minimal edit reward (only when both correct)
-    if a1_correct and a2_correct:
-        from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
-        from vlm_grpo.utils import normalized_edit_distance
-
-        if answer_type in DETERMINISTIC_TYPES:
-            a1_cmp = a1_result.extracted
-            a2_cmp = a2_result.extracted
-        else:
-            a1_cmp = a1_text.strip().lower()
-            a2_cmp = a2_text.strip().lower()
-        edit_dist = normalized_edit_distance(a1_cmp, a2_cmp)
-        r_edit = max(1.0 - 0.5 * edit_dist, 0.0)
-    else:
-        r_edit = 0.0
-
     components = {
         "a1_correctness": r_a1,
         "a2_correctness": r_a2,
         "no_regression": r_no_reg,
         "a2_format": r_a2_format,
-        "minimal_edit": r_edit,
     }
     weighted_components = {
         "a1_correctness": r_a1 * weights.w_a1_correctness,
         "a2_correctness": r_a2 * weights.w_a2_correctness,
         "no_regression": r_no_reg * weights.w_no_regression,
         "a2_format": r_a2_format * weights.w_a2_format,
-        "minimal_edit": r_edit * weights.w_minimal_edit,
     }
     total_reward = sum(weighted_components.values())
 
@@ -1189,49 +972,61 @@ def compute_feedback_reward_breakdown(
     weights: Any,
     use_improvement_reward: bool = False,
     reward_shaping_alpha: float = 0.0,
-    use_binary_verification: bool = False,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
 
-    Two modes:
-    - **Standard** (use_binary_verification=False): open-ended critique with
-      downstream, calibration, format, and tag penalty components.
-    - **Binary verification** (use_binary_verification=True): F1 outputs
-      CORRECT/INCORRECT. Components: downstream, verification accuracy,
-      binary format check. Calibration and tag penalty disabled.
+    F1 outputs a CORRECT/INCORRECT verdict with brief explanation. Reward
+    components:
+    - downstream: `r_a2 + α·(r_a2 − r_a1)` — judge F1 by the A2 it produces
+    - verification: ±1 based on whether F1's verdict matches A1's truth
 
     Args:
-        feedback_text: Feedback text from the critic
+        feedback_text: F1 output text (should contain CORRECT or INCORRECT)
         a1_text: Initial answer text
         a2_text: Refined answer text
         ground_truth: Ground truth answer
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
-        choices: MCQ choices string
+        choices: MCQ choices string (unused, kept for API compat)
         weights: FeedbackRewardWeights instance
-        use_improvement_reward: If True, use R(A2)-R(A1) instead of
-            transition-shaped downstream constants
+        use_improvement_reward: If True, use R(A2)-R(A1) instead of shaped downstream
         reward_shaping_alpha: SCoRe-style shaped reward alpha
-        use_binary_verification: If True, use binary verification rewards
 
     Returns:
         TrajectoryFeedbackRewardBreakdown with all component scores
     """
-    from vlm_grpo.rewards.feedback import compute_feedback_calibration_reward
-
     # Verify A1 and A2 ONCE (downstream needs both)
     a1_result = verify_answer(a1_text, ground_truth, answer_type)
     a2_result = verify_answer(a2_text, ground_truth, answer_type)
     a1_correct = a1_result.is_correct
     a2_correct = a2_result.is_correct
 
-    # Format reward depends on mode
-    if use_binary_verification:
-        r_format = compute_verification_format_reward(feedback_text)
-    else:
-        r_format = compute_critic_format_reward(feedback_text)
-    format_valid = r_format >= 0
+    # Hard short-circuit on missing F1 format tags.
+    # Matches the A1/A2 short-circuit convention: if the critic does not
+    # emit `<think>...</think> \boxed{VERDICT}`, collapse to a format-only
+    # penalty with no downstream or verification credit. Prevents the
+    # keyword-fallback path from rewarding format-violating F1s that still
+    # happen to contain the CORRECT/INCORRECT word.
+    from vlm_grpo.trajectory import has_think_boxed
 
-    # Downstream-aware reward (computed directly, no extra verify_answer call)
+    if not has_think_boxed(feedback_text):
+        _NO_TAG_PENALTY = -2.0
+        components = {
+            "downstream": 0.0,
+            "verification": 0.0,
+            "format": _NO_TAG_PENALTY,
+        }
+        weighted_components = {
+            "downstream": 0.0,
+            "verification": 0.0,
+            "format": _NO_TAG_PENALTY * weights.w_format,
+        }
+        return TrajectoryFeedbackRewardBreakdown(
+            total_reward=_NO_TAG_PENALTY * weights.w_format,
+            components=components,
+            weighted_components=weighted_components,
+        )
+
+    # Downstream-aware reward
     from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
 
     if not feedback_text.strip():
@@ -1261,32 +1056,32 @@ def compute_feedback_reward_breakdown(
         else:
             r_downstream = 2.0 if a2_correct else -1.0
 
-    if use_binary_verification:
-        # Binary mode: verification accuracy replaces calibration,
-        # tag penalty is irrelevant (F1 outputs 1 word).
-        r_calibration = compute_verification_accuracy_reward(feedback_text, a1_correct)
-        r_tag_penalty = 0.0
-    else:
-        # Standard mode: keyword-based calibration + tag leakage penalty
-        r_calibration = compute_feedback_calibration_reward(feedback_text, a1_correct)
-        r_tag_penalty = compute_f1_tag_penalty(feedback_text)
+    r_verification = compute_verification_accuracy_reward(feedback_text, a1_correct)
+    r_fb_format = compute_feedback_format_reward(feedback_text)
+
+    # Gate downstream credit on a calibrated verdict.
+    # F1 earns the downstream reward ONLY when its CORRECT/INCORRECT verdict
+    # matches A1's actual correctness (r_verification == +1). Miscalibrated
+    # or unparseable verdicts collapse r_downstream to 0.
+    #
+    # Rationale: A2 correctness is already credited to the A1/A2 policy via
+    # the response reward (a2_correctness + no_regression). Without this
+    # gate, a sycophantic F1 that says "CORRECT" when A1 is wrong still
+    # receives a large positive downstream reward whenever A2 happens to
+    # variance-flip to correct — which rewards miscalibration for outcomes
+    # F1 actively pushed against. The gate removes that noise from F1's
+    # credit path.
+    r_downstream_gated = r_downstream if r_verification > 0 else 0.0
 
     components = {
-        "downstream": r_downstream,
-        "calibration": r_calibration,
-        "format": r_format,
-        "tag_penalty": r_tag_penalty,
+        "downstream": r_downstream_gated,
+        "verification": r_verification,
+        "format": r_fb_format,
     }
-    w_tag = getattr(weights, "w_tag_penalty", 0.0)
-    w_verif = getattr(weights, "w_verification_accuracy", 0.0)
-    # In binary mode, verification accuracy uses the calibration slot
-    # but with its own weight.
-    cal_weight = w_verif if use_binary_verification else weights.w_calibration
     weighted_components = {
-        "downstream": r_downstream * weights.w_downstream,
-        "calibration": r_calibration * cal_weight,
-        "format": r_format * weights.w_format,
-        "tag_penalty": r_tag_penalty * w_tag,
+        "downstream": r_downstream_gated * weights.w_downstream,
+        "verification": r_verification * weights.w_verification_accuracy,
+        "format": r_fb_format * weights.w_format,
     }
     total_reward = sum(weighted_components.values())
 
@@ -1294,5 +1089,4 @@ def compute_feedback_reward_breakdown(
         total_reward=total_reward,
         components=components,
         weighted_components=weighted_components,
-        feedback_format_valid=format_valid,
     )

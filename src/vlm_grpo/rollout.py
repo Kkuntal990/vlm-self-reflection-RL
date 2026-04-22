@@ -179,15 +179,12 @@ def compute_rollout_metrics(
     wr_count = 0
     ww_count = 0
     reward_sum = 0.0
-    format_valid_count = 0
     feedback_lengths = []
 
     for r in results:
         for bd in r.reward_breakdowns:
             total_pairs += 1
             reward_sum += bd.total_reward
-            if bd.format_valid:
-                format_valid_count += 1
             feedback_lengths.append(len(bd.feedback_text.split()))
 
             if r.a1_is_correct:
@@ -209,7 +206,6 @@ def compute_rollout_metrics(
         "rollout/rw_rate": rw_count / n,
         "rollout/wr_rate": wr_count / n,
         "rollout/ww_rate": ww_count / n,
-        "rollout/format_valid_rate": format_valid_count / n,
         "rollout/feedback_length_mean": (
             sum(feedback_lengths) / len(feedback_lengths) if feedback_lengths else 0.0
         ),
@@ -469,13 +465,11 @@ def generate_self_reflection_rollout(
             all_a1s.extend(chunk_a1s)
 
             # Step 2: Generate F1 for each trajectory.
-            use_binary = getattr(config, "use_binary_verification", False)
             f1_prompts = [
                 build_critic_prompt(
                     chunk_qs[i],
                     chunk_a1s[i * k + j],
                     model_type=model_type,
-                    use_binary_verification=use_binary,
                 )
                 for i in range(chunk_size)
                 for j in range(k)
@@ -567,7 +561,6 @@ def generate_self_reflection_rollout(
                 weights=feedback_weights,
                 use_improvement_reward=getattr(config, "use_improvement_reward", False),
                 reward_shaping_alpha=_get_feedback_alpha(config),
-                use_binary_verification=getattr(config, "use_binary_verification", False),
             )
             result.response_rewards.append(resp_bd.total_reward)
             result.feedback_rewards.append(fb_bd.total_reward)
@@ -604,7 +597,12 @@ def compute_self_reflection_metrics(
     ww_count = 0
     resp_reward_sum = 0.0
     fb_reward_sum = 0.0
-    fb_format_valid_count = 0
+    # Format-violation counters. Detected via the short-circuit sentinel
+    # `components[...] == -2.0` that only the hard-short-circuit path emits.
+    # Helps disambiguate "model refused to correct" from "model refused to
+    # follow tag format" in wandb dashboards.
+    a2_fmt_violation_count = 0
+    fb_fmt_violation_count = 0
 
     for r in results:
         for resp_bd, fb_bd in zip(r.response_breakdowns, r.feedback_breakdowns):
@@ -613,8 +611,6 @@ def compute_self_reflection_metrics(
             fb_reward_sum += fb_bd.total_reward
             if resp_bd.a1_correct:
                 a1_correct_count += 1
-            if fb_bd.feedback_format_valid:
-                fb_format_valid_count += 1
 
             if resp_bd.a1_correct:
                 if resp_bd.a2_correct:
@@ -626,6 +622,13 @@ def compute_self_reflection_metrics(
                     wr_count += 1
                 else:
                     ww_count += 1
+
+            # Short-circuit sentinel: raw format component equals -2.0 only
+            # when the hard-short-circuit path fires (missing required tags).
+            if resp_bd.components.get("a2_format", 0.0) == -2.0:
+                a2_fmt_violation_count += 1
+            if fb_bd.components.get("format", 0.0) == -2.0:
+                fb_fmt_violation_count += 1
 
     a2_correct_count = rr_count + wr_count
     n = max(total, 1)
@@ -639,5 +642,6 @@ def compute_self_reflection_metrics(
         "sr/ww_rate": ww_count / n,
         "sr/response_reward_mean": resp_reward_sum / n,
         "sr/feedback_reward_mean": fb_reward_sum / n,
-        "sr/feedback_format_valid_rate": fb_format_valid_count / n,
+        "sr/a2_format_violation_rate": a2_fmt_violation_count / n,
+        "sr/fb_format_violation_rate": fb_fmt_violation_count / n,
     }

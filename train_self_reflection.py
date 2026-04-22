@@ -166,16 +166,16 @@ def parse_args() -> argparse.Namespace:
         help="Shaped reward alpha for feedback (F1). -1 means use --reward_shaping_alpha.",
     )
     parser.add_argument(
-        "--use_binary_verification",
-        action="store_true",
-        help="V8: Binary verification mode. F1 outputs CORRECT/INCORRECT "
-        "instead of open critique. Auto-disables think/answer tags.",
-    )
-    parser.add_argument(
         "--w_verification_accuracy",
         type=float,
-        default=0.0,
-        help="Weight for F1 verification accuracy reward (v8 binary mode)",
+        default=0.45,
+        help="Weight for F1 verification accuracy reward",
+    )
+    parser.add_argument(
+        "--w_fb_format",
+        type=float,
+        default=0.1,
+        help="Weight for F1 format reward (<think></think> + \\boxed{VERDICT})",
     )
     parser.add_argument(
         "--freeze_a1_steps",
@@ -236,18 +236,14 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of GPU memory for vLLM (freed during training via sleep mode)",
     )
 
-    # Response reward weights
-    parser.add_argument("--w_a1_correctness", type=float, default=1.0)
-    parser.add_argument("--w_a2_correctness", type=float, default=1.0)
-    parser.add_argument("--w_no_regression", type=float, default=2.0)
-    parser.add_argument("--w_a2_format", type=float, default=0.15)
-    parser.add_argument("--w_minimal_edit", type=float, default=0.0)
+    # Response reward weights (must sum to 1.0)
+    parser.add_argument("--w_a1_correctness", type=float, default=0.25)
+    parser.add_argument("--w_a2_correctness", type=float, default=0.25)
+    parser.add_argument("--w_no_regression", type=float, default=0.25)
+    parser.add_argument("--w_a2_format", type=float, default=0.25)
 
-    # Feedback reward weights
-    parser.add_argument("--w_downstream", type=float, default=2.0)
-    parser.add_argument("--w_calibration", type=float, default=0.0)
-    parser.add_argument("--w_fb_format", type=float, default=0.15)
-    parser.add_argument("--w_fb_tag_penalty", type=float, default=0.0)
+    # Feedback reward weights (must sum to 1.0)
+    parser.add_argument("--w_downstream", type=float, default=0.45)
 
     # Logging and checkpointing
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -316,41 +312,16 @@ def main() -> None:
         SelfReflectionConfig,
     )
 
-    # When think/answer tags enabled, increase format weight from 0.15 to 0.5
-    # so the model has positive incentive to use tags (range +0.5 to -1.0).
-    # User can still override explicitly with --w_a2_format.
-    w_a2_format = args.w_a2_format
-    if (args.use_think_answer_tags or getattr(args, "use_answer_tag_only", False)) and w_a2_format == 0.15:
-        w_a2_format = 0.5
-        logger.info("Auto-increased w_a2_format to 0.5 for tag mode")
-
-    # v8 binary verification auto-config
-    if args.use_binary_verification:
-        if args.use_think_answer_tags:
-            logger.warning("--use_binary_verification overrides --use_think_answer_tags to False")
-            args.use_think_answer_tags = False
-        # Token limits are NOT auto-reduced — yaml value is respected.
-        # (The earlier auto-reduce to 16 silently truncated F1 explanations
-        # even when the yaml specified 256. Always trust the yaml.)
-        # Auto-set verification accuracy weight if not explicitly set
-        if args.w_verification_accuracy == 0.0:
-            args.w_verification_accuracy = 1.0
-            logger.info("Auto-set w_verification_accuracy to 1.0 for binary verification")
-        logger.info("Pipeline mode: V8 Binary Verification (A1→F1:CORRECT/INCORRECT→A2)")
-
     response_weights = ResponseRewardWeights(
         w_a1_correctness=args.w_a1_correctness,
         w_a2_correctness=args.w_a2_correctness,
         w_no_regression=args.w_no_regression,
-        w_a2_format=w_a2_format,
-        w_minimal_edit=args.w_minimal_edit,
+        w_a2_format=args.w_a2_format,
     )
     feedback_weights = FeedbackRewardWeights(
         w_downstream=args.w_downstream,
-        w_calibration=args.w_calibration,
-        w_format=args.w_fb_format,
-        w_tag_penalty=args.w_fb_tag_penalty,
         w_verification_accuracy=args.w_verification_accuracy,
+        w_format=args.w_fb_format,
     )
     rollout_config = RolloutConfig(
         k_samples=args.k_samples,
@@ -368,7 +339,6 @@ def main() -> None:
         reward_shaping_alpha=args.reward_shaping_alpha,
         response_alpha=args.response_alpha,
         feedback_alpha=args.feedback_alpha,
-        use_binary_verification=args.use_binary_verification,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -478,7 +448,6 @@ def main() -> None:
                 response_weights,
                 feedback_weights,
                 reward_shaping_alpha=args.reward_shaping_alpha,
-                use_binary_verification=args.use_binary_verification,
             )
         return
 
@@ -735,7 +704,6 @@ def _run_sanity_check(
     response_weights: object,
     feedback_weights: object,
     reward_shaping_alpha: float = 0.0,
-    use_binary_verification: bool = False,
 ) -> None:
     """Run sanity check with synthetic (A1, F1, A2) tuples.
 
@@ -746,7 +714,6 @@ def _run_sanity_check(
         response_weights: Response reward weights
         feedback_weights: Feedback reward weights
         reward_shaping_alpha: SCoRe-style shaped reward alpha
-        use_binary_verification: If True, use binary verification test cases
     """
     from vlm_grpo.rewards.composition import (
         compute_feedback_reward_breakdown,
@@ -754,8 +721,7 @@ def _run_sanity_check(
     )
 
     logger.info("=" * 70)
-    mode = "BINARY VERIFICATION" if use_binary_verification else "two-reward self-reflection"
-    logger.info(f"SANITY CHECK MODE ({mode})")
+    logger.info("SANITY CHECK MODE (two-reward self-reflection)")
     logger.info("=" * 70)
     logger.info(f"Response weights: {response_weights.to_dict()}")
     logger.info(f"Feedback weights: {feedback_weights.to_dict()}")
@@ -773,53 +739,28 @@ def _run_sanity_check(
         logger.info(f"--- Sample {i} ---")
         logger.info(f"  GT: {gt} | Type: {a_type} | Dataset: {ds}")
 
-        # Synthetic trajectory scenarios
-        if use_binary_verification:
-            test_cases = {
-                "RR_correct_verify": {
-                    "a1": gt,
-                    "f1": "CORRECT",
-                    "a2": gt,
-                },
-                "RW_wrong_verify": {
-                    "a1": gt,
-                    "f1": "INCORRECT",
-                    "a2": "ZZZ_WRONG_ANSWER",
-                },
-                "WR_correct_verify": {
-                    "a1": "ZZZ_WRONG_ANSWER",
-                    "f1": "INCORRECT",
-                    "a2": gt,
-                },
-                "WW_sycophantic_verify": {
-                    "a1": "ZZZ_WRONG_ANSWER",
-                    "f1": "CORRECT",
-                    "a2": "ZZZ_STILL_WRONG",
-                },
-            }
-        else:
-            test_cases = {
-                "RR_good_feedback": {
-                    "a1": gt,
-                    "f1": "The answer is correct and well-supported by the image.",
-                    "a2": gt,
-                },
-                "RW_bad_feedback": {
-                    "a1": gt,
-                    "f1": "The answer is incorrect, it should be changed completely.",
-                    "a2": "ZZZ_WRONG_ANSWER",
-                },
-                "WR_helpful_feedback": {
-                    "a1": "ZZZ_WRONG_ANSWER",
-                    "f1": f"The answer is incorrect. The correct answer should be {gt}.",
-                    "a2": gt,
-                },
-                "WW_useless_feedback": {
-                    "a1": "ZZZ_WRONG_ANSWER",
-                    "f1": "Looks fine to me.",
-                    "a2": "ZZZ_STILL_WRONG",
-                },
-            }
+        test_cases = {
+            "RR_correct_verify": {
+                "a1": gt,
+                "f1": "CORRECT. Matches the image.",
+                "a2": gt,
+            },
+            "RW_wrong_verify": {
+                "a1": gt,
+                "f1": "INCORRECT. Revise.",
+                "a2": "ZZZ_WRONG_ANSWER",
+            },
+            "WR_correct_verify": {
+                "a1": "ZZZ_WRONG_ANSWER",
+                "f1": "INCORRECT. Should be the other option.",
+                "a2": gt,
+            },
+            "WW_sycophantic_verify": {
+                "a1": "ZZZ_WRONG_ANSWER",
+                "f1": "CORRECT. Looks fine.",
+                "a2": "ZZZ_STILL_WRONG",
+            },
+        }
 
         for case_name, traj in test_cases.items():
             resp_bd = compute_response_reward_breakdown(
@@ -840,7 +781,6 @@ def _run_sanity_check(
                 choices=ch,
                 weights=feedback_weights,
                 reward_shaping_alpha=reward_shaping_alpha,
-                use_binary_verification=use_binary_verification,
             )
 
             logger.info(f"  [{case_name}]")
@@ -850,20 +790,17 @@ def _run_sanity_check(
                 f"->A2={'R' if resp_bd.a2_correct else 'W'})"
             )
             logger.info(f"      Components: {resp_bd.components}")
-            logger.info(
-                f"    Feedback reward: {fb_bd.total_reward:+.2f} "
-                f"(format_valid={fb_bd.feedback_format_valid})"
-            )
+            logger.info(f"    Feedback reward: {fb_bd.total_reward:+.2f}")
             logger.info(f"      Components: {fb_bd.components}")
 
         logger.info("")
 
     logger.info("=" * 70)
     logger.info("EXPECTED BEHAVIOR:")
-    logger.info("  RR_good_feedback:  High resp reward (+), high fb reward (+)")
-    logger.info("  RW_bad_feedback:   Large negative resp reward, large negative fb reward")
-    logger.info("  WR_helpful_feedback: Positive resp reward (WR fix), high fb reward (+)")
-    logger.info("  WW_useless_feedback: Negative resp reward, negative fb reward")
+    logger.info("  RR_correct_verify:     +resp, +fb (verdict calibrated, A2 stable)")
+    logger.info("  RW_wrong_verify:       −resp (A2 regression), ~0 fb (miscalibrated)")
+    logger.info("  WR_correct_verify:     +resp (big WR bonus), +fb (verdict calibrated)")
+    logger.info("  WW_sycophantic_verify: −resp, −fb (verdict miscalibrated)")
     logger.info("=" * 70)
 
 

@@ -14,57 +14,6 @@ Usage:
 
 import re
 
-# Feedback calibration keyword patterns.
-#
-# Hedged-positive patterns ("partially correct", "on the right track, but")
-# are counted as NEGATIVE because they precede corrections in >90% of cases.
-# These are checked first and excluded from positive matching.
-_HEDGED_POSITIVE_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in [
-        r"\bpartially correct\b",
-        r"\bmostly correct\b",
-        r"\bmostly accurate\b",
-        r"\bon the right track\b",
-        r"\bclose\b.*\bbut\b",
-        r"\bcorrect\b.*\bbut\b.*\b(?:should|could|need|better|more|however)\b",
-        r"\bcorrect answer (?:is|should be|would be)\b",
-        r"\bright answer (?:is|should be|would be)\b",
-    ]
-]
-
-_POSITIVE_FEEDBACK_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in [
-        r"\bcorrect\b",
-        r"\baccurate\b",
-        r"\b(?:you(?:'re| are)|that(?:'s| is)) right\b",
-        r"\bno change needed\b",
-        r"\bno changes? (?:are |is )?(?:needed|necessary|required)\b",
-        r"\bwell done\b",
-        r"\bgood (?:answer|response|job)\b",
-        r"\bmatches?\b.*\b(?:image|visual|evidence)\b",
-    ]
-]
-
-_NEGATIVE_FEEDBACK_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in [
-        r"\bincorrect\b",
-        r"\bwrong\b",
-        r"\berror\b",
-        r"\bmistake\b",
-        r"\bshould be\b",
-        r"\bshould have been\b",
-        r"\bneeds? (?:to be )?(?:corrected|changed|revised|fixed|updated)\b",
-        r"\bnot (?:correct|accurate|right)\b",
-        r"\bdoes(?:n't| not) match\b",
-        r"\breconsider\b",
-        r"\bactually\b.*\bnot\b",
-    ]
-]
-
-
 # =============================================================================
 # Answer Matching Functions
 # =============================================================================
