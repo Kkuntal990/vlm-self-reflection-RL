@@ -475,7 +475,13 @@ def main() -> None:
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             args.model_id,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            # sdpa (not flash_attention_2): the transformers flash_attention
+            # integration has a None-guard bug on s_aux — crashes on any model
+            # without attention sinks (e.g. Qwen2.5-VL ViT).
+            # See transformers/integrations/flash_attention.py:84.
+            # sdpa routes through torch.nn.functional.scaled_dot_product_attention
+            # which auto-selects flash/memory-efficient backends without the wrapper.
+            attn_implementation="sdpa",
         ).to(accelerator.device)
     else:
         from transformers import AutoModelForVision2Seq
@@ -483,7 +489,13 @@ def main() -> None:
         model = AutoModelForVision2Seq.from_pretrained(
             args.model_id,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            # sdpa (not flash_attention_2): the transformers flash_attention
+            # integration has a None-guard bug on s_aux — crashes on any model
+            # without attention sinks (e.g. Qwen2.5-VL ViT).
+            # See transformers/integrations/flash_attention.py:84.
+            # sdpa routes through torch.nn.functional.scaled_dot_product_attention
+            # which auto-selects flash/memory-efficient backends without the wrapper.
+            attn_implementation="sdpa",
         ).to(accelerator.device)
 
     # Freeze vision tower if requested (saves memory, preserves visual features)
