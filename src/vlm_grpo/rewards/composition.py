@@ -203,22 +203,29 @@ def compute_verification_accuracy_reward(
 
 
 def compute_feedback_format_reward(feedback_text: str) -> float:
-    """R_fb_format: binary format check for F1.
+    """R_fb_format: structure + clean verdict check for F1.
 
-    Matches LLaVA-Critic-R1's binary {0, +1} convention (arXiv:2509.00676):
-    purely a structural compliance bonus, no negative penalty. Verdict
-    correctness is handled by R_verification, not by the format reward.
+    Binary {0, +1}. Two conditions must both hold for +1:
+      1. `<think>...</think>...\\boxed{...}` structure present (in order).
+      2. Inner content of `\\boxed{}` is exactly `CORRECT` or `INCORRECT`
+         (case-insensitive) — no descriptor, no garbage like `\\boxed{(A)}`.
+
+    Verdict correctness (vs A1 truth) is handled separately by
+    R_verification; this is a pure format compliance bonus.
 
     Args:
         feedback_text: Raw F1 output
 
     Returns:
-        +1.0 if `<think>...</think>...\\boxed{...}` structure is present.
+        +1.0 if structure present AND boxed content is CORRECT/INCORRECT.
          0.0 otherwise (no penalty, just no bonus).
     """
-    from vlm_grpo.trajectory import has_think_boxed
+    from vlm_grpo.trajectory import extract_from_boxed, has_think_boxed
 
-    return 1.0 if has_think_boxed(feedback_text) else 0.0
+    if not has_think_boxed(feedback_text):
+        return 0.0
+    verdict = extract_from_boxed(feedback_text).upper()
+    return 1.0 if verdict in ("CORRECT", "INCORRECT") else 0.0
 
 
 def compute_critic_reward_breakdown(
@@ -478,47 +485,85 @@ def _compute_tag_format_reward(
     answer_type: str,
     ground_truth: str = "",
 ) -> float:
-    """Format reward for A2 tag mode: pure structural check.
+    """Format reward for A2 tag mode: structure + clean atomic inner.
 
-    Binary {0, +1} matching LLaVA-Critic-R1's convention. Format is a
-    structural compliance bonus only; correctness is handled separately
-    via the strict extractor (which requires `<answer>` tag and atomic
-    inner content). No double-penalty for inner-content mismatch — that
-    surfaces naturally as a2_correctness = -1.
+    Binary {0, +1}. Two conditions must both hold for +1:
+      1. Both `<think>...</think>` and `<answer>...</answer>` present.
+      2. Inner content of `<answer>` is exactly an atomic answer for the
+         expected type (MCQ letter, integer, yes/no, etc.) — no descriptor
+         text, no prose.
+
+    Correctness extraction is more lenient (accepts `(A) descriptor`),
+    but format reward demands the clean canonical form.
 
     Args:
         a2_text: Raw A2 text.
-        answer_type: Expected answer type (unused, kept for API compat).
+        answer_type: Expected answer type.
         ground_truth: Ground truth (unused, kept for API compat).
 
     Returns:
-        +1.0 if both `<think>...</think>` and `<answer>...</answer>` are
-              present (regardless of inner content).
-         0.0 otherwise (no bonus, no penalty).
+        +1.0 if both tags present AND inner is a clean atomic answer.
+         0.0 otherwise.
     """
-    from vlm_grpo.trajectory import has_think_answer_tags
+    from vlm_grpo.trajectory import extract_from_answer_tags, has_think_answer_tags
 
-    return 1.0 if has_think_answer_tags(a2_text) else 0.0
+    if not has_think_answer_tags(a2_text):
+        return 0.0
+    inner = extract_from_answer_tags(a2_text).strip()
+    if not inner:
+        return 0.0
+    if not _is_clean_atomic_answer(inner, answer_type):
+        return 0.0
+    return 1.0
+
+
+def _is_clean_atomic_answer(inner: str, answer_type: str) -> bool:
+    """Whether `inner` is exactly an atomic answer with no extra content."""
+    if answer_type == "mcq":
+        return bool(re.match(r"^\([A-Da-d]\)$", inner) or re.match(r"^[A-Da-d]\.?$", inner))
+    if answer_type == "yesno":
+        return inner.lower().rstrip(".,;:") in ("yes", "no")
+    if answer_type == "counting":
+        return bool(re.match(r"^\d+$", inner))
+    if answer_type == "numeric":
+        num_text = inner.replace(",", "").rstrip("%")
+        try:
+            float(num_text.replace("/", "."))
+            return True
+        except ValueError:
+            return False
+    # Open-ended: any non-empty content counts as "clean"
+    return bool(inner)
 
 
 def _compute_answer_tag_only_format_reward(
     a2_text: str,
     answer_type: str,
 ) -> float:
-    """Format reward for `<answer>`-only mode: pure structural check.
+    """Format reward for `<answer>`-only mode: tag + clean atomic inner.
 
-    Binary {0, +1}. Same convention as `_compute_tag_format_reward` but
-    only requires `<answer>` (no `<think>`). Inner-content validity is
-    enforced by the strict extractor on the correctness path.
+    Binary {0, +1}. Same as `_compute_tag_format_reward` but only requires
+    `<answer>` (no `<think>`). Inner content must still be a clean atomic
+    answer for the expected type.
 
     Args:
         a2_text: Raw A2 text.
-        answer_type: Expected answer type (unused, kept for API compat).
+        answer_type: Expected answer type.
 
     Returns:
-        +1.0 if `<answer>` tag is present, 0.0 otherwise.
+        +1.0 if `<answer>` present AND inner is a clean atomic answer.
+         0.0 otherwise.
     """
-    return 1.0 if re.search(r"<answer>", a2_text, re.IGNORECASE) else 0.0
+    from vlm_grpo.trajectory import extract_from_answer_tags
+
+    if not re.search(r"<answer>", a2_text, re.IGNORECASE):
+        return 0.0
+    inner = extract_from_answer_tags(a2_text).strip()
+    if not inner:
+        return 0.0
+    if not _is_clean_atomic_answer(inner, answer_type):
+        return 0.0
+    return 1.0
 
 
 def _compute_bare_format_reward(

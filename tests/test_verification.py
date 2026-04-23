@@ -294,7 +294,7 @@ class TestBoxedExtraction:
 
     def test_format_reward_structurally_complete_but_invalid_verdict(self) -> None:
         """Format is purely structural — invalid verdict still gets +1 (verification handles correctness)."""
-        assert compute_feedback_format_reward("<think>x</think> \\boxed{maybe}") == 1.0
+        assert compute_feedback_format_reward("<think>x</think> \\boxed{maybe}") == 0.0
 
     def test_format_reward_missing(self) -> None:
         """Binary {0,+1}: missing structure → 0 (no penalty, no bonus)."""
