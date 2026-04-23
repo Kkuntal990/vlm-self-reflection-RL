@@ -214,11 +214,11 @@ spec:
         # REWARD_SHAPING_ALPHA is kept as a fallback for any path that doesn't
         # read the split knobs; it's overridden by RESPONSE_ALPHA / FEEDBACK_ALPHA.
         - name: REWARD_SHAPING_ALPHA
-          value: "5.0"
+          value: "1.0"
         - name: RESPONSE_ALPHA
-          value: "5.0"
+          value: "1.0"
         - name: FEEDBACK_ALPHA
-          value: "3.0"
+          value: "1.0"
         # Response weights: must sum to 1.0 (convex combination).
         # Per-turn split: each turn = 0.9·correctness + 0.1·format.
         # With turn weight 0.3 and no_regression 0.4:

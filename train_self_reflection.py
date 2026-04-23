@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use_ssr", action="store_true", help="Enable Selective Sample Replay (VL-Rethinker)"
     )
-    parser.add_argument("--ssr_buffer_size", type=int, default=64)
+    parser.add_argument("--ssr_buffer_size", type=int, default=256)
     parser.add_argument("--ssr_alpha", type=float, default=1.0)
     parser.add_argument(
         "--use_improvement_reward",

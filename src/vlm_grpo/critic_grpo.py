@@ -143,6 +143,10 @@ class SelfReflectionTrainStepResult:
         kl_loss: KL divergence from reference model
         response_reward_mean: Mean response reward across batch
         feedback_reward_mean: Mean feedback reward across batch
+        a1_reward_mean: Mean A1 per-turn reward (SCoRe-style). NaN when
+            separate_turn_loss is disabled.
+        a2_reward_mean: Mean A2 per-turn reward incl. shaped bonus
+            α·(r_a2-r_a1). NaN when separate_turn_loss is disabled.
         rollout_metrics: Dict of rollout statistics
         global_step: Current global training step
     """
@@ -153,6 +157,8 @@ class SelfReflectionTrainStepResult:
     kl_loss: float
     response_reward_mean: float
     feedback_reward_mean: float
+    a1_reward_mean: float
+    a2_reward_mean: float
     rollout_metrics: dict[str, float]
     global_step: int
 
@@ -171,27 +177,31 @@ class SSREntry:
     Attributes:
         sample: Original sample dict (question, image_path, etc.)
         rollout_result: Full SelfReflectionRolloutResult with K trajectories
-        fb_reward_std: Feedback reward std within this K-group
+        priority: Combined reward variance proxy for |Â| (response_std + feedback_std)
     """
 
     sample: dict
     rollout_result: Any
-    fb_reward_std: float
+    priority: float
 
 
 class SSRBuffer:
     """Selective Sample Replay buffer (VL-Rethinker, arXiv:2504.08837).
 
-    Stores K-groups with non-zero feedback reward variance and replays
-    them when the current batch has zero-variance groups, ensuring the
-    model always receives gradient signal for feedback learning.
+    Stores K-groups with non-zero reward variance (on response OR feedback)
+    and replays them to replace zero-variance groups dropped from the current
+    batch, so the policy update only sees samples with non-zero advantage
+    (matching Alg. 1 L16 of the paper: D_train = D_effective ∪ D_from_buffer
+    with zero-advantage groups excluded from D_train).
 
     Args:
-        max_size: Maximum K-groups in the buffer (FIFO eviction)
-        alpha: Exponent for priority sampling (|std|^alpha)
+        max_size: Maximum K-groups in the buffer (FIFO eviction). Paper uses
+            ~len(batch)/2; our default 256 matches for typical 512-query batches.
+        alpha: Exponent for priority sampling (|priority|^alpha). Paper/repo
+            uses linear weighting (α=1).
     """
 
-    def __init__(self, max_size: int = 64, alpha: float = 1.0) -> None:
+    def __init__(self, max_size: int = 256, alpha: float = 1.0) -> None:
         self._buffer: deque[SSREntry] = deque(maxlen=max_size)
         self.alpha = alpha
 
@@ -205,41 +215,24 @@ class SSRBuffer:
             self._buffer.append(entry)
 
     def sample(self, n: int) -> list[SSREntry]:
-        """Sample n entries WITHOUT replacement, weighted by |fb_reward_std|^alpha.
+        """Sample n entries WITH replacement, weighted by |priority|^alpha.
+
+        Matches the official VL-Rethinker replay_buffer.active_sampling
+        (np.random.choice with p=sel_p, with replacement).
 
         Args:
             n: Number of entries to sample
 
         Returns:
-            List of sampled SSREntry objects (unique)
+            List of sampled SSREntry objects (may contain duplicates)
         """
         if not self._buffer or n <= 0:
             return []
 
-        n = min(n, len(self._buffer))
         buf_list = list(self._buffer)
-        weights = [abs(e.fb_reward_std) ** self.alpha for e in buf_list]
-        total = sum(weights)
-        if total < 1e-8:
-            return random.sample(buf_list, n)
-
-        # Without-replacement weighted sampling
-        selected = []
-        available = list(range(len(buf_list)))
-        for _ in range(n):
-            remaining_w = [weights[i] for i in available]
-            r = random.random() * sum(remaining_w)
-            cumulative = 0.0
-            chosen_idx = len(available) - 1  # fallback for float rounding
-            for idx, i in enumerate(available):
-                cumulative += weights[i]
-                if r <= cumulative:
-                    chosen_idx = idx
-                    break
-            selected.append(buf_list[available[chosen_idx]])
-            available.pop(chosen_idx)
-
-        return selected
+        weights = [abs(e.priority) ** self.alpha + 1e-6 for e in buf_list]
+        # random.choices is with-replacement weighted sampling
+        return random.choices(buf_list, weights=weights, k=n)
 
     def __len__(self) -> int:
         return len(self._buffer)
@@ -424,11 +417,22 @@ class SelfReflectionGRPOTrainer:
                 pbar.update(len(batch))
 
                 if self.global_step % config.logging_steps == 0:
+                    a1_r_str = (
+                        f"{step_result.a1_reward_mean:.3f}"
+                        if not math.isnan(step_result.a1_reward_mean)
+                        else "nan"
+                    )
+                    a2_r_str = (
+                        f"{step_result.a2_reward_mean:.3f}"
+                        if not math.isnan(step_result.a2_reward_mean)
+                        else "nan"
+                    )
                     logger.info(
                         f"Step {self.global_step}: loss={step_result.loss:.4f}, "
                         f"resp_loss={step_result.response_loss:.4f}, "
                         f"fb_loss={step_result.feedback_loss:.4f}, "
                         f"resp_reward={step_result.response_reward_mean:.3f}, "
+                        f"a1_reward={a1_r_str}, a2_reward={a2_r_str}, "
                         f"fb_reward={step_result.feedback_reward_mean:.3f}, "
                         f"rw_rate={rw_rate:.3f}"
                     )
@@ -445,6 +449,8 @@ class SelfReflectionGRPOTrainer:
                         # Rewards
                         "reward/resp_mean": step_result.response_reward_mean,
                         "reward/fb_mean": step_result.feedback_reward_mean,
+                        "reward/a1_mean": step_result.a1_reward_mean,
+                        "reward/a2_mean": step_result.a2_reward_mean,
                         "reward/resp_std": step_result.rollout_metrics.get(
                             "sr/response_reward_std", 0
                         ),
@@ -668,12 +674,16 @@ class SelfReflectionGRPOTrainer:
         trajectory_data = []
         all_resp_rewards = []
         all_fb_rewards = []
+        # Track per-K-group slices into the aggregated lists so SSR can drop
+        # zero-variance groups and replace them with buffer replays (paper Alg. 1 L16).
+        group_slices: list[tuple[int, int]] = []
 
         for result in rollout_results:
             k = len(result.answer1s)
             if k == 0:
                 continue
 
+            slice_start = len(all_resp_rewards)
             all_resp_rewards.extend(result.response_rewards)
             all_fb_rewards.extend(result.feedback_rewards)
 
@@ -761,6 +771,8 @@ class SelfReflectionGRPOTrainer:
                     {"a1_full": a1_full, "f1_full": f1_full, "a2_full": a2_full, "image": image}
                 )
 
+            group_slices.append((slice_start, len(all_resp_rewards)))
+
         if not all_resp_rewards:
             self.global_step += 1
             return SelfReflectionTrainStepResult(
@@ -770,47 +782,79 @@ class SelfReflectionGRPOTrainer:
                 kl_loss=0.0,
                 response_reward_mean=0.0,
                 feedback_reward_mean=0.0,
+                a1_reward_mean=float("nan"),
+                a2_reward_mean=float("nan"),
                 rollout_metrics=rollout_metrics,
                 global_step=self.global_step,
             )
 
         k = self.config.rollout.k_samples
 
-        # SSR: store non-zero-variance K-groups, augment with replayed ones
+        # SSR (VL-Rethinker Alg. 1): drop zero-advantage K-groups and replace
+        # them with buffer replays. Priority = std(resp) + std(fb) as a proxy
+        # for |Â| (paper uses per-sample advantage; reward-std captures the
+        # same signal at group granularity for GRPO).
         if self.ssr_buffer is not None:
             import torch as _torch
 
             n_groups = len(rollout_results)
-            n_zero_var = 0
-            new_entries = []
 
+            # Identify which groups to keep (non-zero variance on either head)
+            # and which to drop (zero variance on BOTH → zero advantage → zero gradient).
+            kept_mask = []
+            new_entries = []
             for result in rollout_results:
-                fb_rews = result.feedback_rewards
-                # Only store complete K-groups (partial groups break advantage alignment)
-                if len(fb_rews) != k or len(result.response_breakdowns) != k:
+                if (
+                    len(result.response_rewards) != k
+                    or len(result.feedback_rewards) != k
+                    or len(result.response_breakdowns) != k
+                ):
+                    kept_mask.append(False)
                     continue
-                fb_std = _torch.tensor(fb_rews).std().item()
-                if fb_std > 1e-4:
-                    # Store image_path (not PIL Image) to avoid memory leak
+                resp_std = _torch.tensor(result.response_rewards).std().item()
+                fb_std = _torch.tensor(result.feedback_rewards).std().item()
+                priority = resp_std + fb_std
+                if priority > 1e-4:
+                    kept_mask.append(True)
                     sample_copy = {"image_path": result.image_path, "question": result.question}
                     new_entries.append(
                         SSREntry(
                             sample=sample_copy,
                             rollout_result=result,
-                            fb_reward_std=fb_std,
+                            priority=priority,
                         )
                     )
                 else:
-                    n_zero_var += 1
+                    kept_mask.append(False)
 
             self.ssr_buffer.store(new_entries)
 
-            # Augment: for each zero-variance group, pull one from buffer
-            if n_zero_var > 0 and len(self.ssr_buffer) > 0:
-                replayed = self.ssr_buffer.sample(n_zero_var)
+            n_dropped = sum(1 for m in kept_mask if not m)
+
+            # Rebuild aggregated lists and rollout_results keeping only
+            # non-zero-variance groups (paper: D_effective).
+            if n_dropped > 0:
+                kept_resp: list[float] = []
+                kept_fb: list[float] = []
+                kept_trajs: list[dict] = []
+                kept_rollouts: list[Any] = []
+                for keep, (s, e), result in zip(kept_mask, group_slices, rollout_results):
+                    if keep:
+                        kept_resp.extend(all_resp_rewards[s:e])
+                        kept_fb.extend(all_fb_rewards[s:e])
+                        kept_trajs.extend(trajectory_data[s:e])
+                        kept_rollouts.append(result)
+                all_resp_rewards = kept_resp
+                all_fb_rewards = kept_fb
+                trajectory_data = kept_trajs
+                rollout_results = kept_rollouts
+
+            # Augment: fill the dropped slots with buffer replays.
+            if n_dropped > 0 and len(self.ssr_buffer) > 0:
+                replayed = self.ssr_buffer.sample(n_dropped)
                 logger.info(
-                    f"  SSR: {n_zero_var}/{n_groups} zero-var fb groups, "
-                    f"replaying {len(replayed)} from buffer "
+                    f"  SSR: dropped {n_dropped}/{n_groups} zero-var groups, "
+                    f"replayed {len(replayed)} from buffer "
                     f"(size={len(self.ssr_buffer)})"
                 )
                 use_tags = self.config.rollout.use_think_answer_tags
@@ -852,6 +896,11 @@ class SelfReflectionGRPOTrainer:
                         )
 
                     rollout_results.append(rr)
+            elif n_dropped > 0:
+                logger.info(
+                    f"  SSR: dropped {n_dropped}/{n_groups} zero-var groups, "
+                    f"buffer empty — no replay yet"
+                )
 
         # Step 3: Group-relative advantages (computed once, frozen)
         resp_rewards_t = torch.tensor(all_resp_rewards, device=self.device)
@@ -870,10 +919,9 @@ class SelfReflectionGRPOTrainer:
             a2_rewards_list = []
             for result in rollout_results:
                 for rb in result.response_breakdowns:
-                    a1_r = (
-                        rb.weighted_components.get("a1_correctness", 0.0)
-                        + rb.weighted_components.get("a1_format", 0.0)
-                    )
+                    a1_r = rb.weighted_components.get(
+                        "a1_correctness", 0.0
+                    ) + rb.weighted_components.get("a1_format", 0.0)
                     a2_r = (
                         rb.weighted_components.get("a2_correctness", 0.0)
                         + rb.weighted_components.get("a2_format", 0.0)
@@ -890,6 +938,8 @@ class SelfReflectionGRPOTrainer:
         else:
             a1_advantages = None
             a2_advantages = None
+            a1_rewards_t = None
+            a2_rewards_t = None
             resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
 
         fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
@@ -1081,12 +1131,31 @@ class SelfReflectionGRPOTrainer:
                         a1_clipped = torch.clamp(a1_ratio, 1 - clip_range, 1 + clip_range)
                         a2_clipped = torch.clamp(a2_ratio, 1 - clip_range, 1 + clip_range)
 
-                        a1_loss = -torch.min(
-                            a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]
-                        ).mean()
-                        a2_loss = -torch.min(
-                            a2_ratio * a2_advantages[ti], a2_clipped * a2_advantages[ti]
-                        ).mean()
+                        # Dr.GRPO aggregation (arXiv:2503.20783):
+                        # sum over completion tokens / max_completion_length, NOT mean.
+                        # This removes length bias — a 10-token answer contributes 10/max_len
+                        # while a 200-token answer contributes 200/max_len, so the per-token
+                        # gradient magnitude is consistent regardless of sequence length.
+                        # TRL reference: (per_token_loss * mask).sum() / (batch * max_comp_len)
+                        # Our per-sample call: sum / max_comp_len, then /n_traj below == /batch.
+                        a1_max_len = float(
+                            getattr(self.config, "a1_max_completion_length", 200) or 200
+                        )
+                        a2_max_len = float(
+                            getattr(self.config, "a2_max_completion_length", 200) or 200
+                        )
+                        a1_loss = (
+                            -torch.min(
+                                a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]
+                            ).sum()
+                            / a1_max_len
+                        )
+                        a2_loss = (
+                            -torch.min(
+                                a2_ratio * a2_advantages[ti], a2_clipped * a2_advantages[ti]
+                            ).sum()
+                            / a2_max_len
+                        )
 
                         # SCoRe Stage I: freeze A1 policy loss for initial steps.
                         # A1 KL anchor is kept (computed separately below) so A1
@@ -1105,7 +1174,7 @@ class SelfReflectionGRPOTrainer:
                             (resp_ratio_combined != resp_clipped_combined).sum().item()
                         )
                     else:
-                        # Original: joint A1+A2 response loss
+                        # Original: joint A1+A2 response loss (Dr.GRPO sum / max_len)
                         resp_new = torch.cat([mb_a1_lps[j], mb_a2_lps[j]])
                         resp_ratio_raw = torch.nan_to_num(
                             resp_new - old_resp_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0
@@ -1115,12 +1184,15 @@ class SelfReflectionGRPOTrainer:
                         resp_clipped_ratio = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
                         resp_surr1 = resp_ratio * resp_advantages[ti]
                         resp_surr2 = resp_clipped_ratio * resp_advantages[ti]
-                        traj_resp_loss = -torch.min(resp_surr1, resp_surr2).mean()
+                        resp_max_len = float(
+                            getattr(self.config, "a1_max_completion_length", 200) or 200
+                        ) + float(getattr(self.config, "a2_max_completion_length", 200) or 200)
+                        traj_resp_loss = -torch.min(resp_surr1, resp_surr2).sum() / resp_max_len
 
                         self._resp_total_tokens += resp_ratio.numel()
                         self._resp_clipped_tokens += (resp_ratio != resp_clipped_ratio).sum().item()
 
-                    # Feedback: per-token clipped surrogate
+                    # Feedback: per-token clipped surrogate (Dr.GRPO sum / max_len)
                     fb_ratio_raw = torch.nan_to_num(
                         fb_new - old_fb_lps[ti].detach(), nan=0.0, posinf=20.0, neginf=-20.0
                     )
@@ -1129,7 +1201,8 @@ class SelfReflectionGRPOTrainer:
                     fb_clipped_ratio = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
                     fb_surr1 = fb_ratio * fb_advantages[ti]
                     fb_surr2 = fb_clipped_ratio * fb_advantages[ti]
-                    traj_fb_loss = -torch.min(fb_surr1, fb_surr2).mean()
+                    f1_max_len = float(getattr(self.config, "f1_max_completion_length", 512) or 512)
+                    traj_fb_loss = -torch.min(fb_surr1, fb_surr2).sum() / f1_max_len
 
                     # Track clip fraction
                     self._fb_total_tokens += fb_ratio.numel()
@@ -1282,11 +1355,23 @@ class SelfReflectionGRPOTrainer:
         # reflect the global view (matches rollout_metrics).
         resp_reward_global = resp_rewards_t.mean().item()
         fb_reward_global = fb_rewards_t.mean().item()
+        # Per-turn means (SCoRe-style), only populated when separate_turn_loss
+        if separate_turns and a1_rewards_t is not None and a2_rewards_t is not None:
+            a1_reward_global = a1_rewards_t.mean().item()
+            a2_reward_global = a2_rewards_t.mean().item()
+        else:
+            a1_reward_global = float("nan")
+            a2_reward_global = float("nan")
         if _dist_is_initialized():
             import torch as _torch
 
             vals = _torch.tensor(
-                [resp_reward_global, fb_reward_global],
+                [
+                    resp_reward_global,
+                    fb_reward_global,
+                    a1_reward_global if not math.isnan(a1_reward_global) else 0.0,
+                    a2_reward_global if not math.isnan(a2_reward_global) else 0.0,
+                ],
                 device=self.device,
                 dtype=_torch.float32,
             )
@@ -1294,6 +1379,9 @@ class SelfReflectionGRPOTrainer:
             world_size = _torch.distributed.get_world_size()
             resp_reward_global = float(vals[0].item()) / world_size
             fb_reward_global = float(vals[1].item()) / world_size
+            if separate_turns:
+                a1_reward_global = float(vals[2].item()) / world_size
+                a2_reward_global = float(vals[3].item()) / world_size
 
         return SelfReflectionTrainStepResult(
             loss=(total_resp_loss + total_fb_loss + total_kl_loss) / num_inner,
@@ -1302,6 +1390,8 @@ class SelfReflectionGRPOTrainer:
             kl_loss=total_kl_loss / num_inner,
             response_reward_mean=resp_reward_global,
             feedback_reward_mean=fb_reward_global,
+            a1_reward_mean=a1_reward_global,
+            a2_reward_mean=a2_reward_global,
             rollout_metrics=rollout_metrics,
             global_step=self.global_step,
         )

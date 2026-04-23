@@ -298,7 +298,7 @@ class SelfReflectionConfig:
     fb_kl_coeff: float = 1.0
     separate_turn_loss: bool = False
     use_ssr: bool = False
-    ssr_buffer_size: int = 64
+    ssr_buffer_size: int = 256
     ssr_alpha: float = 1.0
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
