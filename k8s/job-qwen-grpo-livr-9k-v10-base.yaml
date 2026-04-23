@@ -137,17 +137,19 @@ spec:
         - name: INNER_EPOCHS
           value: "1"
 
-        # Generation (token-cap bug fixed upstream — full 256 for F1)
+        # Generation: 512 to fit per-option reasoning + closing tags
+        # (v10 first-run analysis showed p90 A1 length ≈ 280 tokens, so 256
+        # was truncating ~15% of A1s mid-reasoning before <answer> tag).
         - name: MAX_SAMPLES
           value: "0"
         - name: MAX_COMPLETION_LENGTH
-          value: "256"
+          value: "512"
         - name: A1_MAX_COMPLETION
-          value: "256"
+          value: "512"
         - name: F1_MAX_COMPLETION
-          value: "256"
+          value: "512"
         - name: A2_MAX_COMPLETION
-          value: "256"
+          value: "512"
         - name: TEMPERATURE
           value: "1.0"
         - name: FEEDBACK_TEMPERATURE

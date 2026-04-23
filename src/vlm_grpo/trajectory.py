@@ -43,16 +43,26 @@ _MCQ_ANSWER_IS_PATTERN = re.compile(
 _YESNO_PATTERN = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 _NUMERIC_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
-# Strict patterns — match only when the WHOLE string is a clean atomic answer.
-# Used inside <answer> tags to prevent reward-hacking via prose like
-# "(B) is wrong, (A) is right" which the liberal cascade would parse as B.
+# Strict patterns — anchor the answer to position 0 of the inner content.
+# Allows trailing descriptor (e.g., "(A) Different style") because LIVR options
+# carry their text label, but rejects mid-prose hedging like
+# "(B) is wrong, (A) is right" (the leading letter would be B, mismatched to GT).
+# Trailing content must be separated by whitespace from the answer token.
 _MCQ_STRICT_ONLY_PATTERN = re.compile(
-    r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.?)\s*$"
+    r"^\s*(?:\(([A-Fa-f])\)|([A-Fa-f])\.?)(?:\s+\S.*)?\s*$",
+    re.DOTALL,
 )
-# Pure integer/decimal (with optional sign), nothing else.
-_NUMERIC_STRICT_PATTERN = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*$")
-# Exact yes/no word as the full content.
-_YESNO_STRICT_PATTERN = re.compile(r"^\s*(yes|no)\.?\s*$", re.IGNORECASE)
+# Integer/decimal (with optional sign) at position 0; trailing units allowed
+# (e.g., "6 people", "3.5 cm").
+_NUMERIC_STRICT_PATTERN = re.compile(
+    r"^\s*(-?\d+(?:\.\d+)?)(?:\s+\S.*)?\s*$",
+    re.DOTALL,
+)
+# Yes/no at position 0; trailing explanation allowed (e.g., "Yes, the answer ...").
+_YESNO_STRICT_PATTERN = re.compile(
+    r"^\s*(yes|no)[\.,;:]?(?:\s+\S.*)?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _NUMBER_WORDS: dict[str, str] = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",

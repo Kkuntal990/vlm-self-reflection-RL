@@ -866,25 +866,26 @@ def compute_response_reward_breakdown(
         a2_tags_missing = True
 
     if a2_tags_missing:
-        # Required tag(s) missing: hard short-circuit to format penalty only.
-        # -2.0 raw × w_a2_format ensures no-tag is strictly worse than the
-        # worst tagged outcome. Correctness and no_regression zeroed — no
-        # differential signal on format-violating trajectories.
+        # Required A2 tag(s) missing: zero out A2/no_regression and apply
+        # format penalty. A1's correctness reward is preserved — A1 and A2
+        # are independent completions, and zeroing A1 here would strip the
+        # first-turn anchor signal whenever A2 happens to skip the format.
         _NO_TAG_PENALTY = -2.0
+        r_a1 = 1.0 if a1_correct else -1.0
         components = {
-            "a1_correctness": 0.0,
+            "a1_correctness": r_a1,
             "a2_correctness": 0.0,
             "no_regression": 0.0,
             "a2_format": _NO_TAG_PENALTY,
         }
         weighted_components = {
-            "a1_correctness": 0.0,
+            "a1_correctness": r_a1 * weights.w_a1_correctness,
             "a2_correctness": 0.0,
             "no_regression": 0.0,
             "a2_format": _NO_TAG_PENALTY * weights.w_a2_format,
         }
         return TrajectoryResponseRewardBreakdown(
-            total_reward=_NO_TAG_PENALTY * weights.w_a2_format,
+            total_reward=sum(weighted_components.values()),
             components=components,
             weighted_components=weighted_components,
             a1_correct=a1_correct,
