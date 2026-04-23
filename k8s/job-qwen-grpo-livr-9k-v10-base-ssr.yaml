@@ -92,9 +92,9 @@ spec:
             --w_downstream ${W_DOWNSTREAM:-0.45} \
             --w_verification_accuracy ${W_VERIFICATION_ACCURACY:-0.45} \
             --w_fb_format ${W_FB_FORMAT:-0.1} \
-            --reward_shaping_alpha ${REWARD_SHAPING_ALPHA:-5.0} \
-            --response_alpha ${RESPONSE_ALPHA:--1} \
-            --feedback_alpha ${FEEDBACK_ALPHA:--1} \
+            --reward_shaping_alpha ${REWARD_SHAPING_ALPHA:-1.0} \
+            --response_alpha ${RESPONSE_ALPHA:-1.0} \
+            --feedback_alpha ${FEEDBACK_ALPHA:-1.0} \
             --freeze_a1_steps ${FREEZE_A1_STEPS:-280} \
             --use_ssr \
             --ssr_buffer_size ${SSR_BUFFER_SIZE:-256} \
@@ -212,10 +212,11 @@ spec:
         - name: FREEZE_A1_STEPS
           value: "280"
 
-        # v10: split alphas — response α=5 (A2 correction signal),
-        # feedback α=3 (dampen F1 variance + reduce over-crediting when A2 flips on its own).
-        # REWARD_SHAPING_ALPHA is kept as a fallback for any path that doesn't
-        # read the split knobs; it's overridden by RESPONSE_ALPHA / FEEDBACK_ALPHA.
+        # v10: α=1 everywhere (SCoRe paper default). With binary r_a1, r_a2
+        # in {-1,+1}, shaped term α·(r2-r1) has range ±2 → ±0.8 weighted.
+        # Larger α (e.g., 5 or 10) made transitions dominate group advantages
+        # and caused training collapse. RESPONSE_ALPHA/FEEDBACK_ALPHA override
+        # REWARD_SHAPING_ALPHA per-turn.
         - name: REWARD_SHAPING_ALPHA
           value: "1.0"
         - name: RESPONSE_ALPHA
