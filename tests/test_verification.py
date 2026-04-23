@@ -5,8 +5,8 @@ import pytest
 from vlm_grpo.config import FeedbackRewardWeights
 from vlm_grpo.prompts import (
     ANSWER_TAG_INSTRUCTION,
-    THINK_ANSWER_INSTRUCTION,
     F1_VERIFIER_INSTRUCTION,
+    THINK_ANSWER_INSTRUCTION,
     build_critic_prompt,
     build_initial_answer_prompt,
     build_prompt_with_completion,
@@ -27,44 +27,91 @@ from vlm_grpo.trajectory import extract_from_boxed, has_think_boxed
 class TestVerificationAccuracyReward:
     """Test compute_verification_accuracy_reward."""
 
-    def test_correct_a1_right(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "CORRECT. Well done.", a1_is_correct=True
-        ) == 1.0
+    def test_boxed_correct_a1_right(self) -> None:
+        assert (
+            compute_verification_accuracy_reward(
+                "<think>x</think> \\boxed{CORRECT}", a1_is_correct=True
+            )
+            == 1.0
+        )
 
-    def test_correct_a1_wrong(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "CORRECT. Looks good.", a1_is_correct=False
-        ) == -1.0
+    def test_boxed_correct_a1_wrong(self) -> None:
+        assert (
+            compute_verification_accuracy_reward(
+                "<think>x</think> \\boxed{CORRECT}", a1_is_correct=False
+            )
+            == -1.0
+        )
 
-    def test_incorrect_a1_wrong(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "INCORRECT. Should be (B).", a1_is_correct=False
-        ) == 1.0
+    def test_boxed_incorrect_a1_wrong(self) -> None:
+        assert (
+            compute_verification_accuracy_reward(
+                "<think>x</think> \\boxed{INCORRECT}", a1_is_correct=False
+            )
+            == 1.0
+        )
 
-    def test_incorrect_a1_right(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "INCORRECT. Wrong.", a1_is_correct=True
-        ) == -1.0
+    def test_boxed_incorrect_a1_right(self) -> None:
+        assert (
+            compute_verification_accuracy_reward(
+                "<think>x</think> \\boxed{INCORRECT}", a1_is_correct=True
+            )
+            == -1.0
+        )
 
-    def test_embedded_verdict(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "The answer appears incorrect", a1_is_correct=False
-        ) == 1.0
+    def test_plain_text_no_box_treated_as_wrong(self) -> None:
+        """Plain "CORRECT" without \\boxed{} → no extraction → -1 (wrong verdict)."""
+        assert (
+            compute_verification_accuracy_reward("CORRECT. Well done.", a1_is_correct=True) == -1.0
+        )
 
-    def test_no_verdict_returns_zero(self) -> None:
-        assert compute_verification_accuracy_reward(
-            "The painting shows blue tones", a1_is_correct=True
-        ) == 0.0
+    def test_embedded_verdict_in_prose_no_box(self) -> None:
+        """No keyword fallback any more: prose without \\boxed{} → -1 (wrong)."""
+        assert (
+            compute_verification_accuracy_reward(
+                "The answer appears incorrect", a1_is_correct=False
+            )
+            == -1.0
+        )
 
-    def test_empty_returns_zero(self) -> None:
-        assert compute_verification_accuracy_reward("", a1_is_correct=True) == 0.0
+    def test_no_verdict_returns_minus_one(self) -> None:
+        assert (
+            compute_verification_accuracy_reward(
+                "The painting shows blue tones", a1_is_correct=True
+            )
+            == -1.0
+        )
 
-    def test_ambiguous_both_keywords_returns_zero(self) -> None:
-        """Text containing both 'INCORRECT' and a standalone 'CORRECT' is ambiguous."""
-        assert compute_verification_accuracy_reward(
-            "INCORRECT reasoning but the answer is correct", a1_is_correct=False
-        ) == 0.0
+    def test_empty_returns_minus_one(self) -> None:
+        """Empty F1 → no boxed verdict → treat as wrong verdict."""
+        assert compute_verification_accuracy_reward("", a1_is_correct=True) == -1.0
+
+    def test_no_box_with_keywords_still_minus_one(self) -> None:
+        """Keyword fallback removed: 'incorrect' in prose without \\boxed{} → -1."""
+        assert (
+            compute_verification_accuracy_reward(
+                "INCORRECT reasoning but the answer is correct", a1_is_correct=False
+            )
+            == -1.0
+        )
+
+    def test_box_lowercase_correct(self) -> None:
+        """Boxed verdict is case-insensitive via .upper()."""
+        assert (
+            compute_verification_accuracy_reward(
+                "<think>x</think> \\boxed{Correct}", a1_is_correct=True
+            )
+            == 1.0
+        )
+
+    def test_box_unparseable_verdict_returns_minus_one(self) -> None:
+        """\\boxed{(A)} (not CORRECT/INCORRECT) → wrong verdict."""
+        assert (
+            compute_verification_accuracy_reward(
+                "<think>x</think> \\boxed{(A)}", a1_is_correct=True
+            )
+            == -1.0
+        )
 
 
 # =============================================================================
@@ -78,9 +125,7 @@ class TestFeedbackBreakdown:
     @pytest.fixture()
     def weights(self) -> FeedbackRewardWeights:
         # Use convex weights that match v10: 0.45 / 0.45 / 0.1
-        return FeedbackRewardWeights(
-            w_downstream=0.45, w_verification_accuracy=0.45, w_format=0.1
-        )
+        return FeedbackRewardWeights(w_downstream=0.45, w_verification_accuracy=0.45, w_format=0.1)
 
     def test_wr_honest_boxed(self, weights: FeedbackRewardWeights) -> None:
         """F1 says <think>...</think>\\boxed{INCORRECT} (honest on WR): full reward."""
@@ -120,12 +165,12 @@ class TestFeedbackBreakdown:
         # total = 0.45·1 + 0.45·1 + 0.1·1 = +1.0
         assert bd.total_reward == pytest.approx(1.0, abs=0.01)
 
-    def test_no_boxed_hard_shortcircuit(self, weights: FeedbackRewardWeights) -> None:
-        """Plain text verdict (no <think>, no \\boxed{}) → hard short-circuit.
+    def test_no_boxed_natural_path(self, weights: FeedbackRewardWeights) -> None:
+        """Plain text verdict (no <think>, no \\boxed{}): no short-circuit.
 
-        Matches the A1/A2 convention: missing tags collapse to format-only
-        penalty (-2.0 * w_format), with no downstream or verification credit
-        regardless of semantic content.
+        Missing \\boxed{} → verification=-1 (wrong verdict), downstream
+        gated to 0 by verification < 0, format=0 (no bonus). No special
+        sentinel, no -2.0 penalty.
         """
         bd = compute_feedback_reward_breakdown(
             feedback_text="INCORRECT. Should be (A).",
@@ -137,17 +182,14 @@ class TestFeedbackBreakdown:
             weights=weights,
             reward_shaping_alpha=5.0,
         )
-        # Short-circuit: downstream=0, verification=0, format=-2.
-        assert bd.components["downstream"] == 0.0
-        assert bd.components["verification"] == 0.0
-        assert bd.components["format"] == -2.0
-        # total = 0.45·0 + 0.45·0 + 0.1·(-2) = -0.2
-        assert bd.total_reward == pytest.approx(-0.2, abs=0.01)
+        assert bd.components["verification"] == -1.0
+        assert bd.components["downstream"] == 0.0  # gated by verification < 0
+        assert bd.components["format"] == 0.0
+        # total = 0.45·0 + 0.45·(-1) + 0.1·0 = -0.45
+        assert bd.total_reward == pytest.approx(-0.45, abs=0.01)
 
-    def test_partial_format_no_boxed_shortcircuits(
-        self, weights: FeedbackRewardWeights
-    ) -> None:
-        """<think>...</think> without \\boxed{} → short-circuit (tags missing)."""
+    def test_partial_format_no_boxed_natural(self, weights: FeedbackRewardWeights) -> None:
+        """<think>...</think> without \\boxed{} → verification=-1, format=0."""
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>reasoning</think> INCORRECT",
             a1_text="ZZZ_WRONG",
@@ -158,13 +200,13 @@ class TestFeedbackBreakdown:
             weights=weights,
             reward_shaping_alpha=5.0,
         )
-        assert bd.components["format"] == -2.0
-        assert bd.total_reward == pytest.approx(-0.2, abs=0.01)
+        assert bd.components["verification"] == -1.0
+        assert bd.components["downstream"] == 0.0
+        assert bd.components["format"] == 0.0
+        assert bd.total_reward == pytest.approx(-0.45, abs=0.01)
 
-    def test_partial_format_no_think_shortcircuits(
-        self, weights: FeedbackRewardWeights
-    ) -> None:
-        """\\boxed{INCORRECT} without <think> → short-circuit (tags missing)."""
+    def test_boxed_only_no_think(self, weights: FeedbackRewardWeights) -> None:
+        """\\boxed{INCORRECT} without <think>: verification credit, no format bonus."""
         bd = compute_feedback_reward_breakdown(
             feedback_text="\\boxed{INCORRECT}",
             a1_text="ZZZ_WRONG",
@@ -175,8 +217,14 @@ class TestFeedbackBreakdown:
             weights=weights,
             reward_shaping_alpha=5.0,
         )
-        assert bd.components["format"] == -2.0
-        assert bd.total_reward == pytest.approx(-0.2, abs=0.01)
+        # boxed extraction works → verdict=INCORRECT matches A1 wrong → +1
+        # downstream gate passes (verification > 0) → r_downstream = 11 (WR)
+        # format = 0 (missing <think>)
+        assert bd.components["verification"] == 1.0
+        assert bd.components["downstream"] == pytest.approx(11.0, abs=0.01)
+        assert bd.components["format"] == 0.0
+        # total = 0.45·11 + 0.45·1 + 0.1·0 = 5.4
+        assert bd.total_reward == pytest.approx(5.4, abs=0.01)
 
     def test_ww_miscalibrated_gated(self, weights: FeedbackRewardWeights) -> None:
         """F1 says CORRECT but A1 wrong → downstream gated to 0."""
@@ -190,7 +238,7 @@ class TestFeedbackBreakdown:
             weights=weights,
             reward_shaping_alpha=5.0,
         )
-        # downstream: gated to 0 (r_verification < 0)
+        # downstream: gated to 0 (r_verification ≤ 0)
         # verification: CORRECT when A1 wrong → -1.0
         # format: has think and boxed → +1
         assert bd.components["downstream"] == 0.0
@@ -199,9 +247,7 @@ class TestFeedbackBreakdown:
         # total = 0.45·0 + 0.45·(-1) + 0.1·(+1) = -0.35
         assert bd.total_reward == pytest.approx(-0.35, abs=0.01)
 
-    def test_wr_miscalibrated_downstream_gated(
-        self, weights: FeedbackRewardWeights
-    ) -> None:
+    def test_wr_miscalibrated_downstream_gated(self, weights: FeedbackRewardWeights) -> None:
         """F1 says CORRECT but A1 wrong, A2 variance-corrected — gate kills downstream credit."""
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>(B) looks right.</think> \\boxed{CORRECT}",
@@ -246,15 +292,16 @@ class TestBoxedExtraction:
     def test_format_reward_valid(self) -> None:
         assert compute_feedback_format_reward("<think>x</think> \\boxed{CORRECT}") == 1.0
 
-    def test_format_reward_partial(self) -> None:
-        # Tags+boxed present but verdict inside boxed is invalid
-        assert compute_feedback_format_reward("<think>x</think> \\boxed{maybe}") == 0.0
+    def test_format_reward_structurally_complete_but_invalid_verdict(self) -> None:
+        """Format is purely structural — invalid verdict still gets +1 (verification handles correctness)."""
+        assert compute_feedback_format_reward("<think>x</think> \\boxed{maybe}") == 1.0
 
     def test_format_reward_missing(self) -> None:
-        assert compute_feedback_format_reward("INCORRECT plain text") == -1.0
+        """Binary {0,+1}: missing structure → 0 (no penalty, no bonus)."""
+        assert compute_feedback_format_reward("INCORRECT plain text") == 0.0
 
-    def test_verification_prefers_boxed_over_keyword(self) -> None:
-        # F1 text says 'correct' in prose but boxes INCORRECT — boxed wins.
+    def test_verification_only_uses_boxed(self) -> None:
+        # F1 text says 'correct' in prose but boxes INCORRECT — boxed is the only signal.
         verdict = "<think>It might seem correct but I disagree.</think> \\boxed{INCORRECT}"
         assert compute_verification_accuracy_reward(verdict, a1_is_correct=False) == 1.0
 

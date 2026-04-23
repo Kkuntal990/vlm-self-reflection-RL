@@ -209,4 +209,3 @@ class TestComputeRolloutMetrics:
         metrics = compute_rollout_metrics(results)
         assert metrics["rollout/rr_rate"] == 0.5
         assert metrics["rollout/rw_rate"] == 0.5
-

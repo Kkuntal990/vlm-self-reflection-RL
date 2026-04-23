@@ -37,6 +37,7 @@ Usage:
                               "INCORRECT. The bear is brown.",
                               use_answer_tag_only=True)
 """
+
 import os
 
 
@@ -174,11 +175,7 @@ def build_critic_prompt(
     Returns:
         One-element message list containing a single user turn.
     """
-    text = (
-        f"Question: {question}\n"
-        f"Candidate answer: {answer1}\n\n"
-        f"{F1_VERIFIER_INSTRUCTION}"
-    )
+    text = f"Question: {question}\nCandidate answer: {answer1}\n\n{F1_VERIFIER_INSTRUCTION}"
     return _user_message_with_image(text)
 
 

@@ -597,10 +597,10 @@ def compute_self_reflection_metrics(
     ww_count = 0
     resp_reward_sum = 0.0
     fb_reward_sum = 0.0
-    # Format-violation counters. Detected via the short-circuit sentinel
-    # `components[...] == -2.0` that only the hard-short-circuit path emits.
-    # Helps disambiguate "model refused to correct" from "model refused to
-    # follow tag format" in wandb dashboards.
+    # Format-violation counters. With binary {0, +1} format rewards, a
+    # value of 0 means the required tags were missing. Helps disambiguate
+    # "model refused to correct" from "model refused to follow tag format"
+    # in wandb dashboards.
     a2_fmt_violation_count = 0
     fb_fmt_violation_count = 0
 
@@ -623,11 +623,10 @@ def compute_self_reflection_metrics(
                 else:
                     ww_count += 1
 
-            # Short-circuit sentinel: raw format component equals -2.0 only
-            # when the hard-short-circuit path fires (missing required tags).
-            if resp_bd.components.get("a2_format", 0.0) == -2.0:
+            # Binary format reward: 0 means tags missing, +1 means present.
+            if resp_bd.components.get("a2_format", 1.0) == 0.0:
                 a2_fmt_violation_count += 1
-            if fb_bd.components.get("format", 0.0) == -2.0:
+            if fb_bd.components.get("format", 1.0) == 0.0:
                 fb_fmt_violation_count += 1
 
     a2_correct_count = rr_count + wr_count

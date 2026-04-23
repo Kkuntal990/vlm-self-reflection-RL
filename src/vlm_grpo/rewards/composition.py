@@ -176,67 +176,49 @@ def compute_verification_accuracy_reward(
 ) -> float:
     """R_verification: does F1's verdict match A1's actual correctness?
 
-    Primary path: extract verdict from `\\boxed{...}` (LLaVA-Critic-R1 style,
-    deterministic).  Fallback: keyword scan on the full text — handles
-    early training before the model learns the boxed format.
+    Verdict is extracted ONLY from `\\boxed{...}` (LLaVA-Critic-R1 style).
+    Missing boxed → -1 (treat as wrong verdict). No keyword-fallback on
+    `<think>` prose — that path was a noise source (~3% of trajectories
+    inherited a verdict from think text rather than the explicit boxed
+    output).
 
     Args:
         feedback_text: Verification output from the model
         a1_is_correct: Whether A1 was actually correct
 
     Returns:
-        +1.0 if classification matches ground truth,
-        -1.0 if classification contradicts ground truth,
-        0.0 if verdict cannot be determined
+        +1.0 if boxed verdict matches A1 truth,
+        -1.0 if boxed verdict contradicts A1 truth, or boxed verdict is
+              missing/unparseable (treat as wrong verdict).
     """
     from vlm_grpo.trajectory import extract_from_boxed
 
-    # Primary: boxed verdict (deterministic).
     boxed = extract_from_boxed(feedback_text).upper()
     if boxed == "INCORRECT":
         return 1.0 if not a1_is_correct else -1.0
     if boxed == "CORRECT":
         return 1.0 if a1_is_correct else -1.0
-
-    # Fallback: keyword scan on raw text.
-    upper = feedback_text.upper()
-    if not upper.strip():
-        return 0.0
-    if "INCORRECT" in upper:
-        # Reject ambiguous text that also asserts a standalone "CORRECT".
-        standalone_correct = re.search(r"(?<!IN)CORRECT", upper)
-        if not standalone_correct:
-            return 1.0 if not a1_is_correct else -1.0
-        return 0.0
-    if "CORRECT" in upper:
-        return 1.0 if a1_is_correct else -1.0
-    return 0.0
+    # Missing or unparseable boxed verdict → wrong (no extraction → wrong answer).
+    return -1.0
 
 
 def compute_feedback_format_reward(feedback_text: str) -> float:
-    """R_fb_format: does F1 follow the `<think>...</think> \\boxed{VERDICT}` format?
+    """R_fb_format: binary format check for F1.
 
-    Mirrors LLaVA-Critic-R1's format reward (arXiv:2509.00676) but with
-    {+1, 0, -1} instead of {1, 0} so non-compliance carries a penalty
-    (matches the response-format-reward convention in this pipeline).
+    Matches LLaVA-Critic-R1's binary {0, +1} convention (arXiv:2509.00676):
+    purely a structural compliance bonus, no negative penalty. Verdict
+    correctness is handled by R_verification, not by the format reward.
 
     Args:
         feedback_text: Raw F1 output
 
     Returns:
-        +1.0 if structure is valid AND boxed content is CORRECT/INCORRECT,
-         0.0 if both tags+boxed present but boxed verdict is invalid (e.g.
-             `\\boxed{maybe}`),
-        -1.0 if think or boxed is missing entirely.
+        +1.0 if `<think>...</think>...\\boxed{...}` structure is present.
+         0.0 otherwise (no penalty, just no bonus).
     """
-    from vlm_grpo.trajectory import extract_from_boxed, has_think_boxed
+    from vlm_grpo.trajectory import has_think_boxed
 
-    if not has_think_boxed(feedback_text):
-        return -1.0
-    verdict = extract_from_boxed(feedback_text).upper()
-    if verdict in ("CORRECT", "INCORRECT"):
-        return 1.0
-    return 0.0
+    return 1.0 if has_think_boxed(feedback_text) else 0.0
 
 
 def compute_critic_reward_breakdown(
@@ -496,100 +478,47 @@ def _compute_tag_format_reward(
     answer_type: str,
     ground_truth: str = "",
 ) -> float:
-    """Format reward for tag mode: check <think>+<answer> structure.
+    """Format reward for A2 tag mode: pure structural check.
 
-    Wider range than bare mode to provide positive incentive for tags:
-        Both tags + valid inner answer → +0.5  (positive reward for compliance)
-        Tags present but inner answer invalid → -0.5  (partial credit)
-        Tags missing entirely → -1.0  (penalty)
-
-    With w_a2_format=0.5, this gives a 0.75 weighted swing (+0.25 to -0.5),
-    meaningful against the ~10-point total response reward range.
+    Binary {0, +1} matching LLaVA-Critic-R1's convention. Format is a
+    structural compliance bonus only; correctness is handled separately
+    via the strict extractor (which requires `<answer>` tag and atomic
+    inner content). No double-penalty for inner-content mismatch — that
+    surfaces naturally as a2_correctness = -1.
 
     Args:
         a2_text: Raw A2 text.
-        answer_type: Expected answer type.
+        answer_type: Expected answer type (unused, kept for API compat).
         ground_truth: Ground truth (unused, kept for API compat).
 
     Returns:
-        +0.5 if fully compliant, -0.5 if tags present but answer invalid,
-        -1.0 if tags missing.
+        +1.0 if both `<think>...</think>` and `<answer>...</answer>` are
+              present (regardless of inner content).
+         0.0 otherwise (no bonus, no penalty).
     """
-    from vlm_grpo.trajectory import extract_from_answer_tags, has_think_answer_tags
+    from vlm_grpo.trajectory import has_think_answer_tags
 
-    if not has_think_answer_tags(a2_text):
-        return -1.0
-
-    # Tags present — check inner answer content STRICTLY (raw, not normalized)
-    inner = extract_from_answer_tags(a2_text).strip()
-
-    if not inner:
-        return -0.5
-
-    if answer_type == "mcq":
-        # Strict: must be (A) format — letter in parentheses
-        if not re.match(r"^\([A-Da-d]\)$", inner):
-            return -0.5
-    elif answer_type == "yesno":
-        if inner.lower() not in ("yes", "no"):
-            return -0.5
-    elif answer_type == "counting":
-        # Strict: must be a bare integer like "6"
-        if not re.match(r"^\d+$", inner):
-            return -0.5
-    elif answer_type == "numeric":
-        num_text = inner.replace(",", "")
-        try:
-            float(num_text.rstrip("%").replace("/", "."))
-        except ValueError:
-            return -0.5
-
-    return 0.5
+    return 1.0 if has_think_answer_tags(a2_text) else 0.0
 
 
 def _compute_answer_tag_only_format_reward(
     a2_text: str,
     answer_type: str,
 ) -> float:
-    """Format reward for answer-tag-only mode. Binary: 1.0 or 0.0.
+    """Format reward for `<answer>`-only mode: pure structural check.
 
-    Following DeepSeek-R1 / Open-R1 convention: simple binary format check.
-    1.0 if <answer> tag present with strictly valid content, 0.0 otherwise.
+    Binary {0, +1}. Same convention as `_compute_tag_format_reward` but
+    only requires `<answer>` (no `<think>`). Inner-content validity is
+    enforced by the strict extractor on the correctness path.
 
     Args:
         a2_text: Raw A2 text.
-        answer_type: Expected answer type.
+        answer_type: Expected answer type (unused, kept for API compat).
 
     Returns:
-        1.0 if <answer> present with valid content, 0.0 otherwise.
+        +1.0 if `<answer>` tag is present, 0.0 otherwise.
     """
-    from vlm_grpo.trajectory import extract_from_answer_tags
-
-    # No <answer> tag → 0
-    if not re.search(r"<answer>", a2_text, re.IGNORECASE):
-        return 0.0
-
-    # Tag present — check inner content strictly
-    inner = extract_from_answer_tags(a2_text).strip()
-    if not inner:
-        return 0.0
-
-    if answer_type == "mcq":
-        if not re.match(r"^\([A-Da-d]\)$", inner):
-            return 0.0
-    elif answer_type == "yesno":
-        if inner.lower() not in ("yes", "no"):
-            return 0.0
-    elif answer_type == "counting":
-        if not re.match(r"^\d+$", inner):
-            return 0.0
-    elif answer_type == "numeric":
-        try:
-            float(inner.replace(",", "").rstrip("%").replace("/", "."))
-        except ValueError:
-            return 0.0
-
-    return 1.0
+    return 1.0 if re.search(r"<answer>", a2_text, re.IGNORECASE) else 0.0
 
 
 def _compute_bare_format_reward(
@@ -842,80 +771,33 @@ def compute_response_reward_breakdown(
     Returns:
         TrajectoryResponseRewardBreakdown with all component scores
     """
-    # Strict extraction for correctness when tag mode is active.
-    # Prevents reward-hacking via prose like "(B) is wrong, (A) is right"
-    # inside <answer> tags (the liberal cascade picks "B" via first-match).
-    # Matches EasyR1 / VeRL-DAPO / LLaVA-Critic-R1 convention
-    # (hard-require tag + strict atomic extraction).
+    # In tag mode, strict extraction requires <answer> tag presence.
+    # Missing tag → extracted="" → MatchResult.is_correct=False naturally,
+    # so the correctness path handles "no extractable answer" without any
+    # special short-circuit. Format reward is independent and binary.
     tag_mode = use_think_answer_tags or use_answer_tag_only
 
-    # Verify A1 with strict extraction when tag mode active.
     a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=tag_mode)
     a1_correct = a1_result.is_correct
 
-    # Check tag presence on A2. Short-circuit to penalty-only when required
-    # tags are missing — ensures the model cannot earn correctness credit
-    # for format-violating outputs (reward noise mitigation).
-    a2_has_answer_tag = bool(re.search(r"<answer>", a2_text, re.IGNORECASE))
-    a2_has_think_tag = bool(re.search(r"<think>", a2_text, re.IGNORECASE))
+    a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
+    a2_correct = a2_result.is_correct
 
-    a2_tags_missing = False
-    if use_answer_tag_only and not a2_has_answer_tag:
-        a2_tags_missing = True
-    elif use_think_answer_tags and (not a2_has_think_tag or not a2_has_answer_tag):
-        a2_tags_missing = True
+    # Format reward — pure structural check (binary {0, +1}).
+    r_a2_format = _compute_refiner_format_reward(
+        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+    )
+    a2_format_valid = r_a2_format > 0
 
-    if a2_tags_missing:
-        # Required A2 tag(s) missing: zero out A2/no_regression and apply
-        # format penalty. A1's correctness reward is preserved — A1 and A2
-        # are independent completions, and zeroing A1 here would strip the
-        # first-turn anchor signal whenever A2 happens to skip the format.
-        _NO_TAG_PENALTY = -2.0
-        r_a1 = 1.0 if a1_correct else -1.0
-        components = {
-            "a1_correctness": r_a1,
-            "a2_correctness": 0.0,
-            "no_regression": 0.0,
-            "a2_format": _NO_TAG_PENALTY,
-        }
-        weighted_components = {
-            "a1_correctness": r_a1 * weights.w_a1_correctness,
-            "a2_correctness": 0.0,
-            "no_regression": 0.0,
-            "a2_format": _NO_TAG_PENALTY * weights.w_a2_format,
-        }
-        return TrajectoryResponseRewardBreakdown(
-            total_reward=sum(weighted_components.values()),
-            components=components,
-            weighted_components=weighted_components,
-            a1_correct=a1_correct,
-            a2_correct=False,
-            a2_extracted="",
-            a2_format_valid=False,
-        )
+    # Extract A2 for display (uses same strictness/tag-requirement as scoring)
+    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=tag_mode)
+
+    # A1 / A2 correctness rewards
+    r_a1 = 1.0 if a1_correct else -1.0
+    if answer_type in ("counting", "open") and a2_result.score is not None:
+        r_a2 = 2.0 * a2_result.score - 1.0
     else:
-        a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
-        a2_correct = a2_result.is_correct
-
-        # Format reward
-        r_a2_format = _compute_refiner_format_reward(
-            a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-        )
-        a2_format_valid = r_a2_format > 0
-
-        # Extract A2 for display
-        a2_extracted = extract_answer_from_text(
-            a2_text, answer_type, choices, require_answer_tag=use_answer_tag_only
-        )
-
-        # A1 correctness reward
-        r_a1 = 1.0 if a1_correct else -1.0
-
-        # A2 correctness reward
-        if answer_type in ("counting", "open") and a2_result.score is not None:
-            r_a2 = 2.0 * a2_result.score - 1.0
-        else:
-            r_a2 = 1.0 if a2_correct else -1.0
+        r_a2 = 1.0 if a2_correct else -1.0
 
     # No-regression / improvement reward for A2.
     # When reward_shaping_alpha > 0: use shaped improvement term α*(R(A2)-R(A1)).
@@ -1001,33 +883,15 @@ def compute_feedback_reward_breakdown(
     a1_correct = a1_result.is_correct
     a2_correct = a2_result.is_correct
 
-    # Hard short-circuit on missing F1 format tags.
-    # Matches the A1/A2 short-circuit convention: if the critic does not
-    # emit `<think>...</think> \boxed{VERDICT}`, collapse to a format-only
-    # penalty with no downstream or verification credit. Prevents the
-    # keyword-fallback path from rewarding format-violating F1s that still
-    # happen to contain the CORRECT/INCORRECT word.
-    from vlm_grpo.trajectory import has_think_boxed
+    # No short-circuit on missing F1 format tags. Missing `\boxed{}` is
+    # handled naturally:
+    #   - verification_reward returns -1 (treat as wrong verdict)
+    #   - downstream is gated by `r_verification > 0`, so it becomes 0
+    #   - format_reward returns 0 (no bonus for missing structure)
+    # The natural extraction path produces the same "no credit" outcome
+    # that the short-circuit used to enforce, without the large -2.0
+    # sentinel that created an inverted gradient vs tagged-wrong F1s.
 
-    if not has_think_boxed(feedback_text):
-        _NO_TAG_PENALTY = -2.0
-        components = {
-            "downstream": 0.0,
-            "verification": 0.0,
-            "format": _NO_TAG_PENALTY,
-        }
-        weighted_components = {
-            "downstream": 0.0,
-            "verification": 0.0,
-            "format": _NO_TAG_PENALTY * weights.w_format,
-        }
-        return TrajectoryFeedbackRewardBreakdown(
-            total_reward=_NO_TAG_PENALTY * weights.w_format,
-            components=components,
-            weighted_components=weighted_components,
-        )
-
-    # Downstream-aware reward
     from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
 
     if not feedback_text.strip():

@@ -7,7 +7,6 @@ Tests cover all realistic Qwen2.5-VL output patterns:
 - Correctness matching: deterministic matching for MCQ and counting
 """
 
-
 from vlm_grpo.rewards.composition import (
     _compute_tag_format_reward,
 )
@@ -326,23 +325,25 @@ class TestMCQEndToEnd:
     # --- Perfect format: <think>...<answer>(X)</answer> ---
 
     def test_perfect_format_correct(self) -> None:
-        text = "<think>The second image matches the Impressionist style.</think><answer>(A)</answer>"
+        text = (
+            "<think>The second image matches the Impressionist style.</think><answer>(A)</answer>"
+        )
         assert extract_answer_from_text(text, "mcq") == "A"
         extracted = normalize_answer(extract_from_answer_tags(text))
         assert match_answer(extracted, "a", "mcq") is True
-        assert _compute_tag_format_reward(text, "mcq") == 0.5
+        assert _compute_tag_format_reward(text, "mcq") == 1.0
 
     def test_perfect_format_wrong(self) -> None:
         text = "<think>I think it's the third image.</think><answer>(B)</answer>"
         assert extract_answer_from_text(text, "mcq") == "B"
         extracted = normalize_answer(extract_from_answer_tags(text))
         assert match_answer(extracted, "a", "mcq") is False
-        assert _compute_tag_format_reward(text, "mcq") == 0.5  # format is fine
+        assert _compute_tag_format_reward(text, "mcq") == 1.0  # format is fine
 
     def test_perfect_format_lowercase(self) -> None:
         text = "<think>reason</think><answer>(a)</answer>"
         assert extract_answer_from_text(text, "mcq") == "A"
-        assert _compute_tag_format_reward(text, "mcq") == 0.5
+        assert _compute_tag_format_reward(text, "mcq") == 1.0
 
     # --- Tags present but bad content inside <answer> ---
 
@@ -350,59 +351,65 @@ class TestMCQEndToEnd:
         """<answer>A</answer> — missing parentheses."""
         text = "<think>reason</think><answer>A</answer>"
         assert extract_answer_from_text(text, "mcq") == "A"  # extraction works
-        assert _compute_tag_format_reward(text, "mcq") == -0.5  # format fails
+        assert (
+            _compute_tag_format_reward(text, "mcq") == 1.0
+        )  # binary {0,+1} — both tags present  # format fails
 
     def test_tags_letter_dot_text_inside(self) -> None:
         """<answer>A. the second image</answer> — verbose."""
         text = "<think>reason</think><answer>A. the second image</answer>"
         assert extract_answer_from_text(text, "mcq") == "A"  # extraction works
-        assert _compute_tag_format_reward(text, "mcq") == -0.5  # format fails
+        assert (
+            _compute_tag_format_reward(text, "mcq") == 1.0
+        )  # binary {0,+1} — both tags present  # format fails
 
     def test_tags_full_sentence_inside(self) -> None:
         """<answer>The answer is (B)</answer> — sentence."""
         text = "<think>reason</think><answer>The answer is (B)</answer>"
         assert extract_answer_from_text(text, "mcq") == "B"  # extraction works
-        assert _compute_tag_format_reward(text, "mcq") == -0.5  # format fails
+        assert (
+            _compute_tag_format_reward(text, "mcq") == 1.0
+        )  # binary {0,+1} — both tags present  # format fails
 
     def test_tags_letter_with_period(self) -> None:
         """<answer>A.</answer> — letter with period."""
         text = "<think>reason</think><answer>A.</answer>"
         assert extract_answer_from_text(text, "mcq") == "A"
-        assert _compute_tag_format_reward(text, "mcq") == -0.5
+        assert _compute_tag_format_reward(text, "mcq") == 1.0  # binary {0,+1} — both tags present
 
     def test_tags_empty_answer(self) -> None:
         """<answer></answer> — empty."""
         text = "<think>reason</think><answer></answer>"
         assert extract_answer_from_text(text, "mcq") == ""
-        assert _compute_tag_format_reward(text, "mcq") == -0.5
+        assert _compute_tag_format_reward(text, "mcq") == 1.0  # binary {0,+1} — both tags present
 
     # --- No tags at all ---
 
     def test_no_tags_bare_letter(self) -> None:
         text = "A"
         assert extract_answer_from_text(text, "mcq") == "A"
-        assert _compute_tag_format_reward(text, "mcq") == -1.0
+        assert _compute_tag_format_reward(text, "mcq") == 0.0
 
     def test_no_tags_paren_letter(self) -> None:
         text = "(B)"
         assert extract_answer_from_text(text, "mcq") == "B"
-        assert _compute_tag_format_reward(text, "mcq") == -1.0
+        assert _compute_tag_format_reward(text, "mcq") == 0.0
 
     def test_no_tags_verbose_response(self) -> None:
         """Long verbose response like base model outputs."""
         text = "To solve this pattern recognition problem, let's analyze the sequence of images presented. The correct answer is (C)."
         assert extract_answer_from_text(text, "mcq") == "C"
-        assert _compute_tag_format_reward(text, "mcq") == -1.0
+        assert _compute_tag_format_reward(text, "mcq") == 0.0
 
     def test_no_tags_answer_is_pattern(self) -> None:
         text = "The answer is B"
         assert extract_answer_from_text(text, "mcq") == "B"
-        assert _compute_tag_format_reward(text, "mcq") == -1.0
+        assert _compute_tag_format_reward(text, "mcq") == 0.0
 
     def test_no_tags_letter_dot_with_text(self) -> None:
         text = "A. the second image"
         assert extract_answer_from_text(text, "mcq") == "A"
-        assert _compute_tag_format_reward(text, "mcq") == -1.0
+        assert _compute_tag_format_reward(text, "mcq") == 0.0
 
     # --- Edge cases ---
 
@@ -410,19 +417,19 @@ class TestMCQEndToEnd:
         """<think> present but no <answer> tag."""
         text = "<think>I see the pattern</think>The answer is (A)"
         assert extract_answer_from_text(text, "mcq") == "A"
-        assert _compute_tag_format_reward(text, "mcq") == -1.0
+        assert _compute_tag_format_reward(text, "mcq") == 0.0
 
     def test_answer_tag_only_no_think(self) -> None:
         """<answer> present but no <think> tag."""
         text = "<answer>(A)</answer>"
         assert extract_answer_from_text(text, "mcq") == "A"
-        assert _compute_tag_format_reward(text, "mcq") == -1.0  # needs both tags
+        assert _compute_tag_format_reward(text, "mcq") == 0.0  # needs both tags
 
     def test_multiple_letters_in_reasoning(self) -> None:
         """Think section mentions multiple letters but answer is clear."""
         text = "<think>Option A shows realism, B shows impressionism. B matches.</think><answer>(B)</answer>"
         assert extract_answer_from_text(text, "mcq") == "B"
-        assert _compute_tag_format_reward(text, "mcq") == 0.5
+        assert _compute_tag_format_reward(text, "mcq") == 1.0
 
 
 class TestCountingEndToEnd:
@@ -440,19 +447,19 @@ class TestCountingEndToEnd:
         text = "<think>I count 6 people in the image.</think><answer>6</answer>"
         assert extract_answer_from_text(text, "counting") == "6"
         assert match_answer("6", "6", "counting") is True
-        assert _compute_tag_format_reward(text, "counting") == 0.5
+        assert _compute_tag_format_reward(text, "counting") == 1.0
 
     def test_perfect_format_wrong(self) -> None:
         text = "<think>I see 5 people.</think><answer>5</answer>"
         assert extract_answer_from_text(text, "counting") == "5"
         assert match_answer("5", "6", "counting") is False
-        assert _compute_tag_format_reward(text, "counting") == 0.5  # format fine
+        assert _compute_tag_format_reward(text, "counting") == 1.0  # format fine
 
     def test_perfect_format_two_digit(self) -> None:
         text = "<think>There are 10 birds.</think><answer>10</answer>"
         assert extract_answer_from_text(text, "counting") == "10"
         assert match_answer("10", "10", "counting") is True
-        assert _compute_tag_format_reward(text, "counting") == 0.5
+        assert _compute_tag_format_reward(text, "counting") == 1.0
 
     # --- Tags present but bad content inside <answer> ---
 
@@ -460,60 +467,72 @@ class TestCountingEndToEnd:
         """<answer>six</answer> — word instead of digit."""
         text = "<think>I count six people.</think><answer>six</answer>"
         assert extract_answer_from_text(text, "counting") == "6"  # extraction works
-        assert _compute_tag_format_reward(text, "counting") == -0.5  # format fails
+        assert (
+            _compute_tag_format_reward(text, "counting") == 1.0
+        )  # binary {0,+1} — both tags present  # format fails
 
     def test_tags_number_with_text_inside(self) -> None:
         """<answer>6 people</answer> — extra text."""
         text = "<think>reason</think><answer>6 people</answer>"
         assert extract_answer_from_text(text, "counting") == "6"  # extraction works
-        assert _compute_tag_format_reward(text, "counting") == -0.5  # format fails
+        assert (
+            _compute_tag_format_reward(text, "counting") == 1.0
+        )  # binary {0,+1} — both tags present  # format fails
 
     def test_tags_sentence_inside(self) -> None:
         """<answer>The count is 6</answer> — sentence."""
         text = "<think>reason</think><answer>The count is 6</answer>"
         assert extract_answer_from_text(text, "counting") == "6"
-        assert _compute_tag_format_reward(text, "counting") == -0.5
+        assert (
+            _compute_tag_format_reward(text, "counting") == 1.0
+        )  # binary {0,+1} — both tags present
 
     def test_tags_float_inside(self) -> None:
         """<answer>6.0</answer> — float instead of int."""
         text = "<think>reason</think><answer>6.0</answer>"
         assert extract_answer_from_text(text, "counting") == "6.0"
-        assert _compute_tag_format_reward(text, "counting") == -0.5  # not bare int
+        assert (
+            _compute_tag_format_reward(text, "counting") == 1.0
+        )  # binary {0,+1} — both tags present  # not bare int
 
     def test_tags_empty(self) -> None:
         text = "<think>reason</think><answer></answer>"
         assert extract_answer_from_text(text, "counting") == ""
-        assert _compute_tag_format_reward(text, "counting") == -0.5
+        assert (
+            _compute_tag_format_reward(text, "counting") == 1.0
+        )  # binary {0,+1} — both tags present
 
     def test_tags_mcq_letter_inside(self) -> None:
         """<answer>(D)</answer> — model confused, outputs MCQ letter for counting."""
         text = "<think>I think 4 cups.</think><answer>(D)</answer>"
         # Tag extraction gets "(D)", numeric extraction finds no digit -> ""
         assert extract_answer_from_text(text, "counting") == ""
-        assert _compute_tag_format_reward(text, "counting") == -0.5  # (D) is not int
+        assert (
+            _compute_tag_format_reward(text, "counting") == 1.0
+        )  # binary {0,+1} — both tags present  # (D) is not int
 
     # --- No tags at all ---
 
     def test_no_tags_bare_number(self) -> None:
         text = "6"
         assert extract_answer_from_text(text, "counting") == "6"
-        assert _compute_tag_format_reward(text, "counting") == -1.0
+        assert _compute_tag_format_reward(text, "counting") == 0.0
 
     def test_no_tags_prose_with_number(self) -> None:
         text = "The count is 6."
         assert extract_answer_from_text(text, "counting") == "6"
-        assert _compute_tag_format_reward(text, "counting") == -1.0
+        assert _compute_tag_format_reward(text, "counting") == 0.0
 
     def test_no_tags_number_word(self) -> None:
         text = "There are three cups in the image."
         assert extract_answer_from_text(text, "counting") == "3"
-        assert _compute_tag_format_reward(text, "counting") == -1.0
+        assert _compute_tag_format_reward(text, "counting") == 0.0
 
     def test_no_tags_verbose(self) -> None:
         """Long verbose response — model just explains."""
         text = "In the image, there are two people in the foreground and one person partially visible in the background, making a total of three people."
         assert extract_answer_from_text(text, "counting") == "2"  # first digit found
-        assert _compute_tag_format_reward(text, "counting") == -1.0
+        assert _compute_tag_format_reward(text, "counting") == 0.0
 
     # --- Edge cases ---
 
@@ -521,7 +540,7 @@ class TestCountingEndToEnd:
         text = "<think>No objects visible.</think><answer>0</answer>"
         assert extract_answer_from_text(text, "counting") == "0"
         assert match_answer("0", "0", "counting") is True
-        assert _compute_tag_format_reward(text, "counting") == 0.5
+        assert _compute_tag_format_reward(text, "counting") == 1.0
 
     def test_counting_exact_match_required(self) -> None:
         """Counting uses tolerance=0.0 — no rounding."""
@@ -531,9 +550,17 @@ class TestCountingEndToEnd:
     def test_counting_word_to_number_all(self) -> None:
         """Verify all supported number words."""
         for word, digit in [
-            ("zero", "0"), ("one", "1"), ("two", "2"), ("three", "3"),
-            ("four", "4"), ("five", "5"), ("six", "6"), ("seven", "7"),
-            ("eight", "8"), ("nine", "9"), ("ten", "10"),
+            ("zero", "0"),
+            ("one", "1"),
+            ("two", "2"),
+            ("three", "3"),
+            ("four", "4"),
+            ("five", "5"),
+            ("six", "6"),
+            ("seven", "7"),
+            ("eight", "8"),
+            ("nine", "9"),
+            ("ten", "10"),
         ]:
             assert extract_answer_from_text(word, "counting") == digit, f"Failed for {word}"
 

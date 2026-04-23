@@ -365,8 +365,11 @@ def verify_answer(
     Returns:
         MatchResult with verdict "CORRECT" or "WRONG"
     """
-    # Extract answer from Thought/Answer format if present
-    raw_text = _extract_answer_portion(raw_text)
+    # Strict mode preserves the raw <answer> tag so the extractor can
+    # enforce its presence (missing tag → "" → wrong). Liberal mode
+    # unwraps tags / "Answer:" prefixes so legacy formats also extract.
+    if not strict:
+        raw_text = _extract_answer_portion(raw_text)
     ground_truth = _extract_answer_portion(ground_truth)
 
     if answer_type == "mcq":
@@ -492,22 +495,31 @@ def _verify_yesno(
         pred = extract_answer_from_text(raw_text, "yesno", strict=True)
         if not pred:
             return MatchResult(
-                answer_type="yesno", parse_ok=False, verdict=WRONG,
-                extracted="", score=None,
+                answer_type="yesno",
+                parse_ok=False,
+                verdict=WRONG,
+                extracted="",
+                score=None,
             )
         gt_match = _YESNO_START_PATTERN.match(ground_truth) or re.search(
             r"\b(yes|no)\b", ground_truth, re.IGNORECASE
         )
         if not gt_match:
             return MatchResult(
-                answer_type="yesno", parse_ok=True, verdict=WRONG,
-                extracted=pred, score=None,
+                answer_type="yesno",
+                parse_ok=True,
+                verdict=WRONG,
+                extracted=pred,
+                score=None,
             )
         gt = gt_match.group(1).lower()
         verdict = CORRECT if pred.lower() == gt else WRONG
         return MatchResult(
-            answer_type="yesno", parse_ok=True, verdict=verdict,
-            extracted=pred, score=None,
+            answer_type="yesno",
+            parse_ok=True,
+            verdict=verdict,
+            extracted=pred,
+            score=None,
         )
 
     # Anti-hacking: reject hedging predictions
@@ -652,8 +664,11 @@ def _verify_counting(
         pred_str = extract_answer_from_text(raw_text, "counting", strict=True)
         if not pred_str:
             return MatchResult(
-                answer_type="counting", parse_ok=False, verdict=WRONG,
-                extracted="", score=None,
+                answer_type="counting",
+                parse_ok=False,
+                verdict=WRONG,
+                extracted="",
+                score=None,
             )
         try:
             pred_num: float | int = float(pred_str)
@@ -661,14 +676,20 @@ def _verify_counting(
                 pred_num = int(pred_num)
         except ValueError:
             return MatchResult(
-                answer_type="counting", parse_ok=False, verdict=WRONG,
-                extracted="", score=None,
+                answer_type="counting",
+                parse_ok=False,
+                verdict=WRONG,
+                extracted="",
+                score=None,
             )
         gt_num = _extract_number_from_sentence(ground_truth)
         if gt_num is None:
             return MatchResult(
-                answer_type="counting", parse_ok=False, verdict=WRONG,
-                extracted=str(pred_num), score=None,
+                answer_type="counting",
+                parse_ok=False,
+                verdict=WRONG,
+                extracted=str(pred_num),
+                score=None,
             )
         # Reuse fuzzy scoring so near-misses still get partial signal,
         # but skip the open-ended cascade — strict mode is atomic-only.
@@ -680,8 +701,11 @@ def _verify_counting(
             score = max(0.0, 1.0 - abs_error / denom)
         verdict = CORRECT if score >= 0.75 else WRONG
         return MatchResult(
-            answer_type="counting", parse_ok=True, verdict=verdict,
-            extracted=str(pred_num), score=score,
+            answer_type="counting",
+            parse_ok=True,
+            verdict=verdict,
+            extracted=str(pred_num),
+            score=score,
         )
 
     pred_num = _extract_number_from_sentence(raw_text)

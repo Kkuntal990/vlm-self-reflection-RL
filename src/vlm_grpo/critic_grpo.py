@@ -485,17 +485,15 @@ class SelfReflectionGRPOTrainer:
                         "lengths/a1_tokens": step_result.rollout_metrics.get("sr/avg_a1_tokens", 0),
                         "lengths/f1_tokens": step_result.rollout_metrics.get("sr/avg_f1_tokens", 0),
                         "lengths/a2_tokens": step_result.rollout_metrics.get("sr/avg_a2_tokens", 0),
-                        # Format-violation rates (hard short-circuit hit rate).
+                        # Format-violation rates: fraction of trajectories
+                        # where required tags were missing (format reward = 0).
                         # Disambiguates "model failed to correct" from
-                        # "model failed to follow tag format" — critical
-                        # when reading rr/rw/wr/ww rates since short-circuit
-                        # forces a2_correct=False.
-                        "format_violations/a2_rate": metrics.get(
-                            "sr/a2_format_violation_rate", 0
-                        ),
-                        "format_violations/fb_rate": metrics.get(
-                            "sr/fb_format_violation_rate", 0
-                        ),
+                        # "model failed to follow tag format". With binary
+                        # format rewards, missing tags marks the answer wrong
+                        # via the natural extraction-failure path, not a
+                        # short-circuit override.
+                        "format_violations/a2_rate": metrics.get("sr/a2_format_violation_rate", 0),
+                        "format_violations/fb_rate": metrics.get("sr/fb_format_violation_rate", 0),
                     }
 
                     # EMA-smoothed versions of noisy per-step metrics
@@ -514,12 +512,8 @@ class SelfReflectionGRPOTrainer:
                             "sr/resp_adv_abs_mean", 0
                         ),
                         "ema/fb_adv_abs": step_result.rollout_metrics.get("sr/fb_adv_abs_mean", 0),
-                        "ema/a2_fmt_violation": metrics.get(
-                            "sr/a2_format_violation_rate", 0
-                        ),
-                        "ema/fb_fmt_violation": metrics.get(
-                            "sr/fb_format_violation_rate", 0
-                        ),
+                        "ema/a2_fmt_violation": metrics.get("sr/a2_format_violation_rate", 0),
+                        "ema/fb_fmt_violation": metrics.get("sr/fb_format_violation_rate", 0),
                     }
                     for ema_key, raw_val in ema_sources.items():
                         wandb_dict[ema_key] = self._update_ema(ema_key, raw_val)
@@ -1287,7 +1281,8 @@ class SelfReflectionGRPOTrainer:
 
             vals = _torch.tensor(
                 [resp_reward_global, fb_reward_global],
-                device=self.device, dtype=_torch.float32,
+                device=self.device,
+                dtype=_torch.float32,
             )
             _torch.distributed.all_reduce(vals, op=_torch.distributed.ReduceOp.SUM)
             world_size = _torch.distributed.get_world_size()
