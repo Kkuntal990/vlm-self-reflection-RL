@@ -112,6 +112,18 @@ def _reduce_metrics_across_ranks(metrics: dict[str, float]) -> dict[str, float]:
     for i, k in enumerate(scalar_keys):
         summed = float(values[i].item())
         reduced[k] = summed if k in _SUM_REDUCE_KEYS else summed / world_size
+
+    # Visibility log: surface cross-rank reduction in the text log so PVC
+    # inspection can confirm it's firing. Only log on rank 0 to avoid spam.
+    if torch.distributed.get_rank() == 0:
+        total = reduced.get("sr/total_trajectories", float("nan"))
+        wr = reduced.get("sr/wr_rate", float("nan"))
+        rw = reduced.get("sr/rw_rate", float("nan"))
+        logger.info(
+            f"  [cross-rank reduce] world={world_size} "
+            f"total_trajectories={total:.0f} "
+            f"wr={wr:.3f} rw={rw:.3f}"
+        )
     return reduced
 
 
