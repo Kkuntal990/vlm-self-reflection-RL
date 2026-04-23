@@ -84,10 +84,11 @@ spec:
             --freeze_vision_tower \
             --max_pixels ${MAX_PIXELS:-401408} \
             --min_pixels ${MIN_PIXELS:-200704} \
-            --w_a1_correctness ${W_A1_CORRECTNESS:-0.25} \
-            --w_a2_correctness ${W_A2_CORRECTNESS:-0.25} \
-            --w_no_regression ${W_NO_REGRESSION:-0.25} \
-            --w_a2_format ${W_A2_FORMAT:-0.25} \
+            --w_a1_correctness ${W_A1_CORRECTNESS:-0.27} \
+            --w_a1_format ${W_A1_FORMAT:-0.03} \
+            --w_a2_correctness ${W_A2_CORRECTNESS:-0.27} \
+            --w_a2_format ${W_A2_FORMAT:-0.03} \
+            --w_no_regression ${W_NO_REGRESSION:-0.40} \
             --w_downstream ${W_DOWNSTREAM:-0.45} \
             --w_verification_accuracy ${W_VERIFICATION_ACCURACY:-0.45} \
             --w_fb_format ${W_FB_FORMAT:-0.1} \
@@ -219,16 +220,21 @@ spec:
         - name: FEEDBACK_ALPHA
           value: "3.0"
         # Response weights: must sum to 1.0 (convex combination).
-        # Format is pinned at 0.1; remaining 0.9 split evenly across
-        # a1_correctness / a2_correctness / no_regression.
+        # Per-turn split: each turn = 0.9·correctness + 0.1·format.
+        # With turn weight 0.3 and no_regression 0.4:
+        #   a1: 0.27 corr + 0.03 fmt = 0.30
+        #   a2: 0.27 corr + 0.03 fmt = 0.30
+        #   no_regression:                0.40
         - name: W_A1_CORRECTNESS
-          value: "0.3"
+          value: "0.27"
+        - name: W_A1_FORMAT
+          value: "0.03"
         - name: W_A2_CORRECTNESS
-          value: "0.3"
-        - name: W_NO_REGRESSION
-          value: "0.3"
+          value: "0.27"
         - name: W_A2_FORMAT
-          value: "0.1"
+          value: "0.03"
+        - name: W_NO_REGRESSION
+          value: "0.40"
         # Feedback weights: must sum to 1.0.
         # Format is pinned at 0.1; remaining 0.9 split evenly across
         # downstream / verification_accuracy.

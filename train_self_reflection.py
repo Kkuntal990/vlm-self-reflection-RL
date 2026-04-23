@@ -237,10 +237,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Response reward weights (must sum to 1.0)
-    parser.add_argument("--w_a1_correctness", type=float, default=0.25)
-    parser.add_argument("--w_a2_correctness", type=float, default=0.25)
-    parser.add_argument("--w_no_regression", type=float, default=0.25)
-    parser.add_argument("--w_a2_format", type=float, default=0.25)
+    # Per-turn split: each turn carries 0.9·corr + 0.1·fmt sub-reward.
+    parser.add_argument("--w_a1_correctness", type=float, default=0.27)
+    parser.add_argument("--w_a1_format", type=float, default=0.03)
+    parser.add_argument("--w_a2_correctness", type=float, default=0.27)
+    parser.add_argument("--w_a2_format", type=float, default=0.03)
+    parser.add_argument("--w_no_regression", type=float, default=0.40)
 
     # Feedback reward weights (must sum to 1.0)
     parser.add_argument("--w_downstream", type=float, default=0.45)
@@ -314,9 +316,10 @@ def main() -> None:
 
     response_weights = ResponseRewardWeights(
         w_a1_correctness=args.w_a1_correctness,
+        w_a1_format=args.w_a1_format,
         w_a2_correctness=args.w_a2_correctness,
-        w_no_regression=args.w_no_regression,
         w_a2_format=args.w_a2_format,
+        w_no_regression=args.w_no_regression,
     )
     feedback_weights = FeedbackRewardWeights(
         w_downstream=args.w_downstream,

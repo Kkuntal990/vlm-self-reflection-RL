@@ -828,7 +828,13 @@ def compute_response_reward_breakdown(
     a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
     a2_correct = a2_result.is_correct
 
-    # Format reward — pure structural check (binary {0, +1}).
+    # Format rewards — pure structural check (binary {0, +1}) per turn.
+    # Both A1 and A2 are evaluated independently for tag presence + clean
+    # atomic inner content. Symmetry across turns prevents the model from
+    # learning "format only matters for A2".
+    r_a1_format = _compute_refiner_format_reward(
+        a1_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+    )
     r_a2_format = _compute_refiner_format_reward(
         a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
     )
@@ -867,15 +873,17 @@ def compute_response_reward_breakdown(
 
     components = {
         "a1_correctness": r_a1,
+        "a1_format": r_a1_format,
         "a2_correctness": r_a2,
-        "no_regression": r_no_reg,
         "a2_format": r_a2_format,
+        "no_regression": r_no_reg,
     }
     weighted_components = {
         "a1_correctness": r_a1 * weights.w_a1_correctness,
+        "a1_format": r_a1_format * weights.w_a1_format,
         "a2_correctness": r_a2 * weights.w_a2_correctness,
-        "no_regression": r_no_reg * weights.w_no_regression,
         "a2_format": r_a2_format * weights.w_a2_format,
+        "no_regression": r_no_reg * weights.w_no_regression,
     }
     total_reward = sum(weighted_components.values())
 

@@ -861,17 +861,23 @@ class SelfReflectionGRPOTrainer:
 
         if separate_turns:
             # SCoRe-style: separate advantages for A1 and A2.
-            # A1 reward = a1_correctness only (so wrong A1 gets negative advantage).
-            # A2 reward = everything else (correctness, no_regression, format).
+            #   A1 reward = a1_correctness + a1_format       (turn-local signal)
+            #   A2 reward = a2_correctness + a2_format       (turn-local signal)
+            #             + no_regression                    (SCoRe shaping bonus α·(r_a2-r_a1))
+            # Matches Stage II (Eq. 4) of arXiv:2409.12917 where the shaping
+            # bonus α·(r_a2-r_a1) is added ONLY to the A2 reward, never A1.
             a1_rewards_list = []
             a2_rewards_list = []
             for result in rollout_results:
                 for rb in result.response_breakdowns:
-                    a1_r = rb.weighted_components.get("a1_correctness", 0.0)
+                    a1_r = (
+                        rb.weighted_components.get("a1_correctness", 0.0)
+                        + rb.weighted_components.get("a1_format", 0.0)
+                    )
                     a2_r = (
                         rb.weighted_components.get("a2_correctness", 0.0)
-                        + rb.weighted_components.get("no_regression", 0.0)
                         + rb.weighted_components.get("a2_format", 0.0)
+                        + rb.weighted_components.get("no_regression", 0.0)
                     )
                     a1_rewards_list.append(a1_r)
                     a2_rewards_list.append(a2_r)

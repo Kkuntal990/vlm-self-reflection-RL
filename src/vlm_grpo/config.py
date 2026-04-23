@@ -157,9 +157,14 @@ class ResponseRewardWeights:
     """Weights for response reward (applied to A1 + A2 log-probs).
 
     reward_resp = w_a1_correctness * R_a1_correct
+               + w_a1_format       * R_a1_format
                + w_a2_correctness * R_a2_correct
-               + w_no_regression * R_no_regression
-               + w_a2_format * R_a2_format
+               + w_a2_format       * R_a2_format
+               + w_no_regression  * R_no_regression
+
+    Per-turn split convention: each turn carries a 0.9·corr + 0.1·fmt
+    sub-reward. With turn weight 0.3 each and no_regression 0.4, this
+    gives the defaults below (sum = 1.0).
 
     Weights must sum to 1.0 (convex combination). A `__post_init__`
     warning fires otherwise. Raw α is applied inside R_no_regression,
@@ -167,16 +172,18 @@ class ResponseRewardWeights:
     combination is convex.
 
     Attributes:
-        w_a1_correctness: Weight for A1 correctness
-        w_a2_correctness: Weight for A2 correctness
-        w_no_regression: Weight for shaped α·(r_a2 − r_a1) term
-        w_a2_format: Weight for A2 format compliance
+        w_a1_correctness: Weight for A1 correctness  (0.9 × turn_weight)
+        w_a1_format:      Weight for A1 format       (0.1 × turn_weight)
+        w_a2_correctness: Weight for A2 correctness  (0.9 × turn_weight)
+        w_a2_format:      Weight for A2 format       (0.1 × turn_weight)
+        w_no_regression:  Weight for transition / shaped reward
     """
 
-    w_a1_correctness: float = 0.25
-    w_a2_correctness: float = 0.25
-    w_no_regression: float = 0.25
-    w_a2_format: float = 0.25
+    w_a1_correctness: float = 0.27
+    w_a1_format: float = 0.03
+    w_a2_correctness: float = 0.27
+    w_a2_format: float = 0.03
+    w_no_regression: float = 0.40
 
     def __post_init__(self) -> None:
         _validate_weight_sum("ResponseRewardWeights", self.to_dict())
