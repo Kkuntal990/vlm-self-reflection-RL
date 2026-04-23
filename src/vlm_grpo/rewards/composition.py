@@ -977,19 +977,32 @@ def compute_feedback_reward_breakdown(
     r_verification = compute_verification_accuracy_reward(feedback_text, a1_correct)
     r_fb_format = compute_feedback_format_reward(feedback_text)
 
-    # Gate downstream credit on a calibrated verdict.
-    # F1 earns the downstream reward ONLY when its CORRECT/INCORRECT verdict
-    # matches A1's actual correctness (r_verification == +1). Miscalibrated
-    # or unparseable verdicts collapse r_downstream to 0.
+    # Asymmetric gate on downstream credit.
     #
-    # Rationale: A2 correctness is already credited to the A1/A2 policy via
-    # the response reward (a2_correctness + no_regression). Without this
-    # gate, a sycophantic F1 that says "CORRECT" when A1 is wrong still
-    # receives a large positive downstream reward whenever A2 happens to
-    # variance-flip to correct — which rewards miscalibration for outcomes
-    # F1 actively pushed against. The gate removes that noise from F1's
-    # credit path.
-    r_downstream_gated = r_downstream if r_verification > 0 else 0.0
+    # When F1's verdict is calibrated (r_verification > 0): full bidirectional
+    # downstream signal flows — WR rewards +11, RW penalises -11, etc.
+    #
+    # When F1's verdict is wrong (r_verification <= 0): clamp to NEGATIVE
+    # downstream only. Positive downstream is gated to 0 to prevent
+    # sycophancy farming (e.g., \boxed{CORRECT} on a wrong A1 can't earn
+    # the +11 WR bonus when A2 happens to variance-flip right), but NEGATIVE
+    # downstream still flows through so F1 is penalised proportionally when
+    # its bad verdict caused actual harm:
+    #   • RW + \boxed{INCORRECT} on a right A1 (F1 pushed A2 off correct
+    #     answer, A2 regressed):  downstream = -11, total ≈ -5.3
+    #   • WW + sycophantic \boxed{CORRECT} on wrong A1 (F1 reinforced wrong,
+    #     A2 stayed wrong):       downstream = -1,  total ≈ -0.8
+    #   • RR + wrong \boxed{INCORRECT} (A2 ignored bad advice, stayed
+    #     right): downstream = +1 gated to 0, total = -0.35  (ineffectual,
+    #     small penalty — no harm done)
+    #
+    # The asymmetry discriminates "F1 actively caused harm" from "F1
+    # was ineffectual"; the symmetric gate collapsed both to the same
+    # -0.35 signal.
+    if r_verification > 0:
+        r_downstream_gated = r_downstream
+    else:
+        r_downstream_gated = min(r_downstream, 0.0)
 
     components = {
         "downstream": r_downstream_gated,

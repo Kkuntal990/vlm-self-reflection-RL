@@ -34,13 +34,40 @@ Implementation:
 ## Response reward components
 
 ```
-r_response = w_a1 · r_a1_correctness
-           + w_a2 · r_a2_correctness
-           + w_nor · r_no_regression
-           + w_fmt · r_a2_format
+r_response = w_a1_corr · r_a1_correctness
+           + w_a1_fmt  · r_a1_format
+           + w_a2_corr · r_a2_correctness
+           + w_a2_fmt  · r_a2_format
+           + w_nor     · r_no_regression
 ```
 
-Default weights (v10): `w_a1=0.3, w_a2=0.3, w_nor=0.3, w_fmt=0.1` (sum = 1.0).
+Default weights (v10): per-turn sub-reward split is 0.9·corr + 0.1·fmt
+for both A1 and A2, with turn weight 0.3 each and no_regression 0.4:
+
+| weight | value |
+|---|---:|
+| `w_a1_correctness` | 0.27 |
+| `w_a1_format` | 0.03 |
+| `w_a2_correctness` | 0.27 |
+| `w_a2_format` | 0.03 |
+| `w_no_regression` | 0.40 |
+| **sum** | **1.00** |
+
+### Turn decoupling: `separate_turn_loss=True` (SCoRe convention)
+
+When `separate_turn_loss` is on (the v10 default), the response reward is
+**not** a single scalar applied to both A1 and A2 log-probs. It's split:
+
+```python
+# critic_grpo.py
+a1_reward = weighted(a1_correctness) + weighted(a1_format)
+a2_reward = weighted(a2_correctness) + weighted(a2_format) + weighted(no_regression)
+```
+
+Separate group-advantages are computed for each turn; A1 token gradients
+only see `a1_advantages`, A2 tokens only see `a2_advantages`. Matches
+SCoRe Eq. 4 (arXiv:2409.12917): the `α·(r_a2 − r_a1)` shaping bonus
+(which we call `no_regression`) flows only to A2's gradient.
 
 ### `a1_correctness` ∈ {−1, +1}
 
@@ -150,7 +177,7 @@ Verdict is extracted **only** from `\boxed{...}`. No keyword fallback on
 | `Plain INCORRECT prose` | any | **−1** (no `\boxed{}`) |
 | `\boxed{INCORRECT}` (no `<think>`) | A1 wrong | **+1** (verdict still extractable) |
 
-### `downstream` (gated by verification)
+### `downstream` (asymmetric gate by verification)
 
 ```python
 # Shaped reward (α=5 default for v10):
@@ -158,20 +185,34 @@ r_a1 = 1.0 if a1_correct else -1.0
 r_a2 = 1.0 if a2_correct else -1.0
 r_downstream = r_a2 + α · (r_a2 − r_a1)
 
-# Gate: F1 only earns downstream credit if its verdict is calibrated.
-r_downstream_gated = r_downstream if r_verification > 0 else 0.0
+# Asymmetric gate:
+#   - Calibrated verdict  (verification > 0): full bidirectional signal
+#   - Miscalibrated       (verification ≤ 0): only NEGATIVE downstream flows
+if r_verification > 0:
+    r_downstream_gated = r_downstream
+else:
+    r_downstream_gated = min(r_downstream, 0.0)
 ```
 
-The gate prevents sycophancy: a `\boxed{CORRECT}` on a wrong A1 cannot earn
-downstream credit even if A2 happens to variance-flip to correct. F1 must
-be honest about A1 to be credited for downstream improvements.
+Two properties the asymmetric gate enforces:
 
-| Transition | r_a1 | r_a2 | shaped (α=5) | If verification > 0 | If verification ≤ 0 |
-|---|---|---|---|---|---|
-| WR (best) | −1 | +1 | **+11** | +11 | 0 (gated) |
-| RR | +1 | +1 | **+1** | +1 | 0 |
-| WW | −1 | −1 | **−1** | −1 | 0 |
-| RW (regression) | +1 | −1 | **−11** | −11 | 0 |
+1. **Sycophancy prevention (positive side)** — `\boxed{CORRECT}` on a
+   wrong A1 cannot farm the +11 WR bonus when A2 variance-flips right.
+2. **Harm-causation penalty (negative side)** — `\boxed{INCORRECT}` on a
+   right A1 that pushes A2 off the correct answer (RW transition) still
+   incurs the full −11 downstream penalty. F1 is credited for causing
+   actual damage even when the verdict was wrong.
+
+| Verdict | Transition | raw downstream | gated downstream |
+|---|---|---:|---:|
+| calibrated | WR (best) | +11 | +11 |
+| calibrated | RR | +1 | +1 |
+| calibrated | WW | −1 | −1 |
+| calibrated | RW | −11 | −11 |
+| wrong INCORRECT on right A1 | RR (ignored advice) | +1 | **0** (positive gated) |
+| wrong INCORRECT on right A1 | **RW (F1 caused harm)** | −11 | **−11** (flows through) |
+| sycophantic CORRECT on wrong A1 | WR (A2 variance-flip) | +11 | **0** (positive gated) |
+| sycophantic CORRECT on wrong A1 | WW (F1 reinforced) | −1 | **−1** (flows through) |
 
 ### `format` ∈ {0, +1}  (binary, structural + clean verdict)
 

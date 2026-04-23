@@ -226,8 +226,15 @@ class TestFeedbackBreakdown:
         # total = 0.45·11 + 0.45·1 + 0.1·0 = 5.4
         assert bd.total_reward == pytest.approx(5.4, abs=0.01)
 
-    def test_ww_miscalibrated_gated(self, weights: FeedbackRewardWeights) -> None:
-        """F1 says CORRECT but A1 wrong → downstream gated to 0."""
+    def test_ww_miscalibrated_asymmetric_gate(
+        self, weights: FeedbackRewardWeights
+    ) -> None:
+        """F1 sycophantic CORRECT + WW (A2 still wrong) — negative downstream flows.
+
+        Asymmetric gate: only positive downstream is gated when verdict wrong;
+        negative downstream flows through so F1 is penalised for reinforcing
+        a wrong A1 that A2 didn't recover from.
+        """
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>Looks fine.</think> \\boxed{CORRECT}",
             a1_text="ZZZ_WRONG",
@@ -238,17 +245,19 @@ class TestFeedbackBreakdown:
             weights=weights,
             reward_shaping_alpha=5.0,
         )
-        # downstream: gated to 0 (r_verification ≤ 0)
-        # verification: CORRECT when A1 wrong → -1.0
-        # format: has think and boxed → +1
-        assert bd.components["downstream"] == 0.0
+        # WW downstream shaped: r_a2(-1) + 5·(r_a2-r_a1)=0 → -1
+        # verification: CORRECT when A1 wrong → -1
+        # asymmetric gate: negative flows through → ds = -1
+        # total = 0.45·(-1) + 0.45·(-1) + 0.1·(+1) = -0.80
+        assert bd.components["downstream"] == -1.0
         assert bd.components["verification"] == -1.0
         assert bd.components["format"] == 1.0
-        # total = 0.45·0 + 0.45·(-1) + 0.1·(+1) = -0.35
-        assert bd.total_reward == pytest.approx(-0.35, abs=0.01)
+        assert bd.total_reward == pytest.approx(-0.80, abs=0.01)
 
-    def test_wr_miscalibrated_downstream_gated(self, weights: FeedbackRewardWeights) -> None:
-        """F1 says CORRECT but A1 wrong, A2 variance-corrected — gate kills downstream credit."""
+    def test_wr_sycophantic_positive_downstream_gated(
+        self, weights: FeedbackRewardWeights
+    ) -> None:
+        """F1 sycophantic CORRECT + WR (A2 variance-flip right) — positive gated."""
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>(B) looks right.</think> \\boxed{CORRECT}",
             a1_text="ZZZ_WRONG",
@@ -260,9 +269,37 @@ class TestFeedbackBreakdown:
             reward_shaping_alpha=5.0,
         )
         # Without gate: would be 0.45·11 + 0.45·(-1) + 0.1·1 = +4.65 (sycophancy reward).
-        # With gate: downstream=0, total = 0.45·0 + 0.45·(-1) + 0.1·1 = -0.35
+        # Asymmetric gate: raw ds=+11 → clamped to 0. Negative half of gate
+        # doesn't engage here.
+        # total = 0.45·0 + 0.45·(-1) + 0.1·1 = -0.35
         assert bd.components["downstream"] == 0.0
         assert bd.total_reward == pytest.approx(-0.35, abs=0.01)
+
+    def test_rw_wrong_incorrect_causes_harm(
+        self, weights: FeedbackRewardWeights
+    ) -> None:
+        """F1 wrong INCORRECT on a right A1 → A2 follows bad advice and regresses.
+
+        The worst case: F1 actively caused harm. Asymmetric gate lets the
+        full negative downstream (-11) through even though verdict is wrong.
+        """
+        bd = compute_feedback_reward_breakdown(
+            feedback_text="<think>You're wrong, reconsider.</think> \\boxed{INCORRECT}",
+            a1_text="A",
+            a2_text="B",  # A2 regressed because of F1's bad advice
+            ground_truth="A",
+            answer_type="mcq",
+            choices="(A) (B) (C) (D)",
+            weights=weights,
+            reward_shaping_alpha=5.0,
+        )
+        # RW shaped: r_a2(-1) + 5·(r_a2-r_a1) = -1 + 5·(-2) = -11
+        # verification: INCORRECT when A1 right → -1
+        # asymmetric gate: negative flows through → ds = -11
+        # total = 0.45·(-11) + 0.45·(-1) + 0.1·(+1) = -5.30
+        assert bd.components["downstream"] == -11.0
+        assert bd.components["verification"] == -1.0
+        assert bd.total_reward == pytest.approx(-5.30, abs=0.01)
 
 
 class TestBoxedExtraction:
