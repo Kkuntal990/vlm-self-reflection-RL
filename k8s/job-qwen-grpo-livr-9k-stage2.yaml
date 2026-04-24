@@ -141,9 +141,9 @@ spec:
         # The same path initializes both the training adapter (via
         # RESUME_CHECKPOINT) and the frozen KL reference (via REF_ADAPTER_PATH).
         - name: REF_ADAPTER_PATH
-          value: "/outputs/grpo_qwen_stage1/checkpoint-PLACEHOLDER"
+          value: "/outputs/grpo_qwen_stage1/final"
         - name: RESUME_CHECKPOINT
-          value: "/outputs/grpo_qwen_stage1/checkpoint-PLACEHOLDER"
+          value: "/outputs/grpo_qwen_stage1/final"
 
         # GRPO core
         - name: K_SAMPLES
