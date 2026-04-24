@@ -645,13 +645,16 @@ def main() -> None:
         from safetensors.torch import load_file
 
         adapter_path = ckpt_path / "adapter_model.safetensors"
-        if adapter_path.exists():
-            adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
-            unwrapped = accelerator.unwrap_model(model)
-            set_peft_model_state_dict(unwrapped, adapter_state)
-            logger.info(f"Loaded LoRA adapter from {adapter_path}")
-        else:
-            logger.warning(f"No adapter_model.safetensors found at {ckpt_path}")
+        if not adapter_path.exists():
+            raise FileNotFoundError(
+                f"Resume requested from {ckpt_path} but "
+                f"adapter_model.safetensors is missing. Aborting to avoid "
+                f"silently running on random LoRA init."
+            )
+        adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
+        unwrapped = accelerator.unwrap_model(model)
+        set_peft_model_state_dict(unwrapped, adapter_state)
+        logger.info(f"Loaded LoRA adapter from {adapter_path}")
 
         # Load optimizer state if saved
         optim_path = ckpt_path / "optimizer.pt"

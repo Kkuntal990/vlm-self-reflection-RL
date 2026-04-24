@@ -324,8 +324,21 @@ class SelfReflectionGRPOTrainer:
             )
             unwrapped.load_adapter(ref_adapter_path, adapter_name="ref")
             unwrapped.set_adapter("default")  # training adapter stays active
+            # Defensive freeze: guard against Stage-1 adapter_config.json
+            # having modules_to_save populated, which could leak
+            # requires_grad=True into ref adapter params. Ref adapter must
+            # never receive gradients.
+            n_frozen = 0
+            for name, p in unwrapped.named_parameters():
+                if ".ref." in name or name.endswith(".ref"):
+                    if p.requires_grad:
+                        p.requires_grad = False
+                        n_frozen += 1
             self._use_ref_adapter = True
-            logger.info(f"Loaded frozen ref adapter from {ref_adapter_path}")
+            logger.info(
+                f"Loaded frozen ref adapter from {ref_adapter_path} "
+                f"(defensively froze {n_frozen} ref params)"
+            )
 
         # EMA tracking for wandb metrics (per-step values are too noisy with
         # only batch_size * K = 16 trajectories per step).
@@ -1833,10 +1846,15 @@ class SelfReflectionGRPOTrainer:
             else self.model
         )
         # Defensive: ensure training adapter is active before save so that
-        # save_pretrained writes the trained weights, not the frozen ref.
+        # any active_adapter-sensitive code paths see "default".
+        # Critical: pass selected_adapters=["default"] so save_pretrained
+        # does NOT also write the frozen ref adapter. Default behavior
+        # iterates all adapters in peft_config, which would include "ref".
         if self._use_ref_adapter:
             unwrapped.set_adapter("default")
-        unwrapped.save_pretrained(path)
+            unwrapped.save_pretrained(path, selected_adapters=["default"])
+        else:
+            unwrapped.save_pretrained(path)
         self.processor.save_pretrained(path)
 
         # Save optimizer state for resume
