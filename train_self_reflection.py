@@ -183,6 +183,21 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Freeze A1 policy loss for N steps (SCoRe Stage I)",
     )
+    parser.add_argument(
+        "--freeze_a2_steps",
+        type=int,
+        default=0,
+        help="Freeze A2 policy loss for N steps (critic-first Stage I)",
+    )
+    parser.add_argument(
+        "--ref_adapter_path",
+        type=str,
+        default="",
+        help=(
+            "Path to a LoRA checkpoint to load as frozen KL reference "
+            "(critic-first Stage II). Empty = KL against base model."
+        ),
+    )
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument(
         "--num_inner_epochs",
@@ -372,6 +387,8 @@ def main() -> None:
         use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
         freeze_a1_steps=args.freeze_a1_steps,
+        freeze_a2_steps=args.freeze_a2_steps,
+        ref_adapter_path=args.ref_adapter_path,
         clip_range=args.clip_range,
         loss_type=args.loss_type,
         freeze_vision_tower=args.freeze_vision_tower,

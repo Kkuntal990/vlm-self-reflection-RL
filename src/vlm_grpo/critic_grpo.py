@@ -308,6 +308,25 @@ class SelfReflectionGRPOTrainer:
         self.best_metric = float("inf") if config.early_stopping.mode == "min" else float("-inf")
         self.patience_counter = 0
 
+        # Stage II: load frozen LoRA adapter as a sibling on the same base
+        # model. Used as the KL reference distribution so that A1/F1 are
+        # anchored to their Stage-I shapes (not to the bare base model).
+        # Overhead: one extra LoRA weight set (~150 MB for r=64 on 7B).
+        # ref adapter has requires_grad=False and is never active during
+        # backward, so DDP/Accelerate do not need to know about it.
+        self._use_ref_adapter = False
+        ref_adapter_path = getattr(config, "ref_adapter_path", "")
+        if ref_adapter_path:
+            unwrapped = (
+                self.accelerator.unwrap_model(self.model)
+                if self.accelerator is not None
+                else self.model
+            )
+            unwrapped.load_adapter(ref_adapter_path, adapter_name="ref")
+            unwrapped.set_adapter("default")  # training adapter stays active
+            self._use_ref_adapter = True
+            logger.info(f"Loaded frozen ref adapter from {ref_adapter_path}")
+
         # EMA tracking for wandb metrics (per-step values are too noisy with
         # only batch_size * K = 16 trajectories per step).
         self._ema: dict[str, float] = {}
@@ -1009,25 +1028,39 @@ class SelfReflectionGRPOTrainer:
                 old_a2_lps_list += a2_lps
                 old_fb_lps_list += fb_lps
 
-            # Ref log-probs: only needed when kl_coeff > 0
+            # Ref log-probs: only needed when kl_coeff > 0.
+            # Three cases:
+            #   1. ref adapter loaded (Stage II): switch to "ref" adapter on the
+            #      same model; KL anchors against Stage-I distribution.
+            #   2. separate ref_model provided: use it directly (non-PEFT path).
+            #   3. neither: disable adapter layers; KL anchors against base model.
+            # The adapter state MUST be restored to "default" / enabled before
+            # leaving this block — downstream code (training forward, vLLM sync,
+            # checkpoint save) assumes "default" is active.
             if self.config.kl_coeff > 0:
-                if self.ref_model is None:
+                if self._use_ref_adapter:
+                    unwrapped_model.set_adapter("ref")
+                    ref_m = unwrapped_model
+                elif self.ref_model is None:
                     unwrapped_model.disable_adapter_layers()
                     ref_m = unwrapped_model
                 else:
                     ref_m = self.ref_model
 
-                for mb_s in range(0, n_traj, inner_mini_bs):
-                    mb_e = min(mb_s + inner_mini_bs, n_traj)
-                    a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
-                        [a1_pretok, a2_pretok, f1_pretok], ref_m, mb_s, mb_e
-                    )
-                    ref_a1_lps_list += a1_lps
-                    ref_a2_lps_list += a2_lps
-                    ref_fb_lps_list += fb_lps
-
-                if self.ref_model is None:
-                    unwrapped_model.enable_adapter_layers()
+                try:
+                    for mb_s in range(0, n_traj, inner_mini_bs):
+                        mb_e = min(mb_s + inner_mini_bs, n_traj)
+                        a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
+                            [a1_pretok, a2_pretok, f1_pretok], ref_m, mb_s, mb_e
+                        )
+                        ref_a1_lps_list += a1_lps
+                        ref_a2_lps_list += a2_lps
+                        ref_fb_lps_list += fb_lps
+                finally:
+                    if self._use_ref_adapter:
+                        unwrapped_model.set_adapter("default")
+                    elif self.ref_model is None:
+                        unwrapped_model.enable_adapter_layers()
 
             # Per-token log-probs: keep as lists of variable-length tensors.
             if separate_turns:
@@ -1163,6 +1196,13 @@ class SelfReflectionGRPOTrainer:
                         freeze_a1 = getattr(self.config, "freeze_a1_steps", 0)
                         if freeze_a1 > 0 and self.global_step < freeze_a1:
                             a1_loss = torch.zeros_like(a1_loss)
+
+                        # Critic-first Stage I: freeze A2 policy loss so the
+                        # refiner stays put while F1 (+ optionally A1) learns.
+                        # A2 KL still flows against the reference distribution.
+                        freeze_a2 = getattr(self.config, "freeze_a2_steps", 0)
+                        if freeze_a2 > 0 and self.global_step < freeze_a2:
+                            a2_loss = torch.zeros_like(a2_loss)
 
                         traj_resp_loss = a1_loss + a2_loss
 
@@ -1792,6 +1832,10 @@ class SelfReflectionGRPOTrainer:
             if self.accelerator is not None
             else self.model
         )
+        # Defensive: ensure training adapter is active before save so that
+        # save_pretrained writes the trained weights, not the frozen ref.
+        if self._use_ref_adapter:
+            unwrapped.set_adapter("default")
         unwrapped.save_pretrained(path)
         self.processor.save_pretrained(path)
 

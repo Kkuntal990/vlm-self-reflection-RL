@@ -303,6 +303,11 @@ class SelfReflectionConfig:
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
     freeze_a1_steps: int = 0
+    freeze_a2_steps: int = 0
+    # Path to a LoRA checkpoint to load as frozen reference adapter (Stage II).
+    # When set, KL is computed against that checkpoint's distribution instead of
+    # the base model. Empty string = use base model as ref (current behavior).
+    ref_adapter_path: str = ""
     clip_range: float = 0.2
     loss_type: str = "grpo"
     freeze_vision_tower: bool = False
