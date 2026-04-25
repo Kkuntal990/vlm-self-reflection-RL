@@ -127,14 +127,28 @@ spec:
 
           # Mirror src/vlm_grpo/trajectory.py extract_answer_from_text(strict=True)
           # for MCQ: REQUIRE <answer> tag, search only inside payload, anti-hedge.
-          _ANSWER_TAG_RE = re.compile(r"<answer>\\\\s*(.*?)\\\\s*</answer>", re.IGNORECASE | re.DOTALL)
-          _MCQ_STRICT_RE = re.compile(r"^\\\\s*(?:\\\\(([A-Fa-f])\\\\)|([A-Fa-f])[.\\\\s]?)\\\\s*$")
-          _MCQ_OPTION_RE = re.compile(r"(?:\\\\(([A-Fa-f])\\\\)|(?<!\\\\w)([A-Fa-f])\\\\.)")
+          # Patterns assembled from chr(92) to avoid YAML/bash/Python escape hell.
+          _BS = chr(92)
+          _WS = _BS + "s"   # \\s
+          _OP = _BS + "("   # \\(
+          _CP = _BS + ")"   # \\)
+          _DOT = _BS + "."  # \\.
+          _NW = _BS + "w"   # \\w
+          _ANSWER_TAG_RE = re.compile(
+              "<answer>" + _WS + "*(.*?)" + _WS + "*</answer>",
+              re.IGNORECASE | re.DOTALL,
+          )
+          _MCQ_STRICT_RE = re.compile(
+              "^" + _WS + "*(?:" + _OP + "([A-Fa-f])" + _CP + "|([A-Fa-f])[." + _WS + "]?)" + _WS + "*$"
+          )
+          _MCQ_OPTION_RE = re.compile(
+              "(?:" + _OP + "([A-Fa-f])" + _CP + "|(?<!" + _NW + ")([A-Fa-f])" + _DOT + ")"
+          )
           _MCQ_ANSWER_IS_RE = re.compile(
-              r"(?:answer|choice|option)\\\\s*(?:is|:)\\\\s*\\\\(?([A-Fa-f])\\\\)?",
+              "(?:answer|choice|option)" + _WS + "*(?:is|:)" + _WS + "*" + _OP + "?([A-Fa-f])" + _CP + "?",
               re.IGNORECASE,
           )
-          _MCQ_LETTER_RE = re.compile(r"[A-Fa-f]")
+          _MCQ_LETTER_RE = re.compile("[A-Fa-f]")
 
           def _extract_mcq_letter(response):
               # Step 1: REQUIRE <answer> tag (training strict mode)
