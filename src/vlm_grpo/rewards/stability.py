@@ -27,16 +27,21 @@ def compute_no_regression_reward(
     Uses answer_type-aware values:
 
     For deterministic types (MCQ, YesNo, Numeric):
-        RR: +1.0, RW: -2.0, WR: +3.0, WW: 0.0
+        RR: +1.0, RW: -2.0, WR: +3.0, WW: -0.5
         Rationale: changing a letter/word is cheap and the answer space
         is small, so we reduce the RW penalty and increase WR reward
         to encourage the model to attempt corrections via feedback.
+        WW carries a small negative to discourage "stable wrong" — a
+        K-group of all-WW now produces a non-zero gradient signal via
+        this penalty, attacking the dead-K-group failure mode observed
+        in v10-base training (52% WW, 0 gradient).
 
     For open-ended / counting:
-        RR: +1.0, RW: -3.0, WR: +2.0, WW: 0.0
+        RR: +1.0, RW: -3.0, WR: +2.0, WW: -0.5
         Rationale: changing a correct freeform answer is expensive
         (large answer space makes re-generating a correct answer hard),
         so we keep the heavy RW penalty to protect correct answers.
+        Same WW=-0.5 to maintain consistency with the deterministic case.
 
     NOT gated by format: correctness is evaluated independently.
 
@@ -56,7 +61,7 @@ def compute_no_regression_reward(
     if answer_type in DETERMINISTIC_TYPES:
         if a1_is_correct:
             return 1.0 if a2_correct else -2.0
-        return 3.0 if a2_correct else 0.0
+        return 3.0 if a2_correct else -0.5
 
     if a1_is_correct:
         if a2_correct:
@@ -64,4 +69,4 @@ def compute_no_regression_reward(
         return -3.0
     if a2_correct:
         return 2.0
-    return 0.0
+    return -0.5

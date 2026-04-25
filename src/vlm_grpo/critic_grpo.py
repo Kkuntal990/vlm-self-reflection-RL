@@ -349,10 +349,13 @@ class SelfReflectionGRPOTrainer:
         # Written by ALL ranks (not just rank 0), so all 9K questions are saved.
         self._trajectory_log = None
 
-        # Selective Sample Replay buffer (VL-Rethinker)
+        # Selective Sample Replay buffer (VL-Rethinker, arXiv:2504.08837).
+        # Default 256 matches SelfReflectionConfig.ssr_buffer_size — fallback
+        # bumped from 64 to keep the trainer behavior consistent when invoked
+        # with a config object that lacks the attribute (e.g., older callers).
         if getattr(config, "use_ssr", False):
             self.ssr_buffer: Optional[SSRBuffer] = SSRBuffer(
-                max_size=getattr(config, "ssr_buffer_size", 64),
+                max_size=getattr(config, "ssr_buffer_size", 256),
                 alpha=getattr(config, "ssr_alpha", 1.0),
             )
         else:
@@ -822,14 +825,27 @@ class SelfReflectionGRPOTrainer:
 
         k = self.config.rollout.k_samples
 
-        # SSR (VL-Rethinker Alg. 1): drop zero-advantage K-groups and replace
-        # them with buffer replays. Priority = std(resp) + std(fb) as a proxy
-        # for |Â| (paper uses per-sample advantage; reward-std captures the
-        # same signal at group granularity for GRPO).
+        # SSR (VL-Rethinker Alg. 1, Eq. 1): drop zero-advantage K-groups and
+        # replace them with buffer replays. Priority is the mean of per-sample
+        # |Â_j| over the K trajectories in the group, computed from the
+        # GRPO-normalized advantages: Â_j = (r_j - mean(r)) / std(r). This is
+        # the per-trajectory aggregate the paper's Eq. 1 actually prescribes,
+        # rather than the group-level std proxy used previously.
         if self.ssr_buffer is not None:
             import torch as _torch
 
             n_groups = len(rollout_results)
+
+            def _mean_abs_advantage(rewards: list[float]) -> float:
+                """Compute mean(|(r - mean) / std|) over a K-group — paper-faithful
+                aggregate of per-trajectory |Â| for use as the group's priority."""
+                if not rewards:
+                    return 0.0
+                t = _torch.tensor(rewards, dtype=_torch.float32)
+                std = t.std().item()
+                if std < 1e-6:
+                    return 0.0
+                return ((t - t.mean()).abs() / (std + 1e-6)).mean().item()
 
             # Identify which groups to keep (non-zero variance on either head)
             # and which to drop (zero variance on BOTH → zero advantage → zero gradient).
@@ -843,9 +859,11 @@ class SelfReflectionGRPOTrainer:
                 ):
                     kept_mask.append(False)
                     continue
-                resp_std = _torch.tensor(result.response_rewards).std().item()
-                fb_std = _torch.tensor(result.feedback_rewards).std().item()
-                priority = resp_std + fb_std
+                # Per-trajectory |Â| aggregated to a single K-group priority,
+                # summed across response and feedback heads.
+                resp_priority = _mean_abs_advantage(result.response_rewards)
+                fb_priority = _mean_abs_advantage(result.feedback_rewards)
+                priority = resp_priority + fb_priority
                 if priority > 1e-4:
                     kept_mask.append(True)
                     sample_copy = {"image_path": result.image_path, "question": result.question}
@@ -1098,6 +1116,14 @@ class SelfReflectionGRPOTrainer:
         # No explicit cache clear -- PyTorch reuses memory automatically.
 
         clip_range = self.config.clip_range
+        # DAPO Clip-Higher (arXiv:2503.14476): asymmetric PPO clipping. Upper
+        # bound = 1 + clip_high (when set), lower bound = 1 - clip_range. This
+        # lets positive-advantage tokens grow further before the clip cap fires,
+        # amplifying the gradient of rare WR (wrong→right) flips relative to
+        # the abundant zero-flip cases.
+        _ch = float(getattr(self.config, "clip_high", 0.0) or 0.0)
+        clip_low = clip_range
+        clip_high = _ch if _ch > 0 else clip_range
         num_inner = self.config.num_inner_epochs
 
         # Step 5: Inner optimization epochs -- use pre-tokenized data to skip
@@ -1174,8 +1200,8 @@ class SelfReflectionGRPOTrainer:
 
                         a1_ratio = torch.exp(torch.clamp(a1_ratio_raw, -20.0, 20.0))
                         a2_ratio = torch.exp(torch.clamp(a2_ratio_raw, -20.0, 20.0))
-                        a1_clipped = torch.clamp(a1_ratio, 1 - clip_range, 1 + clip_range)
-                        a2_clipped = torch.clamp(a2_ratio, 1 - clip_range, 1 + clip_range)
+                        a1_clipped = torch.clamp(a1_ratio, 1 - clip_low, 1 + clip_high)
+                        a2_clipped = torch.clamp(a2_ratio, 1 - clip_low, 1 + clip_high)
 
                         # Dr.GRPO aggregation (arXiv:2503.20783):
                         # sum over completion tokens / max_completion_length, NOT mean.
@@ -1234,7 +1260,7 @@ class SelfReflectionGRPOTrainer:
                         )
                         resp_log_ratio = torch.clamp(resp_ratio_raw, min=-20.0, max=20.0)
                         resp_ratio = torch.exp(resp_log_ratio)
-                        resp_clipped_ratio = torch.clamp(resp_ratio, 1 - clip_range, 1 + clip_range)
+                        resp_clipped_ratio = torch.clamp(resp_ratio, 1 - clip_low, 1 + clip_high)
                         resp_surr1 = resp_ratio * resp_advantages[ti]
                         resp_surr2 = resp_clipped_ratio * resp_advantages[ti]
                         resp_max_len = float(
@@ -1251,7 +1277,7 @@ class SelfReflectionGRPOTrainer:
                     )
                     fb_log_ratio = torch.clamp(fb_ratio_raw, min=-20.0, max=20.0)
                     fb_ratio = torch.exp(fb_log_ratio)
-                    fb_clipped_ratio = torch.clamp(fb_ratio, 1 - clip_range, 1 + clip_range)
+                    fb_clipped_ratio = torch.clamp(fb_ratio, 1 - clip_low, 1 + clip_high)
                     fb_surr1 = fb_ratio * fb_advantages[ti]
                     fb_surr2 = fb_clipped_ratio * fb_advantages[ti]
                     f1_max_len = float(getattr(self.config, "f1_max_completion_length", 512) or 512)

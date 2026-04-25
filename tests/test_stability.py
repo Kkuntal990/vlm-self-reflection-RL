@@ -23,9 +23,14 @@ class TestNoRegressionReward:
         assert r == 3.0
 
     def test_ww_a1_wrong(self) -> None:
-        """A1 wrong, A2 wrong → WW → 0.0."""
+        """A1 wrong, A2 wrong → WW → -0.5 (small penalty for "stable wrong")."""
         r = compute_no_regression_reward("B", "A", "mcq", a1_is_correct=False)
-        assert r == 0.0
+        assert r == -0.5
+
+    def test_ww_open(self) -> None:
+        """Open-ended WW also -0.5."""
+        r = compute_no_regression_reward("wrong", "cat", "open", a1_is_correct=False)
+        assert r == -0.5
 
     def test_yesno_rw(self) -> None:
         """YesNo is deterministic type → RW = -2.0."""

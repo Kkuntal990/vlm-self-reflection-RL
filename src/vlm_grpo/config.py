@@ -309,6 +309,12 @@ class SelfReflectionConfig:
     # the base model. Empty string = use base model as ref (current behavior).
     ref_adapter_path: str = ""
     clip_range: float = 0.2
+    # DAPO Clip-Higher (arXiv:2503.14476 §3.1): asymmetric PPO clipping.
+    # When > 0, upper clip becomes (1 + clip_high) instead of (1 + clip_range),
+    # giving positive-advantage tokens more headroom before clipping kicks in.
+    # Recommended: clip_high=0.28 (paper) with clip_range=0.2 for the lower bound.
+    # 0.0 disables and falls back to symmetric clip_range.
+    clip_high: float = 0.0
     loss_type: str = "grpo"
     freeze_vision_tower: bool = False
     max_pixels: int = 401408

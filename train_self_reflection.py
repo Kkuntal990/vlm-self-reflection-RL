@@ -200,6 +200,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument(
+        "--clip_high",
+        type=float,
+        default=0.0,
+        help=(
+            "DAPO Clip-Higher (arXiv:2503.14476): asymmetric upper clip bound. "
+            "When > 0, upper PPO clip becomes (1+clip_high), lower stays (1+clip_range). "
+            "Recommended 0.28 with clip_range=0.2. 0.0 disables (symmetric)."
+        ),
+    )
+    parser.add_argument(
         "--num_inner_epochs",
         type=int,
         default=4,
@@ -390,6 +400,7 @@ def main() -> None:
         freeze_a2_steps=args.freeze_a2_steps,
         ref_adapter_path=args.ref_adapter_path,
         clip_range=args.clip_range,
+        clip_high=args.clip_high,
         loss_type=args.loss_type,
         freeze_vision_tower=args.freeze_vision_tower,
         max_pixels=args.max_pixels,
@@ -720,6 +731,7 @@ def main() -> None:
                 "learning_rate": args.learning_rate,
                 "kl_coeff": args.kl_coeff,
                 "clip_range": args.clip_range,
+                "clip_high": args.clip_high,
                 "num_inner_epochs": args.num_inner_epochs,
                 "temperature": args.temperature,
                 "feedback_temperature": args.feedback_temperature,
