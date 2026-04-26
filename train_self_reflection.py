@@ -142,6 +142,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssr_buffer_size", type=int, default=256)
     parser.add_argument("--ssr_alpha", type=float, default=1.0)
     parser.add_argument(
+        "--use_dynamic_sampling",
+        action="store_true",
+        help=(
+            "Enable DAPO Dynamic Sampling (arXiv:2503.14476): drop K-groups with "
+            "zero reward variance (advantage=0, gradient=0) before the policy "
+            "update. Independent of --use_ssr; when SSR is also on, dropped slots "
+            "are refilled from the SSR buffer, otherwise the update runs on the "
+            "smaller effective batch."
+        ),
+    )
+    parser.add_argument(
         "--use_improvement_reward",
         action="store_true",
         help="Use R(A2)-R(A1) improvement reward for F1 (Critique-GRPO)",
@@ -394,6 +405,7 @@ def main() -> None:
         use_ssr=args.use_ssr,
         ssr_buffer_size=args.ssr_buffer_size,
         ssr_alpha=args.ssr_alpha,
+        use_dynamic_sampling=args.use_dynamic_sampling,
         use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
         freeze_a1_steps=args.freeze_a1_steps,

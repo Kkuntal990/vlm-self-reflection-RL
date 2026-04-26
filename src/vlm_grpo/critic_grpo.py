@@ -167,6 +167,127 @@ class SelfReflectionTrainStepResult:
         return asdict(self)
 
 
+# =============================================================================
+# Zero-variance group filtering (DAPO Dynamic Sampling + SSR shared helpers)
+# =============================================================================
+
+
+def _mean_abs_advantage(rewards: list[float]) -> float:
+    """Compute mean(|(r - mean) / std|) over a K-group.
+
+    This is the per-trajectory aggregate of GRPO-normalized advantages |Â_j|
+    (VL-Rethinker Eq. 1) used as both:
+      - SSR buffer priority for active sampling, AND
+      - DAPO Dynamic Sampling drop predicate (==0 → degenerate group).
+
+    Returns 0.0 when std is below 1e-6 (all-equal rewards: gradient is
+    mathematically zero, no point keeping or training on the group).
+
+    Args:
+        rewards: K reward values for one rollout group.
+
+    Returns:
+        Non-negative mean |Â|. 0.0 means the group is degenerate.
+    """
+    if not rewards:
+        return 0.0
+    import torch as _torch
+
+    t = _torch.tensor(rewards, dtype=_torch.float32)
+    std = t.std().item()
+    if std < 1e-6:
+        return 0.0
+    return ((t - t.mean()).abs() / (std + 1e-6)).mean().item()
+
+
+def _identify_zero_var_groups(
+    rollout_results: list[Any],
+    k: int,
+) -> tuple[list[bool], int]:
+    """Mark each K-group as kept (non-degenerate) or dropped (degenerate).
+
+    A group is dropped when BOTH the response head and the feedback head
+    have zero variance (mean |Â| == 0) — meaning every trajectory in the
+    group earns identical reward on both heads, so the GRPO advantage is
+    zero on both updates and the gradient contribution is zero. A group
+    that is degenerate on only one head is still kept, because it
+    contributes a non-zero gradient on the other head.
+
+    Malformed groups (response_rewards / feedback_rewards / response_breakdowns
+    not exactly length K) are defensively dropped to avoid downstream
+    tensor-shape errors.
+
+    Args:
+        rollout_results: List of SelfReflectionRolloutResult-like objects,
+            each with .response_rewards, .feedback_rewards,
+            .response_breakdowns of length K.
+        k: Number of trajectories per group (config.rollout.k_samples).
+
+    Returns:
+        (kept_mask, n_dropped) where kept_mask[i]=True means group i has
+        non-zero advantage on at least one head.
+    """
+    kept_mask: list[bool] = []
+    n_dropped = 0
+    for result in rollout_results:
+        if (
+            len(result.response_rewards) != k
+            or len(result.feedback_rewards) != k
+            or len(result.response_breakdowns) != k
+        ):
+            kept_mask.append(False)
+            n_dropped += 1
+            continue
+        resp_priority = _mean_abs_advantage(result.response_rewards)
+        fb_priority = _mean_abs_advantage(result.feedback_rewards)
+        if (resp_priority + fb_priority) > 1e-4:
+            kept_mask.append(True)
+        else:
+            kept_mask.append(False)
+            n_dropped += 1
+    return kept_mask, n_dropped
+
+
+def _filter_kept_groups(
+    rollout_results: list[Any],
+    all_resp_rewards: list[float],
+    all_fb_rewards: list[float],
+    trajectory_data: list[dict],
+    group_slices: list[tuple[int, int]],
+    kept_mask: list[bool],
+) -> tuple[list[Any], list[float], list[float], list[dict]]:
+    """Atomically filter the four parallel arrays by `kept_mask`.
+
+    The reward arrays and trajectory_data are flat across trajectories;
+    `group_slices[i] = (start, end)` gives the trajectory range for
+    rollout_results[i]. All four are filtered in lock-step so downstream
+    tensors and prompt batches stay aligned.
+
+    Args:
+        rollout_results: One entry per K-group.
+        all_resp_rewards: One entry per trajectory.
+        all_fb_rewards: One entry per trajectory.
+        trajectory_data: One entry per trajectory.
+        group_slices: One (start, end) per K-group, indexing the per-trajectory lists.
+        kept_mask: One bool per K-group; True means keep.
+
+    Returns:
+        (kept_results, kept_resp_rewards, kept_fb_rewards, kept_trajectory_data)
+        with the dropped groups' trajectories removed.
+    """
+    kept_results: list[Any] = []
+    kept_resp: list[float] = []
+    kept_fb: list[float] = []
+    kept_traj: list[dict] = []
+    for keep, (s, e), result in zip(kept_mask, group_slices, rollout_results):
+        if keep:
+            kept_results.append(result)
+            kept_resp.extend(all_resp_rewards[s:e])
+            kept_fb.extend(all_fb_rewards[s:e])
+            kept_traj.extend(trajectory_data[s:e])
+    return kept_results, kept_resp, kept_fb, kept_traj
+
+
 @dataclass
 class SSREntry:
     """A stored K-group for Selective Sample Replay (VL-Rethinker).
@@ -825,82 +946,58 @@ class SelfReflectionGRPOTrainer:
 
         k = self.config.rollout.k_samples
 
-        # SSR (VL-Rethinker Alg. 1, Eq. 1): drop zero-advantage K-groups and
-        # replace them with buffer replays. Priority is the mean of per-sample
-        # |Â_j| over the K trajectories in the group, computed from the
-        # GRPO-normalized advantages: Â_j = (r_j - mean(r)) / std(r). This is
-        # the per-trajectory aggregate the paper's Eq. 1 actually prescribes,
-        # rather than the group-level std proxy used previously.
-        if self.ssr_buffer is not None:
-            import torch as _torch
-
+        # DAPO Dynamic Sampling (arXiv:2503.14476 §3.2) + SSR (VL-Rethinker
+        # Alg. 1, Eq. 1) share the same drop predicate: a K-group with zero
+        # reward variance on BOTH response and feedback heads has |Â|==0 on
+        # both updates and contributes zero gradient — it is identified and
+        # removed here so the policy update only sees groups with real signal.
+        # When SSR is on, dropped slots are refilled from the buffer (paper:
+        # D_train = D_effective ∪ D_from_buffer). When SSR is off but Dynamic
+        # Sampling is on, we simply train on the smaller effective batch
+        # (every gradient step is still non-degenerate; we just pay the
+        # rollout cost for some groups that don't contribute).
+        use_ds = bool(getattr(self.config, "use_dynamic_sampling", False))
+        use_ssr = self.ssr_buffer is not None
+        if use_ds or use_ssr:
             n_groups = len(rollout_results)
 
-            def _mean_abs_advantage(rewards: list[float]) -> float:
-                """Compute mean(|(r - mean) / std|) over a K-group — paper-faithful
-                aggregate of per-trajectory |Â| for use as the group's priority."""
-                if not rewards:
-                    return 0.0
-                t = _torch.tensor(rewards, dtype=_torch.float32)
-                std = t.std().item()
-                if std < 1e-6:
-                    return 0.0
-                return ((t - t.mean()).abs() / (std + 1e-6)).mean().item()
+            kept_mask, n_dropped = _identify_zero_var_groups(rollout_results, k=k)
 
-            # Identify which groups to keep (non-zero variance on either head)
-            # and which to drop (zero variance on BOTH → zero advantage → zero gradient).
-            kept_mask = []
-            new_entries = []
-            for result in rollout_results:
-                if (
-                    len(result.response_rewards) != k
-                    or len(result.feedback_rewards) != k
-                    or len(result.response_breakdowns) != k
-                ):
-                    kept_mask.append(False)
-                    continue
-                # Per-trajectory |Â| aggregated to a single K-group priority,
-                # summed across response and feedback heads.
-                resp_priority = _mean_abs_advantage(result.response_rewards)
-                fb_priority = _mean_abs_advantage(result.feedback_rewards)
-                priority = resp_priority + fb_priority
-                if priority > 1e-4:
-                    kept_mask.append(True)
+            # SSR-only: store the non-degenerate groups (with their
+            # per-trajectory |Â| sum as priority) into the replay buffer
+            # before we discard the dropped ones.
+            if use_ssr:
+                new_entries: list[SSREntry] = []
+                for keep, result in zip(kept_mask, rollout_results):
+                    if not keep:
+                        continue
+                    resp_priority = _mean_abs_advantage(result.response_rewards)
+                    fb_priority = _mean_abs_advantage(result.feedback_rewards)
                     sample_copy = {"image_path": result.image_path, "question": result.question}
                     new_entries.append(
                         SSREntry(
                             sample=sample_copy,
                             rollout_result=result,
-                            priority=priority,
+                            priority=resp_priority + fb_priority,
                         )
                     )
-                else:
-                    kept_mask.append(False)
+                self.ssr_buffer.store(new_entries)
 
-            self.ssr_buffer.store(new_entries)
-
-            n_dropped = sum(1 for m in kept_mask if not m)
-
-            # Rebuild aggregated lists and rollout_results keeping only
-            # non-zero-variance groups (paper: D_effective).
+            # Filter all parallel arrays in lock-step.
             if n_dropped > 0:
-                kept_resp: list[float] = []
-                kept_fb: list[float] = []
-                kept_trajs: list[dict] = []
-                kept_rollouts: list[Any] = []
-                for keep, (s, e), result in zip(kept_mask, group_slices, rollout_results):
-                    if keep:
-                        kept_resp.extend(all_resp_rewards[s:e])
-                        kept_fb.extend(all_fb_rewards[s:e])
-                        kept_trajs.extend(trajectory_data[s:e])
-                        kept_rollouts.append(result)
-                all_resp_rewards = kept_resp
-                all_fb_rewards = kept_fb
-                trajectory_data = kept_trajs
-                rollout_results = kept_rollouts
+                rollout_results, all_resp_rewards, all_fb_rewards, trajectory_data = (
+                    _filter_kept_groups(
+                        rollout_results=rollout_results,
+                        all_resp_rewards=all_resp_rewards,
+                        all_fb_rewards=all_fb_rewards,
+                        trajectory_data=trajectory_data,
+                        group_slices=group_slices,
+                        kept_mask=kept_mask,
+                    )
+                )
 
-            # Augment: fill the dropped slots with buffer replays.
-            if n_dropped > 0 and len(self.ssr_buffer) > 0:
+            # SSR refill: fill the dropped slots with buffer replays.
+            if use_ssr and n_dropped > 0 and len(self.ssr_buffer) > 0:
                 replayed = self.ssr_buffer.sample(n_dropped)
                 logger.info(
                     f"  SSR: dropped {n_dropped}/{n_groups} zero-var groups, "
@@ -947,9 +1044,25 @@ class SelfReflectionGRPOTrainer:
 
                     rollout_results.append(rr)
             elif n_dropped > 0:
-                logger.info(
-                    f"  SSR: dropped {n_dropped}/{n_groups} zero-var groups, "
-                    f"buffer empty — no replay yet"
+                tag = "DS+SSR" if use_ssr else "DS"
+                detail = "buffer empty — no replay yet" if use_ssr else "training on kept subset"
+                logger.info(f"  {tag}: dropped {n_dropped}/{n_groups} zero-var groups, {detail}")
+
+            # If everything got dropped (no buffer to refill from), short-circuit
+            # the policy update — there is no signal to learn from this batch.
+            if not all_resp_rewards:
+                self.global_step += 1
+                return SelfReflectionTrainStepResult(
+                    loss=0.0,
+                    response_loss=0.0,
+                    feedback_loss=0.0,
+                    kl_loss=0.0,
+                    response_reward_mean=0.0,
+                    feedback_reward_mean=0.0,
+                    a1_reward_mean=float("nan"),
+                    a2_reward_mean=float("nan"),
+                    rollout_metrics=rollout_metrics,
+                    global_step=self.global_step,
                 )
 
         # Step 3: Group-relative advantages (computed once, frozen)

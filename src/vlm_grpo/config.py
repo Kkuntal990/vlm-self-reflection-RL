@@ -300,6 +300,12 @@ class SelfReflectionConfig:
     use_ssr: bool = False
     ssr_buffer_size: int = 256
     ssr_alpha: float = 1.0
+    # DAPO Dynamic Sampling (arXiv:2503.14476 §3.2): drop K-groups whose
+    # rewards are zero-variance (advantage=0, gradient=0). Independent of
+    # use_ssr — when use_ssr=True the dropped slots are refilled from the
+    # SSR buffer; when SSR is off the policy update simply runs on the
+    # smaller effective batch (every gradient step is still non-degenerate).
+    use_dynamic_sampling: bool = False
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
     freeze_a1_steps: int = 0
