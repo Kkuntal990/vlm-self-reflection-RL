@@ -248,6 +248,45 @@ def _identify_zero_var_groups(
     return kept_mask, n_dropped
 
 
+def _kl_term_drgrpo(
+    ref_lps: Any,
+    new_lps: Any,
+    max_len: float,
+) -> Any:
+    """Schulman k3 KL estimator with Dr.GRPO normalization.
+
+    The k3 estimator is `exp(Δ) − Δ − 1` where Δ = log_ref − log_new. It is
+    unbiased and always non-negative. The standard `.mean()` aggregation
+    divides by the actual completion length, which makes shorter completions
+    contribute disproportionately more KL per token — a length bias that
+    fights the Dr.GRPO policy loss (which uses `sum / max_len` for length
+    invariance, arXiv:2503.20783).
+
+    This helper aggregates with `sum / max_len` so that:
+      - The KL gradient and the policy gradient share the same per-token
+        scale, so the KL coefficient acts as a true gradient-magnitude knob.
+      - A short completion does not get an inflated anchor pull.
+
+    Inputs are NaN/inf-clamped to ±20 before exponentiation to prevent
+    log-prob blowups from corrupting the gradient. Empty input returns 0.
+
+    Args:
+        ref_lps: Reference per-token log-probs (1-D tensor, detached upstream).
+        new_lps: Current per-token log-probs (1-D tensor with grad).
+        max_len: Per-turn max completion length (a1/a2/f1_max_completion_length).
+
+    Returns:
+        Scalar KL loss, normalized by max_len.
+    """
+    import torch
+
+    if new_lps.numel() == 0:
+        return torch.zeros((), device=new_lps.device, dtype=new_lps.dtype)
+    raw = torch.nan_to_num(ref_lps.detach() - new_lps, nan=0.0, posinf=20.0, neginf=-20.0)
+    clamped = torch.clamp(raw, -20.0, 20.0)
+    return (torch.exp(clamped) - clamped - 1).sum() / max_len
+
+
 def _filter_kept_groups(
     rollout_results: list[Any],
     all_resp_rewards: list[float],
@@ -1400,22 +1439,26 @@ class SelfReflectionGRPOTrainer:
                     self._fb_total_tokens += fb_ratio.numel()
                     self._fb_clipped_tokens += (fb_ratio != fb_clipped_ratio).sum().item()
 
-                    # KL loss (per-token, averaged) with per-turn coefficients.
-                    # SCoRe insight: strong A1 KL anchors first turn near base model,
-                    # preventing "direct solution collapse" where the model just
-                    # improves A1 instead of learning self-correction.
+                    # KL loss with Dr.GRPO sum/max_len normalization (matches
+                    # the policy loss aggregation, removing length bias on the
+                    # KL anchor — see _kl_term_drgrpo docstring).
+                    # SCoRe insight: strong A1 KL anchors first turn near base
+                    # model, preventing "direct solution collapse" where the
+                    # model just improves A1 instead of learning self-correction.
                     if self.config.kl_coeff > 0 and ref_a1_lps is not None:
+                        a1_kl_max_len = float(
+                            getattr(self.config, "a1_max_completion_length", 200) or 200
+                        )
+                        a2_kl_max_len = float(
+                            getattr(self.config, "a2_max_completion_length", 200) or 200
+                        )
+                        f1_kl_max_len = float(
+                            getattr(self.config, "f1_max_completion_length", 512) or 512
+                        )
 
-                        def _kl_term(ref_lps: torch.Tensor, new_lps: torch.Tensor) -> torch.Tensor:
-                            raw = torch.nan_to_num(
-                                ref_lps.detach() - new_lps, nan=0.0, posinf=20.0, neginf=-20.0
-                            )
-                            clamped = torch.clamp(raw, -20.0, 20.0)
-                            return (torch.exp(clamped) - clamped - 1).mean()
-
-                        a1_kl = _kl_term(ref_a1_lps[ti], mb_a1_lps[j])
-                        a2_kl = _kl_term(ref_a2_lps[ti], mb_a2_lps[j])
-                        f1_kl = _kl_term(ref_fb_lps[ti], fb_new)
+                        a1_kl = _kl_term_drgrpo(ref_a1_lps[ti], mb_a1_lps[j], a1_kl_max_len)
+                        a2_kl = _kl_term_drgrpo(ref_a2_lps[ti], mb_a2_lps[j], a2_kl_max_len)
+                        f1_kl = _kl_term_drgrpo(ref_fb_lps[ti], fb_new, f1_kl_max_len)
 
                         a1_kl_c = self.config.kl_coeff * getattr(self.config, "a1_kl_coeff", 1.0)
                         a2_kl_c = self.config.kl_coeff * getattr(self.config, "a2_kl_coeff", 1.0)

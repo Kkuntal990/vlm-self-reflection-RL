@@ -20,7 +20,7 @@ spec:
         - |
           set -e
           echo "========================================="
-          echo "v10-fixes-v2: Qwen2.5-VL-7B + Pattern A + DAPO Dynamic Sampling"
+          echo "v10-fixes-v2: Qwen2.5-VL-7B + Pattern A + DAPO Dynamic Sampling + Dr.GRPO KL"
           echo "Start weights: ${MODEL_ID} (base Instruct checkpoint)"
           echo "Model: ${MODEL_ID}"
           echo "Dataset: ${DATASET_PATH}"
@@ -29,6 +29,7 @@ spec:
           echo "Dynamic Sampling: ${USE_DYNAMIC_SAMPLING:-1}  (DAPO §3.2)"
           echo "Clip-Higher: ${CLIP_HIGH:-0.28}              (DAPO §3.1)"
           echo "K samples:   ${K_SAMPLES:-16}"
+          echo "A1 KL coef:  ${A1_KL_COEFF:-700.0}           (Dr.GRPO sum/max_len norm)"
           echo "SSR:         OFF (independent isolation of Dynamic Sampling)"
           echo "========================================="
 
@@ -77,7 +78,7 @@ spec:
             --num_train_epochs ${EPOCHS:-1} \
             --num_inner_epochs ${INNER_EPOCHS:-1} \
             --kl_coeff ${KL_COEFF:-0.02} \
-            --a1_kl_coeff ${A1_KL_COEFF:-150.0} \
+            --a1_kl_coeff ${A1_KL_COEFF:-700.0} \
             --a2_kl_coeff ${A2_KL_COEFF:-1.0} \
             --fb_kl_coeff ${FB_KL_COEFF:-1.0} \
             ${SEPARATE_TURN_LOSS:+--separate_turn_loss} \
@@ -118,7 +119,7 @@ spec:
         - name: DATASET_PATH
           value: "/outputs/livr_data/livr_perception_mcq_hightrust_v2.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v10_fixes_v2_dynsamp"
+          value: "/outputs/grpo_qwen_livr_v10_fixes_v2_dynsamp_klfix"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -127,14 +128,24 @@ spec:
         #     K-groups before policy update so every gradient step is
         #     non-degenerate. Decoupled from SSR (still off) for clean
         #     isolation of the dynamic-sampling effect.
+        #   + Dr.GRPO-consistent KL normalization (sum/max_len, was .mean()).
+        #   + A1_KL_COEFF 150 → 700 (post-normalization, makes KL gradient
+        #     ≈ 2× policy gradient per token after the freeze lifts; was
+        #     ≈ 0.4× under the old setup, which let A1 drift freely).
         #   = Everything else identical to v10-fixes (K=16, CLIP_HIGH=0.28,
         #     WW penalty −0.5 in code, SSR off, same data + reward weights).
         - name: SEPARATE_TURN_LOSS
           value: "1"
         - name: KL_COEFF
           value: "0.02"
+        # Dr.GRPO-consistent KL: k3 estimator now aggregates as sum/max_len
+        # (was .mean(), which was length-biased and silently weakened the
+        # anchor by 280/386 ≈ 0.73× on full-length completions). With the
+        # corrected normalization, A1_KL_COEFF=700 gives effective per-token
+        # KL gradient ≈ 2× policy gradient post-freeze (vs ~0.4× at the old
+        # 150 setting), so the A1 distribution actually stays anchored.
         - name: A1_KL_COEFF
-          value: "150.0"
+          value: "700.0"
         - name: A2_KL_COEFF
           value: "1.0"
         - name: FB_KL_COEFF
@@ -309,7 +320,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v10-fixes-v2-dynsamp"
+          value: "grpo-livr-9k-v10-fixes-v2-dynsamp-klfix"
 
         resources:
           limits:
