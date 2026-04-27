@@ -43,7 +43,7 @@ spec:
           mkdir -p "$(dirname "${OUTPUT_PATH}")"
 
           echo "=== Running profiler ==="
-          uv run --no-sync python scripts/data/profile_difficulty_a1.py \
+          python scripts/data/profile_difficulty_a1.py \
               --dataset "${DATASET_PATH}" \
               --output "${OUTPUT_PATH}" \
               --model "${MODEL_ID}" \
@@ -64,7 +64,7 @@ spec:
               ${STRICT_EXTRACT:+--strict_answer_extraction}
 
           echo "=== Bucketing ==="
-          uv run --no-sync python scripts/analysis/difficulty_buckets.py \
+          python scripts/analysis/difficulty_buckets.py \
               --input "${OUTPUT_PATH}" \
               --output_jsonl "${BUCKETED_PATH}" \
               --output_report "${REPORT_PATH}"
