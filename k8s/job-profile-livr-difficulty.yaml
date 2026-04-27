@@ -1,0 +1,204 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: profile-livr-difficulty
+  labels:
+    app: vlm-grpo
+    task: difficulty-profile
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: vlm-grpo
+        task: difficulty-profile
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: profiler
+        image: huggingface/trl:0.29.0
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          echo "============================================="
+          echo "LIVR A1 difficulty profile (base Qwen2.5-VL)"
+          echo "============================================="
+          nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+          echo ""
+
+          echo "=== Installing runtime deps (vLLM + sentence-transformers) ==="
+          uv pip install --system "vllm==0.12.0" sentence-transformers 2>&1 | tail -5
+
+          echo "=== Cloning repo ==="
+          git clone --depth 1 --branch "${GIT_BRANCH:-feature/two-stage-critic-first}" \
+              https://github.com/Kkuntal990/vlm-self-reflection-RL.git \
+              /workspace/vlm-self-reflection-RL
+          cd /workspace/vlm-self-reflection-RL
+          uv pip install --system -e . 2>&1 | tail -3
+
+          mkdir -p "$(dirname "${OUTPUT_PATH}")"
+
+          echo "=== Running profiler ==="
+          uv run --no-sync python scripts/data/profile_difficulty_a1.py \
+              --dataset "${DATASET_PATH}" \
+              --output "${OUTPUT_PATH}" \
+              --model "${MODEL_ID}" \
+              --image_base_dir "${IMAGE_BASE_DIR}" \
+              --k "${K_SAMPLES:-8}" \
+              --max_completion_length "${MAX_COMPLETION:-200}" \
+              --temperature "${TEMPERATURE:-1.0}" \
+              --top_p "${TOP_P:-0.9}" \
+              --batch_size "${BATCH_SIZE:-32}" \
+              --gpu_memory_utilization "${GPU_MEM:-0.85}" \
+              --max_model_len "${MAX_MODEL_LEN:-2048}" \
+              --max_pixels "${MAX_PIXELS:-401408}" \
+              --min_pixels "${MIN_PIXELS:-200704}" \
+              --seed 0 \
+              --resume \
+              ${USE_THINK_TAGS:+--use_think_answer_tags} \
+              ${USE_ANSWER_TAG_ONLY:+--use_answer_tag_only} \
+              ${STRICT_EXTRACT:+--strict_answer_extraction}
+
+          echo "=== Bucketing ==="
+          uv run --no-sync python scripts/analysis/difficulty_buckets.py \
+              --input "${OUTPUT_PATH}" \
+              --output_jsonl "${BUCKETED_PATH}" \
+              --output_report "${REPORT_PATH}"
+
+          echo "=== Done ==="
+          ls -lh "${OUTPUT_PATH}" "${BUCKETED_PATH}" "${REPORT_PATH}" || true
+
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            memory: "48Gi"
+            cpu: "6"
+          requests:
+            nvidia.com/gpu: "1"
+            memory: "32Gi"
+            cpu: "4"
+
+        volumeMounts:
+          - name: cache-volume
+            mountPath: /cache
+          - name: outputs-volume
+            mountPath: /outputs
+          - name: dev-shm
+            mountPath: /dev/shm
+
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: HF_DATASETS_CACHE
+          value: "/cache/hf/datasets"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+        - name: PIP_CACHE_DIR
+          value: "/cache/pip"
+
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        - name: DO_NOT_TRACK
+          value: "1"
+        - name: VLM_USE_LLM_JUDGE
+          value: "0"
+
+        # Profile knobs
+        - name: GIT_BRANCH
+          value: "feature/two-stage-critic-first"
+        - name: MODEL_ID
+          value: "Qwen/Qwen2.5-VL-7B-Instruct"
+        - name: DATASET_PATH
+          value: "/outputs/livr_data/livr_perception_mcq.jsonl"
+        - name: IMAGE_BASE_DIR
+          value: "/outputs/image_base"
+        - name: OUTPUT_PATH
+          value: "/outputs/livr_data/livr_difficulty_a1.jsonl"
+        - name: BUCKETED_PATH
+          value: "/outputs/livr_data/livr_difficulty_a1_bucketed.jsonl"
+        - name: REPORT_PATH
+          value: "/outputs/livr_data/livr_difficulty_report.md"
+        - name: K_SAMPLES
+          value: "8"
+        - name: MAX_COMPLETION
+          value: "200"
+        - name: TEMPERATURE
+          value: "1.0"
+        - name: TOP_P
+          value: "0.9"
+        - name: BATCH_SIZE
+          value: "32"
+        - name: GPU_MEM
+          value: "0.85"
+        - name: MAX_MODEL_LEN
+          value: "2048"
+        - name: MAX_PIXELS
+          value: "401408"
+        - name: MIN_PIXELS
+          value: "200704"
+        # Match training prompt format. v10 uses think+answer tags.
+        - name: USE_THINK_TAGS
+          value: "1"
+        # Strict atomic-answer extraction matches RL correctness scoring.
+        - name: STRICT_EXTRACT
+          value: "1"
+
+      tolerations:
+        - key: nautilus.io/reservation
+          operator: Exists
+          effect: NoSchedule
+        - key: nautilus.io/hardware
+          operator: Equal
+          value: large-gpu
+        - effect: PreferNoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - key: nautilus.io/issue
+          operator: Exists
+          effect: NoSchedule
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            # Single 48GB GPU is plenty for 7B VLM inference. Prefer A6000s
+            # (10 nodes available, less contended than A100s); allow A40 / L40
+            # / RTX-PRO-6000 as fallbacks since they are also ≥48GB.
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-RTX-A6000
+                - NVIDIA-A40
+                - NVIDIA-L40
+                - NVIDIA-L40S
+                - NVIDIA-RTX-PRO-6000-Blackwell-Max-Q-Workstation-Edition
+
+      volumes:
+        - name: cache-volume
+          emptyDir:
+            sizeLimit: 200Gi
+        - name: outputs-volume
+          persistentVolumeClaim:
+            claimName: ms-swift-outputs-pvc
+        - name: dev-shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
