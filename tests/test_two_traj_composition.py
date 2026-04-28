@@ -79,7 +79,7 @@ class TestCriticRewardBreakdown:
             weights=CriticRewardWeights(),
         )
         assert bd.a2_correct is True
-        assert bd.components["downstream"] == 1.0
+        assert bd.components["downstream"] == 3.0
         assert "format" not in bd.components
         assert "calibration" not in bd.components
         assert bd.total_reward > 0

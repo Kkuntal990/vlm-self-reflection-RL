@@ -18,9 +18,10 @@ class TestNoRegressionReward:
         assert r == -2.0
 
     def test_wr_a1_wrong(self) -> None:
-        """A1 wrong, A2 correct → WR → +3.0 (deterministic type)."""
+        """A1 wrong, A2 correct → WR → +2.35 (deterministic; exact compensation
+        for a1_correctness so combined response RR == response WR)."""
         r = compute_no_regression_reward("A", "A", "mcq", a1_is_correct=False)
-        assert r == 3.0
+        assert r == 2.35
 
     def test_ww_a1_wrong(self) -> None:
         """A1 wrong, A2 wrong → WW → -0.5 (small penalty for "stable wrong")."""
@@ -51,7 +52,8 @@ class TestNoRegressionReward:
         r = compute_no_regression_reward("wrong", "cat", "open", a1_is_correct=True)
         assert r == -3.0
 
-    def test_open_wr_keeps_original_reward(self) -> None:
-        """Open-ended WR keeps +2.0."""
+    def test_open_wr_uses_tie_compensation(self) -> None:
+        """Open-ended WR also uses +2.35 (same exact a1_corr compensation
+        as the deterministic case)."""
         r = compute_no_regression_reward("cat", "cat", "open", a1_is_correct=False)
-        assert r == 2.0
+        assert r == 2.35

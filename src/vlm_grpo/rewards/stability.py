@@ -27,21 +27,22 @@ def compute_no_regression_reward(
     Uses answer_type-aware values:
 
     For deterministic types (MCQ, YesNo, Numeric):
-        RR: +1.0, RW: -2.0, WR: +3.0, WW: -0.5
-        Rationale: changing a letter/word is cheap and the answer space
-        is small, so we reduce the RW penalty and increase WR reward
-        to encourage the model to attempt corrections via feedback.
-        WW carries a small negative to discourage "stable wrong" — a
-        K-group of all-WW now produces a non-zero gradient signal via
-        this penalty, attacking the dead-K-group failure mode observed
-        in v10-base training (52% WW, 0 gradient).
+        RR: +1.0, RW: -2.0, WR: +2.35, WW: -0.5
+        WR=+2.35 is the exact compensation that ties response-head RR
+        and WR after combining with the a1_correctness term
+        (0.27·R_a1 contributes ±0.27, requiring R_noreg(WR)−R_noreg(RR)
+        = 0.54/0.40 = 1.35). The tie removes the WR>RR gradient bias
+        that drove A1 sandbagging in v10-fixes-v2 — the model used to
+        prefer "wrong A1 → corrected" over "right A1 → kept right"
+        because the former earned +1.16 more in combined reward.
+        WW=-0.5 keeps the small negative anchor that breaks dead
+        all-WW K-groups (zero-gradient failure mode in v10-base).
 
     For open-ended / counting:
-        RR: +1.0, RW: -3.0, WR: +2.0, WW: -0.5
-        Rationale: changing a correct freeform answer is expensive
-        (large answer space makes re-generating a correct answer hard),
-        so we keep the heavy RW penalty to protect correct answers.
-        Same WW=-0.5 to maintain consistency with the deterministic case.
+        RR: +1.0, RW: -3.0, WR: +2.35, WW: -0.5
+        Same WR=+2.35 compensation; RW kept at -3.0 since changing a
+        correct freeform answer is expensive (large answer space makes
+        re-generating a correct answer hard).
 
     NOT gated by format: correctness is evaluated independently.
 
@@ -61,12 +62,12 @@ def compute_no_regression_reward(
     if answer_type in DETERMINISTIC_TYPES:
         if a1_is_correct:
             return 1.0 if a2_correct else -2.0
-        return 3.0 if a2_correct else -0.5
+        return 2.35 if a2_correct else -0.5
 
     if a1_is_correct:
         if a2_correct:
             return 1.0
         return -3.0
     if a2_correct:
-        return 2.0
+        return 2.35
     return -0.5

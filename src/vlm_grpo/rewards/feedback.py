@@ -37,9 +37,14 @@ def compute_downstream_aware_reward(
 
     **Transition mode** (default, use_improvement_reward=False):
         For deterministic types (MCQ, YesNo, Numeric):
-            RR: +1.0, RW: -1.5, WR: +3.0, WW: -1.0
+            RR: +3.0, RW: -1.5, WR: +3.0, WW: -1.0
         For open-ended / counting:
-            RR: +1.0, RW: -2.0, WR: +2.0, WW: -1.0
+            RR: +2.0, RW: -2.0, WR: +2.0, WW: -1.0
+        RR is raised to match WR so the feedback head also has
+        Feedback(RR) = Feedback(WR). Combined with the response-head
+        tie (see stability.py), this gives an exact tie on the
+        combined reward between (right, right) and (wrong→right) —
+        F1 has no incentive to encourage A1 sandbagging.
 
     **Improvement mode** (use_improvement_reward=True):
         R_improve = correctness(A2) - correctness(A1)
@@ -79,12 +84,12 @@ def compute_downstream_aware_reward(
 
     if answer_type in DETERMINISTIC_TYPES:
         if a1_is_correct:
-            return 1.0 if a2_correct else -1.5
+            return 3.0 if a2_correct else -1.5
         return 3.0 if a2_correct else -1.0
 
     if a1_is_correct:
         if a2_correct:
-            return 1.0
+            return 2.0
         return -2.0
     if a2_correct:
         return 2.0

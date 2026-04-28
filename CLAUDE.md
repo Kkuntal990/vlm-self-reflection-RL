@@ -71,7 +71,7 @@ GRPO³ uses two separate reward signals per trajectory — one for response qual
 |-----------|-----------|-------|--------|
 | a1_correctness | {-1, +1} | Binary correct/wrong | SCoRe Stage I¹ |
 | a2_correctness | [-1, +1] | Binary for MCQ/YesNo/Numeric; continuous for counting/open | GRPO³ |
-| no_regression | {-3..+3} | Deterministic: RW:-2, WW:-0.5, RR:+1, WR:+3. Open: RW:-3, WW:-0.5, RR:+1, WR:+2 | SCoRe shaping¹ + ReST-MCTS asymmetry⁵ |
+| no_regression | {-3..+2.35} | Deterministic: RW:-2, WW:-0.5, RR:+1, WR:+2.35. Open: RW:-3, WW:-0.5, RR:+1, WR:+2.35 | SCoRe shaping¹ + ReST-MCTS asymmetry⁵ |
 | a2_format | {-1..+0.5} | No tags: 0/-1. With tags: +0.5 (valid), -0.5 (bad inner), -1.0 (no tags) | DeepSeek-R1⁴ |
 | minimal_edit | [0, +1] | `max(1 - 0.5*edit_dist, 0)`, only when both A1 and A2 correct | Self-Refine⁶ |
 
@@ -79,7 +79,7 @@ GRPO³ uses two separate reward signals per trajectory — one for response qual
 
 | Component | Raw Range | Logic | Source |
 |-----------|-----------|-------|--------|
-| downstream | {-2..+3} | Deterministic: RW:-1.5, WW:-1, RR:+1, WR:+3. Open: RW:-2, WW:-1, RR:+1, WR:+2 | Critique-GRPO² + ReST-MCTS⁵ |
+| downstream | {-2..+3} | Deterministic: RW:-1.5, WW:-1, RR:+3, WR:+3. Open: RW:-2, WW:-1, RR:+2, WR:+2 | Critique-GRPO² + ReST-MCTS⁵ |
 | calibration | [-1, +1] | 7 discrete values from keyword matching (positive/negative/mixed/doubt/neutral) | Self-Refine⁶ |
 | fb_format | {-2, -1, 0} | Pure word count (de-coupled from calibration): <3:-2, 3-6:-1, >6:0 | DeepSeek-R1⁴ |
 
@@ -133,8 +133,8 @@ The balanced_70k dataset's `messages` contain a system prompt with `Thought: [re
 
 ### MCQ-Aware Reward Asymmetry
 Deterministic types (MCQ/YesNo/Numeric) use different no-regression and downstream values than open-ended:
-- **No-regression**: RR=+1, RW=-2, WR=+3, WW=-0.5 (small WW penalty added in v10-fixes to break zero-gradient all-WW K-groups)
-- **Downstream**: RR=+1, RW=-1.5, WR=+3, WW=-1
+- **No-regression**: RR=+1, RW=-2, WR=+2.35, WW=-0.5 (WR=2.35 is the exact compensation that ties response-head RR and WR after the a1_correctness term, removing the sandbagging gradient bias)
+- **Downstream**: RR=+3, RW=-1.5, WR=+3, WW=-1 (RR raised to match WR so feedback head is also tied — exact tie on combined reward between RR and WR)
 - **Feedback format**: De-coupled from calibration — pure word count only (0/<3/-2, 3-6/-1, >6/0)
 
 ### Key Training Config
