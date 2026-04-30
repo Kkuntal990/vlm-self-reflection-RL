@@ -33,10 +33,17 @@ spec:
           # pure-python so it works on any image with requests installed.
           pip install --quiet "huggingface_hub[cli]" requests tqdm
 
-          echo "=== Cloning repo ==="
-          git clone --depth 1 --branch "${GIT_BRANCH:-feature/two-stage-critic-first}" \
-              https://github.com/Kkuntal990/vlm-self-reflection-RL.git \
-              /workspace/vlm-self-reflection-RL
+          echo "=== Cloning repo (with retries) ==="
+          for attempt in 1 2 3 4 5; do
+            if git clone --depth 1 --branch "${GIT_BRANCH:-feature/two-stage-critic-first}" \
+                https://github.com/Kkuntal990/vlm-self-reflection-RL.git \
+                /workspace/vlm-self-reflection-RL; then
+              break
+            fi
+            echo "git clone attempt ${attempt} failed, sleeping 30s..."
+            rm -rf /workspace/vlm-self-reflection-RL
+            sleep 30
+          done
           cd /workspace/vlm-self-reflection-RL
 
           mkdir -p "${LIVR_V2_ROOT}"
@@ -106,7 +113,19 @@ spec:
           operator: Exists
           effect: NoSchedule
 
-      # CPU-only download job — no GPU required, broad node affinity
+      # CPU-only download job — no GPU required.
+      # Avoid `gp-engine.usd.edu`: external connectivity (apt repos,
+      # github.com) is flaky there, breaking both apt-get and git clone.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - gp-engine.usd.edu
+
       volumes:
         - name: cache-volume
           emptyDir:
