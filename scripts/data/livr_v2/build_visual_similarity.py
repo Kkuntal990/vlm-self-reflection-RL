@@ -184,11 +184,17 @@ def main() -> None:
     keep_set: set[Path] | None = None
     if not args.skip_dedup:
         blink_val = Path(args.blink_val_dir)
-        candidates = list(blink_val.rglob("*Visual_Similarity*/*"))
-        candidates += list(blink_val.rglob("*visual_similarity*/*"))
-        blink_imgs = [
-            p for p in candidates if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        ]
+        images_dir = blink_val / "Visual_Similarity" / "images"
+        if images_dir.exists():
+            blink_imgs = sorted(images_dir.glob("*.png"))
+        else:
+            candidates = list(blink_val.rglob("*Visual_Similarity*/*"))
+            candidates += list(blink_val.rglob("*visual_similarity*/*"))
+            blink_imgs = [
+                p
+                for p in candidates
+                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+            ]
         logger.info("BLINK Visual_Similarity val images: %d", len(blink_imgs))
         if blink_imgs:
             # Dedup over the *reference* images (NIGHTS triad identity).

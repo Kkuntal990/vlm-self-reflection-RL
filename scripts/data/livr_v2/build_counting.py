@@ -210,15 +210,27 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     ds = load_from_disk(args.pixmo_dir)
-    train_split = ds["train"] if "train" in ds else ds
-    val_split = ds.get("validation") or ds.get("val")
-    test_split = ds.get("test")
+    # `load_from_disk` returns a `Dataset` for a single-split snapshot or a
+    # `DatasetDict` for a multi-split one. Older snapshots saved on the PVC
+    # may be a single split (just `train`), in which case we pull `validation`
+    # and `test` directly from HuggingFace.
+    if hasattr(ds, "keys"):  # DatasetDict
+        train_split = ds["train"] if "train" in ds.keys() else ds
+        val_split = ds.get("validation") if "validation" in ds.keys() else None
+        test_split = ds.get("test") if "test" in ds.keys() else None
+    else:  # plain Dataset (single split)
+        train_split = ds
+        val_split = None
+        test_split = None
+    # Fallback: download missing splits from HF directly.
     if val_split is None or test_split is None:
-        raise SystemExit(
-            "PixMo-Count snapshot missing 'validation' or 'test' splits. "
-            "Re-run datasets.load_dataset('allenai/pixmo-count').save_to_disk(...) "
-            "to capture all official splits."
-        )
+        from datasets import load_dataset
+
+        logger.info("PixMo-Count snapshot lacks validation/test splits; loading from HF.")
+        if val_split is None:
+            val_split = load_dataset("allenai/pixmo-count", split="validation")
+        if test_split is None:
+            test_split = load_dataset("allenai/pixmo-count", split="test")
     logger.info(
         "PixMo-Count: train=%d  validation=%d  test=%d",
         len(train_split),

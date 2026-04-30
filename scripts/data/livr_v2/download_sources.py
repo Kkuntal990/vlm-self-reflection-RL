@@ -257,15 +257,15 @@ def download_blink_val(root: Path) -> None:
 
     Source: https://github.com/zeyofu/BLINK_Benchmark
 
-    We need the val TSVs for: Counting, Object_Localization, Art_Style,
-    Visual_Similarity, Semantic_Correspondence (the tasks for which our
-    paper does explicit cross-dataset dedup against BLINK).
+    BLINK is distributed as parquet files on HuggingFace
+    (BLINK-Benchmark/BLINK). After download, we extract embedded image
+    bytes into per-task `images/` subdirectories so dedup helpers can
+    point at them as files.
     """
     dest = root / "blink_val"
     if _is_done(dest):
         logger.info("BLINK val already complete, skipping")
         return
-    # Use the HuggingFace dataset mirror (BLINK/BLINK).
     dest.mkdir(parents=True, exist_ok=True)
     _run(
         [
@@ -278,8 +278,89 @@ def download_blink_val(root: Path) -> None:
             str(dest),
         ]
     )
+    _extract_blink_images(dest)
     _mark_done(dest)
     logger.info("BLINK val done")
+
+
+def _extract_blink_images(blink_root: Path) -> None:
+    """Walk BLINK task subdirs, read each `*-of-*.parquet`, and write the
+    embedded image columns out as PNG files under `<task>/images/`.
+
+    BLINK rows typically carry images as either `image_1`, `image_2`, ...
+    columns or as a single `image` column with PIL-encoded bytes.
+    """
+    import io
+
+    import pyarrow.parquet as pq
+    from PIL import Image as PILImage
+
+    for task_dir in sorted(blink_root.iterdir()):
+        if not task_dir.is_dir() or task_dir.name in {"assets"}:
+            continue
+        out_dir = task_dir / "images"
+        out_dir.mkdir(exist_ok=True)
+        parquets = list(task_dir.glob("*.parquet"))
+        if not parquets:
+            continue
+        n_extracted = 0
+        for pq_path in parquets:
+            try:
+                table = pq.read_table(pq_path)
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", pq_path, e)
+                continue
+            cols = table.column_names
+            img_cols = [c for c in cols if c == "image" or c.startswith("image_")]
+            if not img_cols:
+                continue
+            for col in img_cols:
+                arr = table.column(col).to_pylist()
+                for i, cell in enumerate(arr):
+                    if cell is None:
+                        continue
+                    raw = cell.get("bytes") if isinstance(cell, dict) else cell
+                    if raw is None:
+                        continue
+                    try:
+                        img = PILImage.open(io.BytesIO(raw)).convert("RGB")
+                    except Exception:
+                        continue
+                    out_path = out_dir / f"{pq_path.stem}_{col}_{i:05d}.png"
+                    img.save(out_path)
+                    n_extracted += 1
+        if n_extracted:
+            logger.info("BLINK %s: extracted %d images", task_dir.name, n_extracted)
+
+
+def download_coco_annotations(root: Path) -> None:
+    """COCO 2017 detection annotations (instances_train2017.json + val).
+
+    The PVC's COCO directory typically only has the image splits
+    (train2017/, val2017/) without the annotation JSONs. Object
+    localization needs the annotations for bbox + segmentation masks,
+    so we download them separately into the symlinked coco/ directory.
+
+    Annotation tar: ~241 MB.
+    """
+    coco_dir = root / "coco"
+    if not coco_dir.exists():
+        logger.warning("COCO symlink missing at %s; skipping annotations", coco_dir)
+        return
+    target = coco_dir / "annotations" / "instances_train2017.json"
+    if target.exists():
+        logger.info("COCO annotations already present, skipping")
+        return
+    archive_url = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+    archive = root / "coco_annotations" / "annotations_trainval2017.zip"
+    _wget(archive_url, archive)
+    # The zip extracts to `annotations/instances_*.json`.
+    # If coco_dir is a symlink, we extract into the symlink target.
+    extract_into = coco_dir.resolve()
+    _extract(archive, extract_into)
+    archive.unlink(missing_ok=True)
+    archive.parent.rmdir()
+    logger.info("COCO annotations extracted into %s", extract_into)
 
 
 def link_pixmo(root: Path, existing: Path) -> None:
@@ -379,6 +460,10 @@ def main() -> None:
         link_pixmo(root, Path(args.pixmo_existing))
     if "coco" not in args.skip:
         link_coco(root, Path(args.coco_existing))
+        # COCO annotations (instances_train/val 2017) are NOT in the PVC's
+        # image-only symlink target — fetch them separately and drop into
+        # the linked coco/ directory.
+        download_coco_annotations(root)
 
     logger.info("=== All sources ready under %s ===", root)
     # Final inventory

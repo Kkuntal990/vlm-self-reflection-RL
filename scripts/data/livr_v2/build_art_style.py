@@ -177,11 +177,17 @@ def main() -> None:
     keep_set: set[Path] | None = None
     if not args.skip_dedup:
         blink_val = Path(args.blink_val_dir)
-        candidates = list(blink_val.rglob("*Art_Style*/*"))
-        candidates += list(blink_val.rglob("*art_style*/*"))
-        blink_imgs = [
-            p for p in candidates if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        ]
+        images_dir = blink_val / "Art_Style" / "images"
+        if images_dir.exists():
+            blink_imgs = sorted(images_dir.glob("*.png"))
+        else:
+            candidates = list(blink_val.rglob("*Art_Style*/*"))
+            candidates += list(blink_val.rglob("*art_style*/*"))
+            blink_imgs = [
+                p
+                for p in candidates
+                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+            ]
         logger.info("BLINK Art_Style val images: %d", len(blink_imgs))
         if blink_imgs:
             # Appendix A: CLIP + pHash + SSIM ANDed.

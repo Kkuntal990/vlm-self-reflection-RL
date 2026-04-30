@@ -108,7 +108,15 @@ def _draw_box(image, box, color, label, label_font_size=24):
 
 
 def _load_blink_val_images(blink_dir: Path) -> list[Path]:
-    """Locate BLINK Object_Localization val images for dedup target."""
+    """Locate BLINK Object_Localization val images for dedup target.
+
+    BLINK ships as parquet files; `download_sources._extract_blink_images`
+    writes per-row images under `<task>/images/`. We look there first.
+    """
+    images_dir = blink_dir / "Object_Localization" / "images"
+    if images_dir.exists():
+        return sorted(images_dir.glob("*.png"))
+    # Fallback: any png/jpg under any *Object_Localization* dir.
     candidates = list(blink_dir.rglob("*Object_Localization*/*"))
     candidates += list(blink_dir.rglob("*object_localization*/*"))
     return [p for p in candidates if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}]

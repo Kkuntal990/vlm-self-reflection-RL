@@ -252,11 +252,17 @@ def main() -> None:
     keep_set: set[int] | None = None
     if not args.skip_dedup:
         blink_val = Path(args.blink_val_dir)
-        candidates = list(blink_val.rglob("*Semantic_Correspondence*/*"))
-        candidates += list(blink_val.rglob("*semantic_correspondence*/*"))
-        blink_imgs = [
-            p for p in candidates if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        ]
+        images_dir = blink_val / "Semantic_Correspondence" / "images"
+        if images_dir.exists():
+            blink_imgs = sorted(images_dir.glob("*.png"))
+        else:
+            candidates = list(blink_val.rglob("*Semantic_Correspondence*/*"))
+            candidates += list(blink_val.rglob("*semantic_correspondence*/*"))
+            blink_imgs = [
+                p
+                for p in candidates
+                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+            ]
         logger.info("BLINK Sem_Corr val images: %d", len(blink_imgs))
         if blink_imgs:
             unique_imgs: list[Path] = []
