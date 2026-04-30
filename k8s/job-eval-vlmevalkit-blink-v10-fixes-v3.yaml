@@ -449,7 +449,12 @@ spec:
         - name: TAG_MODE
           value: "think_answer"   # matches training's --use_think_answer_tags
         - name: CONVERSATION_LOG_PATH
-          value: "/outputs/benchmark_results/blink_v10_base_final_patternA/conversation_log.jsonl"
+          # MUST match OUTPUT_DIR above. The v10-base eval YAML left this
+          # pointing at v10-base's path; this v3 YAML inherited the bug
+          # via copy-paste. analyze_blink_turns.py read v10-base's stale log
+          # and produced a turn_analysis.json that looked identical to
+          # v10-base's. Always set this to ${OUTPUT_DIR}/conversation_log.jsonl.
+          value: "/outputs/benchmark_results/blink_v10_fixes_v3_final_patternA/conversation_log.jsonl"
 
         - name: PYTHONUNBUFFERED
           value: "1"
