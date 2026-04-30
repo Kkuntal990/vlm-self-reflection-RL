@@ -114,8 +114,11 @@ spec:
           effect: NoSchedule
 
       # CPU-only download job — no GPU required.
-      # Avoid `gp-engine.usd.edu`: external connectivity (apt repos,
-      # github.com) is flaky there, breaking both apt-get and git clone.
+      # Avoid the `*.usd.edu` cluster: those nodes have unreachable
+      # external connectivity (apt repos AND github.com fail), and their
+      # kubelet logs port 10250 is also unreachable from the apiserver,
+      # making debugging impossible. Both gp-engine and gp-argo failed
+      # the same way; presume entire usd.edu is unusable for downloads.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -125,6 +128,8 @@ spec:
                 operator: NotIn
                 values:
                 - gp-engine.usd.edu
+                - gp-argo.usd.edu
+                - hcc-gpengine-shor-c5303.unl.edu
 
       volumes:
         - name: cache-volume
