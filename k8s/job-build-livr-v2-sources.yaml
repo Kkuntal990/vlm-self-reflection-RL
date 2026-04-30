@@ -1,0 +1,115 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-livr-v2-sources
+  labels:
+    app: vlm-grpo
+    task: livr-v2-download
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: vlm-grpo
+        task: livr-v2-download
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: downloader
+        image: huggingface/trl:0.29.0
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          echo "============================================="
+          echo "LIVR-v2 source download"
+          echo "============================================="
+
+          # Cluster image lacks wget by default; install it + huggingface-cli
+          apt-get update -qq && apt-get install -y -qq wget unzip
+          pip install --quiet "huggingface_hub[cli]"
+
+          echo "=== Cloning repo ==="
+          git clone --depth 1 --branch "${GIT_BRANCH:-feature/two-stage-critic-first}" \
+              https://github.com/Kkuntal990/vlm-self-reflection-RL.git \
+              /workspace/vlm-self-reflection-RL
+          cd /workspace/vlm-self-reflection-RL
+
+          mkdir -p "${LIVR_V2_ROOT}"
+
+          echo "=== Running downloader ==="
+          python scripts/data/livr_v2/download_sources.py \
+              --root "${LIVR_V2_ROOT}" \
+              --pixmo-existing "${PIXMO_EXISTING}" \
+              --coco-existing "${COCO_EXISTING}"
+
+          echo "=== Done ==="
+          du -sh "${LIVR_V2_ROOT}"/*
+
+        resources:
+          limits:
+            memory: "16Gi"
+            cpu: "4"
+          requests:
+            memory: "12Gi"
+            cpu: "3"
+
+        volumeMounts:
+          - name: cache-volume
+            mountPath: /cache
+          - name: outputs-volume
+            mountPath: /outputs
+
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: HF_DATASETS_CACHE
+          value: "/cache/hf/datasets"
+        - name: PIP_CACHE_DIR
+          value: "/cache/pip"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+
+        - name: GIT_BRANCH
+          value: "feature/two-stage-critic-first"
+        - name: LIVR_V2_ROOT
+          value: "/outputs/livr_v2_sources"
+        - name: PIXMO_EXISTING
+          value: "/outputs/livr_sources/pixmo_count/dataset"
+        - name: COCO_EXISTING
+          value: "/outputs/image_base/coco"
+
+      tolerations:
+        - key: nautilus.io/reservation
+          operator: Exists
+          effect: NoSchedule
+        - key: nautilus.io/hardware
+          operator: Equal
+          value: large-gpu
+        - effect: PreferNoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - key: nautilus.io/issue
+          operator: Exists
+          effect: NoSchedule
+
+      # CPU-only download job — no GPU required, broad node affinity
+      volumes:
+        - name: cache-volume
+          emptyDir:
+            sizeLimit: 50Gi
+        - name: outputs-volume
+          persistentVolumeClaim:
+            claimName: ms-swift-outputs-pvc
