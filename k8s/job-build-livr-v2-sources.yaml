@@ -28,9 +28,10 @@ spec:
           echo "LIVR-v2 source download"
           echo "============================================="
 
-          # Cluster image lacks wget by default; install it + huggingface-cli
-          apt-get update -qq && apt-get install -y -qq wget unzip
-          pip install --quiet "huggingface_hub[cli]"
+          # Use python requests/urllib for downloads (no apt-get).
+          # Some cluster nodes have apt repos unreachable; downloader is
+          # pure-python so it works on any image with requests installed.
+          pip install --quiet "huggingface_hub[cli]" requests tqdm
 
           echo "=== Cloning repo ==="
           git clone --depth 1 --branch "${GIT_BRANCH:-feature/two-stage-critic-first}" \

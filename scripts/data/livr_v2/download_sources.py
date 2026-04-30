@@ -65,12 +65,50 @@ def _run(cmd: list[str], cwd: Path | None = None) -> None:
 
 
 def _wget(url: str, out: Path) -> None:
-    """Download a single URL to `out` using wget with resume support."""
+    """Download a single URL to `out` using Python requests with resume support.
+
+    Avoids the wget dependency so we can run on minimal images
+    (e.g. huggingface/trl:0.29.0) without needing apt-get.
+    """
+    import requests
+
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists() and out.stat().st_size > 0:
-        logger.info("Already present, skipping: %s (%.1f MB)", out, out.stat().st_size / 1e6)
-        return
-    _run(["wget", "-c", "-O", str(out), url])
+        # Try a HEAD to compare size; if equal, we're done.
+        try:
+            head = requests.head(url, allow_redirects=True, timeout=30)
+            content_len = int(head.headers.get("content-length", 0))
+            if content_len > 0 and content_len == out.stat().st_size:
+                logger.info("Already complete: %s (%.1f MB)", out, out.stat().st_size / 1e6)
+                return
+        except Exception:
+            pass
+        logger.info("Resuming partial: %s (%.1f MB)", out, out.stat().st_size / 1e6)
+
+    headers = {}
+    mode = "wb"
+    if out.exists() and out.stat().st_size > 0:
+        headers["Range"] = f"bytes={out.stat().st_size}-"
+        mode = "ab"
+
+    logger.info("Downloading: %s -> %s", url, out)
+    with requests.get(url, headers=headers, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0)) + (
+            out.stat().st_size if mode == "ab" else 0
+        )
+        downloaded = out.stat().st_size if mode == "ab" else 0
+        last_log_mb = 0
+        with open(out, mode) as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):  # 1 MB chunks
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    mb = downloaded // (1 << 20)
+                    if mb >= last_log_mb + 100:
+                        logger.info("  ... %.0f / %.0f MB", mb, total / (1 << 20) if total else mb)
+                        last_log_mb = mb
+    logger.info("Downloaded: %s (%.1f MB)", out, out.stat().st_size / 1e6)
 
 
 def _extract(archive: Path, dest: Path) -> None:
