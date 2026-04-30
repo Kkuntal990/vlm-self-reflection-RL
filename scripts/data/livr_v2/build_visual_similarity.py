@@ -149,7 +149,12 @@ def main() -> None:
     rng.shuffle(triplets)
 
     needed = N_TRAIN + N_VAL + N_TEST + 200
-    saved: list[tuple[Path, dict, Path]] = []  # (composite_path, record, ref_path-for-dedup)
+    # (out_composite_path, record, ref_path, candidate_a_path, candidate_b_path)
+    # — all three NIGHTS images are tracked so dedup can check each
+    # individually against BLINK Visual_Similarity images. Appendix A:
+    # "drop any triad whose reference OR candidate image is a near-
+    # duplicate of a BLINK Visual Similarity image".
+    saved: list[tuple[Path, dict, Path, Path, Path]] = []
     for tr in triplets:
         if len(saved) >= needed:
             break
@@ -177,11 +182,11 @@ def main() -> None:
             image_path=str(out_path),
             dataset_name=TASK_NAME,
         )
-        saved.append((out_path, rec, tr["ref"]))
+        saved.append((out_path, rec, tr["ref"], tr["a"], tr["b"]))
         if len(saved) % 200 == 0:
             logger.info("  built %d/%d", len(saved), needed)
 
-    keep_set: set[Path] | None = None
+    keep_set: set[int] | None = None
     if not args.skip_dedup:
         blink_val = Path(args.blink_val_dir)
         images_dir = blink_val / "Visual_Similarity" / "images"
@@ -197,18 +202,30 @@ def main() -> None:
             ]
         logger.info("BLINK Visual_Similarity val images: %d", len(blink_imgs))
         if blink_imgs:
-            # Dedup over the *reference* images (NIGHTS triad identity).
-            # Appendix A: CLIP + pHash + SSIM ANDed.
-            keep_set = full_dedup(
-                candidates=[ref for _, _, ref in saved],
+            # Dedup over reference AND both candidates per Appendix A.
+            unique_imgs: list[Path] = []
+            seen: set[Path] = set()
+            for _, _, ref, ap, bp in saved:
+                for p in (ref, ap, bp):
+                    if p not in seen:
+                        seen.add(p)
+                        unique_imgs.append(p)
+            keep_imgs = full_dedup(
+                candidates=unique_imgs,
                 exclude=blink_imgs,
                 clip_sim_thresh=0.95,
                 phash_thresh=8,
                 ssim_thresh=0.95,
                 device=args.clip_device,
             )
+            # A triad is kept only if ref AND both candidates are kept.
+            keep_set = {
+                i
+                for i, (_, _, ref, ap, bp) in enumerate(saved)
+                if ref in keep_imgs and ap in keep_imgs and bp in keep_imgs
+            }
 
-    final = [(p, r) for p, r, ref in saved if keep_set is None or ref in keep_set]
+    final = [(p, r) for i, (p, r, _, _, _) in enumerate(saved) if keep_set is None or i in keep_set]
     logger.info("After dedup: %d", len(final))
 
     train = [r for _, r in final[:N_TRAIN]]

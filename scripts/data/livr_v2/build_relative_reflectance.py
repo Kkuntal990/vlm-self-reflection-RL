@@ -54,9 +54,53 @@ MIN_POINT_DIST = 80  # px between the two sampled points
 MARGIN = 30
 
 
-def _luminance(rgb: np.ndarray) -> float:
-    """Rec. 709 luminance from a single RGB pixel (or mean of patch)."""
-    return float(0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2])
+def _srgb_to_linear(srgb_0_255: np.ndarray) -> np.ndarray:
+    """sRGB (0-255) -> linear RGB (0-1).
+
+    Per Appendix A of the LIVR paper: "converting the albedo to linear
+    RGB, and computing the local disk-averaged luminance at each point."
+    JPEG-decoded pixel values are gamma-encoded sRGB; we MUST decode the
+    transfer function before computing luminance, or labels near the
+    0.10 threshold flip.
+    """
+    s = srgb_0_255.astype(np.float32) / 255.0
+    linear = np.where(s <= 0.04045, s / 12.92, ((s + 0.055) / 1.055) ** 2.4)
+    return linear.astype(np.float32)
+
+
+def _luminance_linear(linear_rgb: np.ndarray) -> float:
+    """Rec. 709 luminance from LINEAR RGB (0-1)."""
+    return float(
+        0.2126 * linear_rgb[..., 0] + 0.7152 * linear_rgb[..., 1] + 0.0722 * linear_rgb[..., 2]
+    )
+
+
+def _disk_mean_linear_luminance(albedo: np.ndarray, cx: int, cy: int, radius: int) -> float:
+    """Disk-averaged luminance at (cx, cy) on the albedo image.
+
+    Appendix A says "the local DISK-averaged luminance at each point".
+    Steps:
+      1. Crop a square (cx,cy ± radius) bounding box.
+      2. sRGB -> linear (per-channel).
+      3. Mask to the inscribed disk.
+      4. Take the per-channel mean over disk pixels.
+      5. Apply Rec. 709 weights.
+    """
+    H, W = albedo.shape[:2]
+    x0 = max(0, cx - radius)
+    x1 = min(W, cx + radius + 1)
+    y0 = max(0, cy - radius)
+    y1 = min(H, cy + radius + 1)
+    patch = albedo[y0:y1, x0:x1]  # gamma-encoded sRGB uint-like floats
+    linear = _srgb_to_linear(patch)
+    yy, xx = np.ogrid[: linear.shape[0], : linear.shape[1]]
+    cyy = cy - y0
+    cxx = cx - x0
+    mask = (xx - cxx) ** 2 + (yy - cyy) ** 2 <= radius**2
+    if not mask.any():
+        return _luminance_linear(linear.mean(axis=(0, 1)))
+    disk_mean = linear[mask].mean(axis=0)
+    return _luminance_linear(disk_mean)
 
 
 def _find_scenes(root: Path) -> list[Path]:
@@ -172,16 +216,8 @@ def main() -> None:
                     break
             else:
                 continue
-            patch_a = albedo[
-                ay - args.patch_size : ay + args.patch_size,
-                ax - args.patch_size : ax + args.patch_size,
-            ].mean(axis=(0, 1))
-            patch_b = albedo[
-                by - args.patch_size : by + args.patch_size,
-                bx - args.patch_size : bx + args.patch_size,
-            ].mean(axis=(0, 1))
-            ya = _luminance(patch_a)
-            yb = _luminance(patch_b)
+            ya = _disk_mean_linear_luminance(albedo, ax, ay, args.patch_size)
+            yb = _disk_mean_linear_luminance(albedo, bx, by, args.patch_size)
             mx = max(ya, yb, 1e-8)
             rel = abs(ya - yb) / mx
             if rel <= REL_THRESHOLD:
