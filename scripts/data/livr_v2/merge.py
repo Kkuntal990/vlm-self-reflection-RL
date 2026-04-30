@@ -34,21 +34,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Paper's multi-task setup: 6 tasks. We have 5 (FunKPoint unavailable).
-MULTI_TASK_TASKS = [
+# Paper's full single-task pool: 9 tasks x 1000 = 9000 train examples
+# (Counting, Jigsaw, Object_Localization, Visual_Correspondence,
+#  Semantic_Correspondence, Functional_Correspondence, Relative_Reflectance,
+#  Art_Style, Visual_Similarity).
+# We omit Functional_Correspondence (FunKPoint not publicly available),
+# yielding 8 tasks x 1000 = 8000 total.
+ALL_TASKS = [
+    "counting",
+    "jigsaw",
+    "object_localization",
+    "visual_correspondence",
+    "semantic_correspondence",
+    "relative_reflectance",
+    "art_style",
+    "visual_similarity",
+]
+
+# Paper's specific 6-task multi-task ablation (Appendix A "Multi-Task Setup"
+# omits Jigsaw, Art_Style, Visual_Similarity since base is already strong).
+# We omit Functional_Correspondence too -> 5-task variant for ablation.
+ABLATION_6TASK = [
     "counting",
     "object_localization",
     "visual_correspondence",
     "semantic_correspondence",
     "relative_reflectance",
-]
-
-# Single-task ablation (tasks paper omits because base is already strong,
-# but useful as side experiments).
-SINGLE_TASK_ALSO = [
-    "jigsaw",
-    "art_style",
-    "visual_similarity",
+    # "functional_correspondence" — skipped (FunKPoint unavailable)
 ]
 
 
@@ -65,71 +77,72 @@ def _write_jsonl(records: list[dict], path: Path) -> None:
     logger.info("Wrote %d records -> %s", len(records), path)
 
 
+def _merge_tasks(task_list, data_dir, rng):
+    train: list[dict] = []
+    val: list[dict] = []
+    counts: dict[str, dict[str, int]] = {}
+    for task in task_list:
+        train_path = data_dir / f"{task}_train.jsonl"
+        val_path = data_dir / f"{task}_val.jsonl"
+        if not train_path.exists():
+            logger.warning("Missing %s - skipping", train_path)
+            continue
+        train_recs = _read_jsonl(train_path)
+        val_recs = _read_jsonl(val_path) if val_path.exists() else []
+        counts[task] = {"train": len(train_recs), "val": len(val_recs)}
+        logger.info("  %s: train=%d val=%d", task, len(train_recs), len(val_recs))
+        train.extend(train_recs)
+        val.extend(val_recs)
+    rng.shuffle(train)
+    rng.shuffle(val)
+    return train, val, counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="/outputs/livr_v2/data")
-    parser.add_argument("--output-prefix", default="/outputs/livr_v2/data/livr_v2_5task")
+    parser.add_argument("--output-prefix", default="/outputs/livr_v2/data/livr_v2")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
     data_dir = Path(args.data_dir)
+    manifest = {}
 
-    # Build multi-task train (5 tasks x 1000) and val (5 tasks x 250).
-    multi_train: list[dict] = []
-    multi_val: list[dict] = []
-    manifest = {"multi_task_tasks": MULTI_TASK_TASKS, "single_task_also": SINGLE_TASK_ALSO}
+    # Primary corpus: ALL 8 tasks (paper's 9 minus FunKPoint).
+    logger.info("=== Merging all-tasks corpus ===")
+    all_train, all_val, all_counts = _merge_tasks(ALL_TASKS, data_dir, rng)
+    _write_jsonl(all_train, Path(f"{args.output_prefix}_8task_train.jsonl"))
+    _write_jsonl(all_val, Path(f"{args.output_prefix}_8task_val.jsonl"))
+    manifest["8task"] = {
+        "tasks": ALL_TASKS,
+        "train": len(all_train),
+        "val": len(all_val),
+        "per_task": all_counts,
+    }
 
-    for task in MULTI_TASK_TASKS:
-        train_path = data_dir / f"{task}_train.jsonl"
-        val_path = data_dir / f"{task}_val.jsonl"
-        if not train_path.exists():
-            logger.warning("Missing %s — skipping", train_path)
-            continue
-        train_recs = _read_jsonl(train_path)
-        val_recs = _read_jsonl(val_path) if val_path.exists() else []
-        manifest.setdefault("counts", {})[task] = {
-            "train": len(train_recs),
-            "val": len(val_recs),
-        }
-        logger.info("  %s: train=%d val=%d", task, len(train_recs), len(val_recs))
-        multi_train.extend(train_recs)
-        multi_val.extend(val_recs)
+    # Ablation corpus: 5 of paper's 6-task multi-task setup
+    # (Functional_Correspondence omitted — FunKPoint not public).
+    logger.info("=== Merging ablation 5-task corpus ===")
+    abl_train, abl_val, abl_counts = _merge_tasks(ABLATION_6TASK, data_dir, rng)
+    _write_jsonl(abl_train, Path(f"{args.output_prefix}_5task_train.jsonl"))
+    _write_jsonl(abl_val, Path(f"{args.output_prefix}_5task_val.jsonl"))
+    manifest["5task"] = {
+        "tasks": ABLATION_6TASK,
+        "train": len(abl_train),
+        "val": len(abl_val),
+        "per_task": abl_counts,
+    }
 
-    rng.shuffle(multi_train)
-    rng.shuffle(multi_val)
-    _write_jsonl(multi_train, Path(f"{args.output_prefix}_train.jsonl"))
-    _write_jsonl(multi_val, Path(f"{args.output_prefix}_val.jsonl"))
-
-    # Also build a 9-task superset (for ablations) — INCLUDING the
-    # single-task-only tasks (jigsaw, art_style, visual_similarity).
-    full_train: list[dict] = list(multi_train)
-    full_val: list[dict] = list(multi_val)
-    for task in SINGLE_TASK_ALSO:
-        train_path = data_dir / f"{task}_train.jsonl"
-        val_path = data_dir / f"{task}_val.jsonl"
-        if not train_path.exists():
-            logger.warning("Missing %s (single-task additional) — skipping", train_path)
-            continue
-        full_train.extend(_read_jsonl(train_path))
-        if val_path.exists():
-            full_val.extend(_read_jsonl(val_path))
-    rng.shuffle(full_train)
-    rng.shuffle(full_val)
-    full_prefix = args.output_prefix.replace("_5task", "_8task")
-    if full_prefix == args.output_prefix:
-        full_prefix = args.output_prefix + "_full"
-    _write_jsonl(full_train, Path(f"{full_prefix}_train.jsonl"))
-    _write_jsonl(full_val, Path(f"{full_prefix}_val.jsonl"))
-
-    manifest["multi_task_train"] = len(multi_train)
-    manifest["multi_task_val"] = len(multi_val)
-    manifest["full_train"] = len(full_train)
-    manifest["full_val"] = len(full_val)
     manifest_path = Path(f"{args.output_prefix}_manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     logger.info("Wrote manifest -> %s", manifest_path)
+    logger.info(
+        "Done. Corpora: 8task=%d train, 5task=%d train",
+        len(all_train),
+        len(abl_train),
+    )
 
 
 if __name__ == "__main__":

@@ -135,23 +135,32 @@ def _extract(archive: Path, dest: Path) -> None:
 
 
 def download_hpatches(root: Path) -> None:
-    """HPatches release tarball (Viewpoint + Illumination sequences).
+    """HPatches release zip (Viewpoint + Illumination sequences).
 
-    Source: https://github.com/hpatches/hpatches-dataset
+    Primary source (Imperial College) at icvl.ee.ic.ac.uk fails DNS
+    on many cluster nodes; we use the official HuggingFace mirror by
+    V. Balntas (the dataset author) instead. Same 116 sequences (59
+    viewpoint + 57 illumination), each with 6 images + 5 ground-truth
+    homographies (1->2..1->6).
 
-    The release tarball `hpatches-sequences-release.tar.gz` (~580 MB)
-    contains 116 sequences (59 viewpoint + 57 illumination). Each
-    sequence has 6 images and 5 ground-truth homographies (1->2..1->6).
+    HF mirror: https://huggingface.co/datasets/vbalnt/hpatches
     """
+    from huggingface_hub import hf_hub_download
+
     dest = root / "hpatches"
     if _is_done(dest):
         logger.info("HPatches already complete, skipping")
         return
-    archive_url = "http://icvl.ee.ic.ac.uk/vbalnt/hpatches/hpatches-sequences-release.tar.gz"
-    archive = dest / "hpatches-sequences-release.tar.gz"
-    _wget(archive_url, archive)
-    _extract(archive, dest)
-    archive.unlink(missing_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading HPatches via HF Hub (vbalnt/hpatches)")
+    archive_path = hf_hub_download(
+        repo_id="vbalnt/hpatches",
+        filename="hpatches-sequences-release.zip",
+        repo_type="dataset",
+        local_dir=str(dest),
+    )
+    _extract(Path(archive_path), dest)
+    Path(archive_path).unlink(missing_ok=True)
     _mark_done(dest)
     logger.info("HPatches done")
 
