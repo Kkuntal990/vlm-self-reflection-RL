@@ -189,17 +189,29 @@ def main() -> None:
                 if gt_pt_src is None:
                     continue
 
-                # 3 distractors in target image, far from true location.
-                distractors = []
+                # 3 distractors in target image, "far from the true location
+                # and from each other" (Appendix A). Each distractor must be
+                # at least MIN_DISTRACTOR_DIST from the GT AND from every
+                # already-placed distractor.
+                distractors: list[tuple[float, float]] = []
                 for _ in range(3):
                     for _ in range(50):
                         a = rng.uniform(0, 2 * np.pi)
                         r = rng.uniform(MIN_DISTRACTOR_DIST, MAX_DISTRACTOR_DIST)
                         dx = gt_pt_tgt[0] + r * np.cos(a)
                         dy = gt_pt_tgt[1] + r * np.sin(a)
-                        if MARGIN <= dx <= tw - MARGIN and MARGIN <= dy <= th - MARGIN:
-                            distractors.append((dx, dy))
-                            break
+                        if not (MARGIN <= dx <= tw - MARGIN and MARGIN <= dy <= th - MARGIN):
+                            continue
+                        # Must be far from every previously-placed distractor.
+                        ok = True
+                        for px, py in distractors:
+                            if ((dx - px) ** 2 + (dy - py) ** 2) ** 0.5 < MIN_DISTRACTOR_DIST:
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                        distractors.append((dx, dy))
+                        break
                 if len(distractors) < 3:
                     continue
 

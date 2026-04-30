@@ -174,15 +174,23 @@ def main() -> None:
             continue
 
         gt_tgt = (tx, ty)
-        distractors = []
+        distractors: list[tuple[float, float]] = []
+        # Per Appendix A spirit (matches the visual_correspondence text):
+        # distractors should be far from the GT AND from each other.
         for di in distractor_idxs:
             dx, dy = pdata["trg_kps"][di]
-            if (
-                MARGIN <= dx <= tw - MARGIN
-                and MARGIN <= dy <= th - MARGIN
-                and ((dx - tx) ** 2 + (dy - ty) ** 2) ** 0.5 >= MIN_DISTRACTOR_DIST
-            ):
-                distractors.append((dx, dy))
+            if not (MARGIN <= dx <= tw - MARGIN and MARGIN <= dy <= th - MARGIN):
+                continue
+            if ((dx - tx) ** 2 + (dy - ty) ** 2) ** 0.5 < MIN_DISTRACTOR_DIST:
+                continue
+            ok = True
+            for px, py in distractors:
+                if ((dx - px) ** 2 + (dy - py) ** 2) ** 0.5 < MIN_DISTRACTOR_DIST:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            distractors.append((dx, dy))
         if len(distractors) < 3:
             continue
 
