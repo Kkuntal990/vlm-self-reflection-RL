@@ -38,7 +38,7 @@ from pathlib import Path
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(__file__))
-from dedup import clip_dedup  # noqa: E402
+from dedup import full_dedup  # noqa: E402
 from livr_common import (  # noqa: E402
     OPTION_COLORS,
     OPTION_LETTERS,
@@ -138,7 +138,11 @@ def main() -> None:
     rng.shuffle(valid)
     needed = N_TRAIN + N_VAL + N_TEST + 200
 
-    saved: list[tuple[Path, dict]] = []
+    # (out_composite_path, record, src_image_path, tgt_image_path) — the
+    # last two are kept so we can do pair-aware dedup against BLINK
+    # (Appendix A "pair-aware similarity check, consider both aligned
+    # and swapped orientations").
+    saved: list[tuple[Path, dict, Path, Path]] = []
     for pair_idx, (pdata, kp_idx) in enumerate(valid):
         if len(saved) >= needed:
             break
@@ -222,13 +226,22 @@ def main() -> None:
             image_path=str(out_path),
             dataset_name=TASK_NAME,
         )
-        saved.append((out_path, rec))
+        saved.append((out_path, rec, src_path, tgt_path))
         if (pair_idx + 1) % 200 == 0:
             logger.info("  built %d/%d", len(saved), needed)
     logger.info("Saved %d semcorr composites", len(saved))
 
     # Pair-aware dedup vs BLINK Semantic_Correspondence val.
-    keep_set: set[Path] | None = None
+    # Appendix A: "CLIP-based pre-filter followed by perceptual hashing
+    # and SSIM" with "consider both aligned and swapped orientations" of
+    # the candidate pair. We approximate by deduping each candidate's
+    # source AND target images independently against the BLINK image set
+    # — a candidate is dropped if EITHER its source or target image is a
+    # confirmed near-duplicate of any BLINK image (under CLIP+pHash+SSIM
+    # ANDed, identical to full_dedup). This is a strict superset of pair-
+    # aware: it catches both (cs~bs, ct~bt) aligned matches and (cs~bt,
+    # ct~bs) swapped matches without needing BLINK pair structure.
+    keep_set: set[int] | None = None
     if not args.skip_dedup:
         blink_val = Path(args.blink_val_dir)
         candidates = list(blink_val.rglob("*Semantic_Correspondence*/*"))
@@ -238,14 +251,26 @@ def main() -> None:
         ]
         logger.info("BLINK Sem_Corr val images: %d", len(blink_imgs))
         if blink_imgs:
-            keep_set = clip_dedup(
-                candidates=[p for p, _ in saved],
+            unique_imgs: list[Path] = []
+            seen: set[Path] = set()
+            for _, _, sp, tp in saved:
+                for p in (sp, tp):
+                    if p not in seen:
+                        seen.add(p)
+                        unique_imgs.append(p)
+            keep_imgs = full_dedup(
+                candidates=unique_imgs,
                 exclude=blink_imgs,
-                sim_thresh=0.95,
+                clip_sim_thresh=0.95,
+                phash_thresh=8,
+                ssim_thresh=0.95,
                 device=args.clip_device,
             )
+            keep_set = {
+                i for i, (_, _, sp, tp) in enumerate(saved) if sp in keep_imgs and tp in keep_imgs
+            }
 
-    final = [(p, r) for p, r in saved if keep_set is None or p in keep_set]
+    final = [(p, r) for i, (p, r, _, _) in enumerate(saved) if keep_set is None or i in keep_set]
     logger.info("After dedup: %d", len(final))
 
     train = [r for _, r in final[:N_TRAIN]]

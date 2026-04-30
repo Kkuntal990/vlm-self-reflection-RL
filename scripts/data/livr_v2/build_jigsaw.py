@@ -78,12 +78,32 @@ def _rect_overlaps(a, b):
     return _rect_intersects(a, b)
 
 
+def _box_center(box):
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
 def _try_distractor(img_size, gt_box, canvas_box, rng, max_tries=50):
-    """Sample a same-size patch elsewhere in the image that intersects
-    the canvas and does not overlap the GT patch."""
+    """Sample a same-size patch elsewhere in the image that:
+
+      (i)   intersects the canvas
+      (ii)  does NOT overlap the GT patch
+      (iii) has center at least a fixed fraction of the canvas size
+            away from the GT center (Appendix A constraint).
+
+    Constraint (iii) prevents the distractor from being too close to
+    the GT — without it, distractors can land just barely off the GT
+    while still showing the same image content, making the task trivial
+    on near-identical patches.
+    """
     iw, ih = img_size
     pw = gt_box[2] - gt_box[0]
     ph = gt_box[3] - gt_box[1]
+    cw = canvas_box[2] - canvas_box[0]
+    ch = canvas_box[3] - canvas_box[1]
+    # Min center distance: at least 0.5 * min(canvas_w, canvas_h).
+    # This is the "fixed fraction of the canvas size" the paper requires.
+    min_center_dist = 0.5 * min(cw, ch)
+    gx, gy = _box_center(gt_box)
     for _ in range(max_tries):
         dx = rng.randint(0, iw - pw)
         dy = rng.randint(0, ih - ph)
@@ -91,6 +111,9 @@ def _try_distractor(img_size, gt_box, canvas_box, rng, max_tries=50):
         if not _rect_intersects(d, canvas_box):
             continue
         if _rect_overlaps(d, gt_box):
+            continue
+        cx_d, cy_d = _box_center(d)
+        if ((cx_d - gx) ** 2 + (cy_d - gy) ** 2) ** 0.5 < min_center_dist:
             continue
         return d
     return None

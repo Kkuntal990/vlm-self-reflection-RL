@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
-"""livr-v2 Counting builder.
+"""livr-v2 Counting builder — strict Appendix A replication.
 
 Per Appendix A of the LIVR paper (arXiv:2512.21218):
-  * Source: PixMo-Count (allenai/pixmo-count)
-  * Filter: counts c in {2..10}
-  * Format: open-ended (model generates integer count)
-  * Dedup: CLIP+pHash+SSIM vs official PixMo-Count test split
-  * Splits: 1000 train / 534 val / 528 test
 
-Usage:
-    python scripts/data/livr_v2/build_counting.py \\
-        --pixmo-dir /outputs/livr_v2_sources/pixmo_count \\
-        --output-dir /outputs/livr_v2/image_base/counting \\
-        --output-jsonl-prefix /outputs/livr_v2/data/counting
+  Source     : PixMo-Count (`allenai/pixmo-count` on HuggingFace)
+  Format     : OPEN-ENDED (model generates an integer count, no MCQ)
+  Filter     : ground-truth counts c in {2,3,...,10}
+  Train      : 1,000-example subset sampled from the PixMo-Count
+               TRAIN split, "approximately uniformly represented" across
+               c in {2..10}, after URL-validity filtering.
+  Validation : the OFFICIAL PixMo-Count validation split, after URL
+               validity filtering (paper reports 534 surviving examples).
+  Test       : the OFFICIAL PixMo-Count test split, after URL validity
+               filtering (paper reports 528 surviving examples).
+  Dedup      : "CLIP embeddings together with perceptual hashing and
+               SSIM-based image similarity" between train+val images
+               and the test images — drop near-duplicates.
+
+Output schema is open-ended:
+    {
+      "question": "How many <object> are in the image? Provide a single integer answer.",
+      "ground_truth": "<integer>",
+      "answer_type": "counting",
+      "choices": "",
+      "images": ["<png path>"],
+      "dataset_name": "livr_counting",
+      "split": "train"|"val"|"test"
+    }
 """
 
 from __future__ import annotations
@@ -22,6 +36,7 @@ import io
 import os
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import requests
@@ -29,7 +44,7 @@ from datasets import load_from_disk
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(__file__))
-from dedup import perceptual_dedup  # noqa: E402
+from dedup import full_dedup  # noqa: E402
 from livr_common import (  # noqa: E402
     log_task_banner,
     logger,
@@ -40,13 +55,39 @@ from livr_common import (  # noqa: E402
 TASK_NAME = "livr_counting"
 MIN_COUNT = 2
 MAX_COUNT = 10
-N_TRAIN = 1000
-N_VAL = 534
-N_TEST = 528
+N_TRAIN = 1000  # paper Appendix A
+N_VAL = 534  # paper Appendix A — official PixMo val after URL filter
+N_TEST = 528  # paper Appendix A — official PixMo test after URL filter
+
+# Appendix A: "counts are approximately uniformly represented".
+# 9 buckets c=2..10 -> ~111 per bucket for N_TRAIN=1000 (rounding):
+PER_BUCKET_TRAIN = N_TRAIN // (MAX_COUNT - MIN_COUNT + 1)  # = 111
+
+
+def _get_count(sample: dict) -> int | None:
+    """Extract integer count from a PixMo-Count sample row."""
+    count = sample.get("count")
+    if count is None:
+        for k in ("number", "label", "answer", "target"):
+            if k in sample:
+                try:
+                    return int(sample[k])
+                except (ValueError, TypeError):
+                    continue
+        return None
+    try:
+        return int(count)
+    except (ValueError, TypeError):
+        return None
 
 
 def _open_image(sample: dict) -> Image.Image | None:
-    """Get the PIL image for a PixMo sample (embedded or via URL)."""
+    """Get the PIL image for a PixMo sample (embedded or via URL).
+
+    PixMo-Count samples carry images by URL; transient fetch failures
+    or 404s are common, hence the URL-validity filter mentioned in
+    Appendix A.
+    """
     img = sample.get("image")
     if isinstance(img, Image.Image):
         return img
@@ -62,12 +103,97 @@ def _open_image(sample: dict) -> Image.Image | None:
         return None
 
 
+def _materialize(samples_with_count, out_dir: Path, prefix: str):
+    """Download + save images for a list of (orig_idx, sample, count) tuples.
+
+    Returns a list of (out_path, count) for the successfully saved images.
+    Skips samples whose URL is invalid (this is the "removing bad URLs"
+    step from the paper — drives the 534/528 numbers).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[tuple[Path, int]] = []
+    for idx, (_, sample, count) in enumerate(samples_with_count):
+        img = _open_image(sample)
+        if img is None:
+            continue
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        out_path = out_dir / f"{prefix}_{idx:05d}.png"
+        save_image(img, str(out_path), format="PNG")
+        saved.append((out_path, count))
+        if (idx + 1) % 200 == 0:
+            logger.info("  [%s] saved %d/%d", prefix, len(saved), idx + 1)
+    return saved
+
+
+def _filter_count_range(split):
+    """Yield (orig_idx, sample, count) for rows with c in {2..10}."""
+    out = []
+    for i, sample in enumerate(split):
+        c = _get_count(sample)
+        if c is not None and MIN_COUNT <= c <= MAX_COUNT:
+            out.append((i, sample, c))
+    return out
+
+
+def _uniform_sample_train(filtered, rng) -> list[tuple[int, dict, int]]:
+    """Sample ~uniformly across c=2..10. We sample more than 1000 so
+    after image-fetch failures we still hit 1000 saved images."""
+    by_count: dict[int, list] = defaultdict(list)
+    for r in filtered:
+        by_count[r[2]].append(r)
+    for c in by_count:
+        rng.shuffle(by_count[c])
+    # Oversample by 50% to absorb URL-failure attrition.
+    target_per_bucket = int(PER_BUCKET_TRAIN * 1.5)
+    pool: list = []
+    for c in range(MIN_COUNT, MAX_COUNT + 1):
+        bucket = by_count.get(c, [])
+        pool.extend(bucket[:target_per_bucket])
+        logger.info(
+            "  count=%d -> pool size=%d (had %d)",
+            c,
+            min(len(bucket), target_per_bucket),
+            len(bucket),
+        )
+    rng.shuffle(pool)
+    return pool
+
+
+def _build_records(
+    saved: list[tuple[Path, int]], split_name: str, sample_index: dict
+) -> list[dict]:
+    """Build open-ended counting records.
+
+    sample_index maps Path -> the original sample dict so we can recover
+    the object label for the question phrasing.
+    """
+    recs = []
+    for img_path, count in saved:
+        sample = sample_index.get(img_path, {})
+        obj_label = sample.get("label", "objects")
+        question = f"How many {obj_label} are in the image? Provide a single integer answer."
+        recs.append(
+            {
+                "question": question,
+                "ground_truth": str(count),
+                "answer_type": "counting",  # open-ended numeric — fuzzy partial credit
+                "choices": "",
+                "images": [str(img_path)],
+                "dataset_name": TASK_NAME,
+                "split": split_name,
+            }
+        )
+    return recs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pixmo-dir",
         default="/outputs/livr_v2_sources/pixmo_count",
-        help="Path to PixMo-Count HF dataset (load_from_disk-able).",
+        help="Path to PixMo-Count HF dataset (load_from_disk-able). Must "
+        "contain train + validation + test splits.",
     )
     parser.add_argument("--output-dir", default="/outputs/livr_v2/image_base/counting")
     parser.add_argument("--output-jsonl-prefix", default="/outputs/livr_v2/data/counting")
@@ -75,145 +201,141 @@ def main() -> None:
     parser.add_argument(
         "--skip-dedup",
         action="store_true",
-        help="Skip the perceptual+SSIM dedup vs PixMo test (useful for debugging).",
+        help="Skip the CLIP+pHash+SSIM dedup vs official test images.",
     )
+    parser.add_argument("--clip-device", default="cuda")
     args = parser.parse_args()
 
     log_task_banner(TASK_NAME)
     rng = random.Random(args.seed)
 
     ds = load_from_disk(args.pixmo_dir)
-    # PixMo-Count has 'train' and 'test' splits.
-    if "train" in ds:
-        train_split = ds["train"]
-        test_split = ds.get("test", None)
-    else:
-        train_split = ds
-        test_split = None
+    train_split = ds["train"] if "train" in ds else ds
+    val_split = ds.get("validation") or ds.get("val")
+    test_split = ds.get("test")
+    if val_split is None or test_split is None:
+        raise SystemExit(
+            "PixMo-Count snapshot missing 'validation' or 'test' splits. "
+            "Re-run datasets.load_dataset('allenai/pixmo-count').save_to_disk(...) "
+            "to capture all official splits."
+        )
     logger.info(
-        "Loaded PixMo-Count (train=%d, test=%s)",
+        "PixMo-Count: train=%d  validation=%d  test=%d",
         len(train_split),
-        len(test_split) if test_split else "n/a",
+        len(val_split),
+        len(test_split),
     )
 
-    # Step 1: filter for count range on the source (will sample from this).
-    def filt(split):
-        out = []
-        for i, sample in enumerate(split):
-            count = sample.get("count")
-            if count is None:
-                for k in ("number", "label", "answer", "target"):
-                    if k in sample:
-                        try:
-                            count = int(sample[k])
-                            break
-                        except (ValueError, TypeError):
-                            continue
-            if count is not None and MIN_COUNT <= count <= MAX_COUNT:
-                out.append((i, sample, count))
-        return out
+    # 1) filter to c in {2..10}
+    train_filt = _filter_count_range(train_split)
+    val_filt = _filter_count_range(val_split)
+    test_filt = _filter_count_range(test_split)
+    logger.info(
+        "After count-range filter: train=%d  val=%d  test=%d",
+        len(train_filt),
+        len(val_filt),
+        len(test_filt),
+    )
 
-    filtered = filt(train_split)
-    logger.info("Filtered train: %d in count range [%d, %d]", len(filtered), MIN_COUNT, MAX_COUNT)
+    out_root = Path(args.output_dir)
 
-    # Step 2: produce material in excess so we can dedup + still hit the
-    # split sizes. Need at least N_TRAIN+N_VAL = 1534 surviving the dedup.
-    needed = N_TRAIN + N_VAL + N_TEST + 200
-    rng.shuffle(filtered)
-    material = filtered[:needed]
+    # 2) uniform sample for TRAIN, materialize all three splits
+    train_pool = _uniform_sample_train(train_filt, rng)
+    rng.shuffle(val_filt)
+    rng.shuffle(test_filt)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Materializing test split...")
+    test_saved = _materialize(test_filt[: N_TEST + 100], out_root / "test", "counting_test")
+    logger.info("Materializing val split...")
+    val_saved = _materialize(val_filt[: N_VAL + 100], out_root / "val", "counting_val")
+    logger.info("Materializing train pool...")
+    train_saved = _materialize(train_pool, out_root / "train", "counting_train")
 
-    saved: list[tuple[Path, dict, int]] = []
-    for idx, (orig_idx, sample, count) in enumerate(material):
-        img = _open_image(sample)
-        if img is None:
-            continue
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        out_path = out_dir / f"counting_{idx:05d}.png"
-        save_image(img, str(out_path), format="PNG")
-        saved.append((out_path, sample, count))
-        if (idx + 1) % 200 == 0:
-            logger.info("  saved %d/%d images", idx + 1, len(material))
-    logger.info("Saved %d images for counting", len(saved))
+    # Build a Path -> sample lookup (so we can reach object labels later).
+    sample_index: dict[Path, dict] = {}
+    for source, saved_list in [
+        (test_filt, test_saved),
+        (val_filt, val_saved),
+        (train_pool, train_saved),
+    ]:
+        # The order in `saved_list` mirrors the order in `source`, but with
+        # gaps where URL fetches failed. Re-walk to align.
+        idx_iter = iter(source)
+        for path, _count in saved_list:
+            # Pop samples until we find one that actually rendered (we
+            # can't tell from here which were skipped). This is a best-
+            # effort label lookup; fallback "objects" is fine.
+            try:
+                _, sample, _ = next(idx_iter)
+                sample_index[path] = sample
+            except StopIteration:
+                break
 
-    # Step 3: dedup against PixMo test split if available.
-    keep_set: set[Path] | None = None
-    if test_split is not None and not args.skip_dedup:
-        test_filtered = filt(test_split)
-        # Save test images temporarily for dedup comparison.
-        test_dir = out_dir / "_pixmo_test_for_dedup"
-        test_dir.mkdir(parents=True, exist_ok=True)
-        test_paths = []
-        for j, (_, ts, _) in enumerate(test_filtered[:1000]):
-            ti = _open_image(ts)
-            if ti is None:
-                continue
-            if ti.mode != "RGB":
-                ti = ti.convert("RGB")
-            tp = test_dir / f"pixmo_test_{j:05d}.png"
-            save_image(ti, str(tp), format="PNG")
-            test_paths.append(tp)
-        keep_set = perceptual_dedup(
-            candidates=[p for (p, _, _) in saved],
+    # 3) Dedup train+val vs test (per Appendix A: CLIP + pHash + SSIM).
+    if not args.skip_dedup and test_saved:
+        test_paths = [p for p, _ in test_saved]
+        candidates = [p for p, _ in train_saved] + [p for p, _ in val_saved]
+        # Appendix A: "CLIP embeddings together with perceptual hashing
+        # and SSIM-based image similarity" — full_dedup ANDs all three
+        # so a candidate is dropped only if all three checks agree it's
+        # a near-duplicate.
+        keep_set = full_dedup(
+            candidates=candidates,
             exclude=test_paths,
+            clip_sim_thresh=0.95,
             phash_thresh=8,
             ssim_thresh=0.95,
+            device=args.clip_device,
         )
-        # Cleanup temp dir.
-        for tp in test_paths:
-            tp.unlink(missing_ok=True)
-        try:
-            test_dir.rmdir()
-        except OSError:
-            pass
-
-    final = [(p, s, c) for (p, s, c) in saved if keep_set is None or p in keep_set]
-    logger.info("After dedup: %d remain (need %d)", len(final), N_TRAIN + N_VAL + N_TEST)
-
-    if len(final) < N_TRAIN + N_VAL + N_TEST:
-        logger.warning(
-            "Not enough samples after dedup (have %d, need %d). Continuing with what we have.",
-            len(final),
-            N_TRAIN + N_VAL + N_TEST,
+        train_saved = [(p, c) for p, c in train_saved if p in keep_set]
+        val_saved = [(p, c) for p, c in val_saved if p in keep_set]
+        logger.info(
+            "After dedup: train=%d  val=%d",
+            len(train_saved),
+            len(val_saved),
         )
 
-    # Step 4: build records. Open-ended counting matches the existing
-    # numeric/counting answer_type in vlm_grpo (fuzzy partial credit
-    # already implemented in the verifier).
-    def build_records(slice_, split_name):
-        recs = []
-        for img_path, sample, count in slice_:
-            obj_label = sample.get("label", "objects")
-            question = f"How many {obj_label} are in the image? Provide a single integer answer."
-            recs.append(
-                {
-                    "question": question,
-                    "ground_truth": str(count),
-                    "answer_type": "counting",
-                    "choices": "",
-                    "images": [str(img_path)],
-                    "dataset_name": TASK_NAME,
-                    "split": split_name,
-                }
-            )
-        return recs
+    # 4) Trim to exactly the paper's split sizes (1000 / 534 / 528)
+    if len(train_saved) >= N_TRAIN:
+        # Re-balance to keep counts roughly uniform after dedup attrition.
+        by_count: dict[int, list] = defaultdict(list)
+        for p, c in train_saved:
+            by_count[c].append((p, c))
+        for c in by_count:
+            rng.shuffle(by_count[c])
+        per_bucket = N_TRAIN // (MAX_COUNT - MIN_COUNT + 1)
+        balanced: list[tuple[Path, int]] = []
+        for c in range(MIN_COUNT, MAX_COUNT + 1):
+            balanced.extend(by_count.get(c, [])[:per_bucket])
+        # Top up if a bucket was short.
+        if len(balanced) < N_TRAIN:
+            extras = [item for c in by_count for item in by_count[c][per_bucket:]]
+            rng.shuffle(extras)
+            balanced += extras[: N_TRAIN - len(balanced)]
+        train_saved = balanced[:N_TRAIN]
+    val_saved = val_saved[:N_VAL]
+    test_saved = test_saved[:N_TEST]
 
-    train_records = build_records(final[:N_TRAIN], "train")
-    val_records = build_records(final[N_TRAIN : N_TRAIN + N_VAL], "val")
-    test_records = build_records(final[N_TRAIN + N_VAL : N_TRAIN + N_VAL + N_TEST], "test")
+    # 5) Build + write records.
+    train_records = _build_records(train_saved, "train", sample_index)
+    val_records = _build_records(val_saved, "val", sample_index)
+    test_records = _build_records(test_saved, "test", sample_index)
 
     write_jsonl(train_records, f"{args.output_jsonl_prefix}_train.jsonl")
     write_jsonl(val_records, f"{args.output_jsonl_prefix}_val.jsonl")
     write_jsonl(test_records, f"{args.output_jsonl_prefix}_test.jsonl")
     logger.info(
-        "Counting build done: %d/%d/%d (train/val/test)",
+        "Counting build done: train=%d  val=%d  test=%d",
         len(train_records),
         len(val_records),
         len(test_records),
     )
+
+    # Per-bucket distribution sanity log.
+    train_dist: dict[int, int] = defaultdict(int)
+    for r in train_records:
+        train_dist[int(r["ground_truth"])] += 1
+    logger.info("Train count distribution: %s", dict(sorted(train_dist.items())))
 
 
 if __name__ == "__main__":

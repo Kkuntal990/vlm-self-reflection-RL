@@ -130,6 +130,15 @@ def main() -> None:
     rng.shuffle(scenes)
     needed = N_TRAIN + N_VAL + N_TEST + 200
 
+    # Per-class quotas (Appendix A: "'About the same' class constitutes
+    # roughly one quarter of the data"). 25% C, ~37.5% A, ~37.5% B.
+    quota_c = int(round(needed * 0.25))
+    quota_a = int(round((needed - quota_c) * 0.5))
+    quota_b = needed - quota_c - quota_a
+    quotas = {"A": quota_a, "B": quota_b, "C": quota_c}
+    counts = {"A": 0, "B": 0, "C": 0}
+    logger.info("Per-class quotas: %s (target ~25%% for C 'About the same')", quotas)
+
     records: list[dict] = []
     for scene_idx, scene in enumerate(scenes):
         if len(records) >= needed:
@@ -147,8 +156,13 @@ def main() -> None:
         if H < 2 * MARGIN + 2 * args.patch_size or W < 2 * MARGIN + 2 * args.patch_size:
             continue
 
-        # Sample multiple point pairs from this scene to amortize the load cost.
-        for _ in range(min(3, max(1, needed - len(records)))):
+        # Try a generous number of point-pair attempts per scene; for
+        # each, accept only if the resulting class is still under quota.
+        # This balances toward the target ≈25% / ≈37.5% / ≈37.5% mix.
+        attempts_per_scene = 8
+        for _ in range(attempts_per_scene):
+            if len(records) >= needed:
+                break
             ax = rng.randint(MARGIN + args.patch_size, W - MARGIN - args.patch_size)
             ay = rng.randint(MARGIN + args.patch_size, H - MARGIN - args.patch_size)
             for _ in range(40):
@@ -176,6 +190,10 @@ def main() -> None:
                 gt = "A"  # A is darker
             else:
                 gt = "B"  # B is darker
+            # Reject if this class is already over quota.
+            if counts[gt] >= quotas[gt]:
+                continue
+            counts[gt] += 1
 
             # Annotate the displayed RGB (resize albedo points to RGB coords if dims differ).
             disp = rgb.copy()
@@ -215,7 +233,7 @@ def main() -> None:
                 break
         if (scene_idx + 1) % 50 == 0:
             logger.info("  scenes processed=%d  records=%d/%d", scene_idx + 1, len(records), needed)
-    logger.info("Built %d relative_reflectance records", len(records))
+    logger.info("Built %d relative_reflectance records (class counts: %s)", len(records), counts)
 
     train = records[:N_TRAIN]
     val = records[N_TRAIN : N_TRAIN + N_VAL]

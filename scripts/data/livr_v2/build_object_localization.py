@@ -29,7 +29,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.dirname(__file__))
-from dedup import clip_dedup  # noqa: E402
+from dedup import full_dedup  # noqa: E402
 from livr_common import (  # noqa: E402
     OPTION_COLORS,
     OPTION_LETTERS,
@@ -233,16 +233,22 @@ def main() -> None:
     logger.info("Saved %d candidates", len(saved))
 
     # Dedup vs BLINK Object_Localization val.
+    # Appendix A: "CLIP embeddings together with perceptual hashing and
+    # SSIM-based image similarity (on both raw and blurred grayscale
+    # images)" — three confirming checks PLUS a blurred-grayscale pass.
     keep_set: set[Path] | None = None
     if not args.skip_dedup:
         blink_imgs = _load_blink_val_images(Path(args.blink_val_dir))
         logger.info("BLINK Object_Localization val: %d images", len(blink_imgs))
         if blink_imgs:
-            keep_set = clip_dedup(
+            keep_set = full_dedup(
                 candidates=[p for p, _ in saved],
                 exclude=blink_imgs,
-                sim_thresh=0.95,
+                clip_sim_thresh=0.95,
+                phash_thresh=8,
+                ssim_thresh=0.95,
                 device=args.clip_device,
+                blurred_grayscale=True,
             )
 
     final = [(p, r) for p, r in saved if keep_set is None or p in keep_set]

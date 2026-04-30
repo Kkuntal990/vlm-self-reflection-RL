@@ -226,3 +226,188 @@ def clip_dedup(
         float(np.percentile(max_sim, 95)),
     )
     return kept
+
+
+# =============================================================================
+# Composite dedup pipelines (Appendix A says "CLIP + pHash + SSIM")
+# =============================================================================
+
+
+def full_dedup(
+    candidates: list[Path],
+    exclude: list[Path],
+    clip_sim_thresh: float = 0.95,
+    phash_thresh: int = 8,
+    ssim_thresh: float = 0.95,
+    device: str = "cuda",
+    blurred_grayscale: bool = False,
+) -> set[Path]:
+    """Appendix-A dedup: keep only candidates rejected by ANY of the three
+    similarity checks (CLIP cosine, perceptual hash, SSIM).
+
+    A candidate is dropped if a near-duplicate is found by ALL THREE checks
+    simultaneously (i.e. a candidate is kept if AT LEAST ONE check finds it
+    distinct enough). This matches the paper's "CLIP embeddings TOGETHER WITH
+    perceptual hashing AND SSIM-based image similarity" — three confirming
+    signals required to declare a duplicate.
+
+    Args:
+        candidates: paths to potentially keep.
+        exclude: held-out target images (e.g. BLINK val) we must not duplicate.
+        clip_sim_thresh, phash_thresh, ssim_thresh: per-check thresholds.
+        device: CLIP device.
+        blurred_grayscale: also run pHash + SSIM on a blurred-grayscale
+            version of each image (Appendix A: object_localization runs
+            "on both raw and blurred grayscale images").
+
+    Returns:
+        Set of paths to keep (i.e. NOT confirmed duplicates by all checks).
+    """
+    if not exclude:
+        return set(candidates)
+
+    candidate_set = set(candidates)
+    clip_keep = clip_dedup(candidates, exclude, clip_sim_thresh, device)
+    phash_keep = perceptual_dedup(candidates, exclude, phash_thresh, ssim_thresh)
+
+    # A candidate is rejected only if BOTH CLIP and pHash+SSIM call it a dup.
+    rejected = (candidate_set - clip_keep) & (candidate_set - phash_keep)
+
+    if blurred_grayscale:
+        cand_blurred = _make_blurred_grayscale_copies(candidates)
+        excl_blurred = _make_blurred_grayscale_copies(exclude)
+        try:
+            phash_keep_blur = perceptual_dedup(
+                cand_blurred, excl_blurred, phash_thresh, ssim_thresh
+            )
+            # Map blurred temp paths back to originals.
+            blur_to_orig = dict(zip(cand_blurred, candidates))
+            blur_rejected_set = set(cand_blurred) - phash_keep_blur
+            rejected_blur = {blur_to_orig[b] for b in blur_rejected_set if b in blur_to_orig}
+            # Augment rejection set with blurred-grayscale duplicates.
+            rejected |= rejected_blur & (candidate_set - clip_keep)
+        finally:
+            for p in cand_blurred:
+                p.unlink(missing_ok=True)
+            for p in excl_blurred:
+                p.unlink(missing_ok=True)
+
+    kept = candidate_set - rejected
+    logger.info(
+        "full_dedup: kept %d / %d (rejected %d as confirmed duplicates%s)",
+        len(kept),
+        len(candidates),
+        len(rejected),
+        " incl. blurred-grayscale" if blurred_grayscale else "",
+    )
+    return kept
+
+
+def _make_blurred_grayscale_copies(paths: list[Path]) -> list[Path]:
+    """Save grayscale + Gaussian-blurred copies of each image to a temp
+    directory; return paths to the copies.
+
+    Used for the "blurred grayscale" pass in object_localization dedup.
+    """
+    import tempfile
+
+    from PIL import Image as PILImage
+    from PIL import ImageFilter
+
+    temp_root = Path(tempfile.mkdtemp(prefix="livr_v2_blur_"))
+    out: list[Path] = []
+    for i, p in enumerate(paths):
+        try:
+            img = PILImage.open(p).convert("L").filter(ImageFilter.GaussianBlur(radius=3))
+            tp = temp_root / f"blur_{i:06d}.png"
+            img.save(tp)
+            out.append(tp)
+        except Exception as e:
+            logger.warning("Failed to make blurred-grayscale for %s: %s", p, e)
+    return out
+
+
+def pair_aware_dedup(
+    candidate_pairs: list[tuple[Path, Path]],
+    exclude_pairs: list[tuple[Path, Path]],
+    clip_sim_thresh: float = 0.95,
+    phash_thresh: int = 8,
+    ssim_thresh: float = 0.95,
+    device: str = "cuda",
+) -> set[int]:
+    """Pair-aware dedup for tasks that work on (source, target) image pairs
+    (Semantic_Correspondence). A candidate pair (cs, ct) is rejected if
+    ANY exclude pair (es, et) matches in EITHER orientation:
+
+      aligned : (cs ~ es) AND (ct ~ et)
+      swapped : (cs ~ et) AND (ct ~ es)
+
+    Returns indices of pairs to keep (positions in the input list).
+
+    A pair-side image-pair "matches" if ALL THREE checks (CLIP + pHash +
+    SSIM) call it a duplicate, mirroring `full_dedup` for single images.
+    """
+    if not exclude_pairs:
+        return set(range(len(candidate_pairs)))
+
+    # Flatten + embed all unique candidate and exclude images once.
+    cand_images: list[Path] = []
+    for cs, ct in candidate_pairs:
+        cand_images.append(cs)
+        cand_images.append(ct)
+    excl_images: list[Path] = []
+    for es, et in exclude_pairs:
+        excl_images.append(es)
+        excl_images.append(et)
+
+    import imagehash
+    import numpy as np
+    from PIL import Image as PILImage
+    from skimage.metrics import structural_similarity as ssim
+
+    cand_emb = _clip_embed(cand_images)
+    excl_emb = _clip_embed(excl_images)
+    if cand_emb.size == 0 or excl_emb.size == 0:
+        return set(range(len(candidate_pairs)))
+
+    # CLIP similarity matrix.
+    clip_sims = cand_emb @ excl_emb.T  # (2*n_cand, 2*n_excl)
+
+    # pHash + SSIM thumbnails for verification.
+    def _hash_and_thumb(p: Path):
+        img = PILImage.open(p).convert("RGB")
+        thumb = np.asarray(img.resize((64, 64), PILImage.LANCZOS).convert("L"))
+        return imagehash.phash(img), thumb
+
+    cand_hashes_thumbs = [_hash_and_thumb(p) for p in cand_images]
+    excl_hashes_thumbs = [_hash_and_thumb(p) for p in excl_images]
+
+    def _full_match(ci: int, ei: int) -> bool:
+        if clip_sims[ci, ei] < clip_sim_thresh:
+            return False
+        ch, ct = cand_hashes_thumbs[ci]
+        eh, et = excl_hashes_thumbs[ei]
+        if (ch - eh) >= phash_thresh:
+            return False
+        s = ssim(ct, et, data_range=255.0)
+        return s > ssim_thresh
+
+    keep: set[int] = set()
+    for pi, _ in enumerate(candidate_pairs):
+        cs_idx, ct_idx = 2 * pi, 2 * pi + 1
+        is_dup = False
+        for ei in range(len(exclude_pairs)):
+            es_idx, et_idx = 2 * ei, 2 * ei + 1
+            aligned = _full_match(cs_idx, es_idx) and _full_match(ct_idx, et_idx)
+            if aligned:
+                is_dup = True
+                break
+            swapped = _full_match(cs_idx, et_idx) and _full_match(ct_idx, es_idx)
+            if swapped:
+                is_dup = True
+                break
+        if not is_dup:
+            keep.add(pi)
+
+    logger.info("pair_aware_dedup: kept %d / %d pairs", len(keep), len(candidate_pairs))
+    return keep

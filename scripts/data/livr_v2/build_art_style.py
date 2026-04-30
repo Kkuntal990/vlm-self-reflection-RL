@@ -32,7 +32,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.dirname(__file__))
-from dedup import clip_dedup  # noqa: E402
+from dedup import full_dedup  # noqa: E402
 from livr_common import (  # noqa: E402
     OPTION_LETTERS,
     get_font,
@@ -184,10 +184,13 @@ def main() -> None:
         ]
         logger.info("BLINK Art_Style val images: %d", len(blink_imgs))
         if blink_imgs:
-            keep_set = clip_dedup(
+            # Appendix A: CLIP + pHash + SSIM ANDed.
+            keep_set = full_dedup(
                 candidates=[p for p, _ in saved],
                 exclude=blink_imgs,
-                sim_thresh=0.95,
+                clip_sim_thresh=0.95,
+                phash_thresh=8,
+                ssim_thresh=0.95,
                 device=args.clip_device,
             )
 
