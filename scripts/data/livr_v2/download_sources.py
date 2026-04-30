@@ -33,7 +33,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -110,10 +109,7 @@ def download_hpatches(root: Path) -> None:
     if _is_done(dest):
         logger.info("HPatches already complete, skipping")
         return
-    archive_url = (
-        "http://icvl.ee.ic.ac.uk/vbalnt/hpatches/"
-        "hpatches-sequences-release.tar.gz"
-    )
+    archive_url = "http://icvl.ee.ic.ac.uk/vbalnt/hpatches/hpatches-sequences-release.tar.gz"
     archive = dest / "hpatches-sequences-release.tar.gz"
     _wget(archive_url, archive)
     _extract(archive, dest)
@@ -158,10 +154,7 @@ def download_mid(root: Path) -> None:
         return
     # MID release URLs (from the project's data page).
     # The "diffuse_25" subset includes the albedo + luminance maps.
-    archive_url = (
-        "https://data.csail.mit.edu/multilum/"
-        "multi_illumination_train_mip2_jpg.zip"
-    )
+    archive_url = "https://data.csail.mit.edu/multilum/multi_illumination_train_mip2_jpg.zip"
     archive = dest / "multi_illumination_train_mip2_jpg.zip"
     _wget(archive_url, archive)
     _extract(archive, dest)
@@ -181,10 +174,7 @@ def download_artbench10(root: Path) -> None:
     if _is_done(dest):
         logger.info("ArtBench-10 already complete, skipping")
         return
-    archive_url = (
-        "https://artbench.eecs.berkeley.edu/files/"
-        "artbench-10-imagefolder-split.tar"
-    )
+    archive_url = "https://artbench.eecs.berkeley.edu/files/artbench-10-imagefolder-split.tar"
     archive = dest / "artbench-10-imagefolder-split.tar"
     _wget(archive_url, archive)
     _extract(archive, dest)
@@ -348,9 +338,7 @@ def main() -> None:
     for entry in sorted(root.iterdir()):
         if entry.is_dir() or entry.is_symlink():
             try:
-                size_mb = sum(
-                    f.stat().st_size for f in entry.rglob("*") if f.is_file()
-                ) / 1e6
+                size_mb = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file()) / 1e6
                 logger.info("  %s: %.0f MB", entry.name, size_mb)
             except OSError:
                 logger.info("  %s: (symlinked)", entry.name)
