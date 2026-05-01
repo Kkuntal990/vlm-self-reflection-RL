@@ -116,36 +116,85 @@ def _find_scenes(root: Path) -> list[Path]:
     return sorted(scenes)
 
 
-def _find_albedo_and_rgb(scene_dir: Path) -> tuple[Path, Path] | None:
-    """Find the albedo map and an RGB image to display in this scene.
+def _find_materials_and_rgb(scene_dir: Path) -> tuple[Path, Path] | None:
+    """Find materials_mip2.png and one RGB illumination frame.
 
-    MID provides per-scene 'probes' and material decomposition outputs.
-    The naming convention varies; we look for files containing 'albedo'
-    (or 'reflectance') and pair with the first available RGB frame.
+    DEVIATION FROM PAPER (Appendix A "RGB-albedo pair"):
+    The MID training zip we have access to (multi_illumination_train_mip2_jpg.zip)
+    does NOT ship pre-computed albedo decompositions; it ships scene RGB
+    at 25 illuminations + chrome/gray probe balls + a materials
+    segmentation map (`materials_mip2.png`). The decomposition zip is
+    not exposed as a public download. We use materials_mip2.png as the
+    ground-truth signal for "same reflectance" — pixels with the same
+    material ID are by construction the same intrinsic material and
+    therefore the same reflectance, which is *more* accurate than
+    luminance-thresholding on an estimated albedo map.
+
+    Returns (materials_mip2.png, dir_<N>_mip2.jpg) for one fixed
+    illumination, or None if either is missing.
     """
-    files = list(scene_dir.iterdir())
-    albedo = None
-    rgb = None
-    for f in files:
-        n = f.name.lower()
-        if (
-            albedo is None
-            and ("albedo" in n or "reflectance" in n)
-            and f.suffix.lower() in {".jpg", ".jpeg", ".png", ".exr"}
-        ):
-            albedo = f
-        elif (
-            rgb is None
-            and f.suffix.lower() in {".jpg", ".jpeg", ".png"}
-            and "albedo" not in n
-            and "shading" not in n
-            and "normal" not in n
-            and "depth" not in n
-        ):
-            rgb = f
-    if albedo and rgb:
-        return albedo, rgb
-    return None
+    materials = scene_dir / "materials_mip2.png"
+    if not materials.exists():
+        return None
+    # Pick a deterministic illumination frame for display + luminance
+    # fallback. dir_0 is typically present; fall back to first dir_*.
+    rgb = scene_dir / "dir_0_mip2.jpg"
+    if not rgb.exists():
+        candidates = sorted(scene_dir.glob("dir_*_mip2.jpg"))
+        if not candidates:
+            return None
+        rgb = candidates[0]
+    return materials, rgb
+
+
+def _disk_majority_material(materials: np.ndarray, cx: int, cy: int, radius: int) -> int:
+    """Return the most-common material ID in the disk around (cx, cy).
+
+    Material IDs are encoded as the pixel value of materials_mip2.png
+    (8-bit grayscale or RGB). We collapse to a single int per pixel by
+    taking the first channel (MID's materials map is single-channel
+    semantic; PIL may broadcast to 3 channels on .convert('RGB')).
+    """
+    H, W = materials.shape[:2]
+    x0 = max(0, cx - radius)
+    x1 = min(W, cx + radius + 1)
+    y0 = max(0, cy - radius)
+    y1 = min(H, cy + radius + 1)
+    patch = materials[y0:y1, x0:x1]
+    if patch.ndim == 3:
+        patch = patch[..., 0]
+    yy, xx = np.ogrid[: patch.shape[0], : patch.shape[1]]
+    cyy = cy - y0
+    cxx = cx - x0
+    mask = (xx - cxx) ** 2 + (yy - cyy) ** 2 <= radius**2
+    if not mask.any():
+        return int(patch.flatten()[0])
+    vals = patch[mask].astype(np.int32)
+    bincount = np.bincount(vals)
+    return int(np.argmax(bincount))
+
+
+def _disk_mean_linear_luminance_rgb(rgb_arr: np.ndarray, cx: int, cy: int, radius: int) -> float:
+    """Same disk-mean linear luminance as the albedo helper, but
+    operating on the scene RGB image. Used only for A/B comparison
+    when the two points are on DIFFERENT materials — at that point
+    luminance is a reasonable cheap signal for "which is darker"
+    even though it includes shading."""
+    H, W = rgb_arr.shape[:2]
+    x0 = max(0, cx - radius)
+    x1 = min(W, cx + radius + 1)
+    y0 = max(0, cy - radius)
+    y1 = min(H, cy + radius + 1)
+    patch = rgb_arr[y0:y1, x0:x1]
+    linear = _srgb_to_linear(patch)
+    yy, xx = np.ogrid[: linear.shape[0], : linear.shape[1]]
+    cyy = cy - y0
+    cxx = cx - x0
+    mask = (xx - cxx) ** 2 + (yy - cyy) ** 2 <= radius**2
+    if not mask.any():
+        return _luminance_linear(linear.mean(axis=(0, 1)))
+    disk_mean = linear[mask].mean(axis=0)
+    return _luminance_linear(disk_mean)
 
 
 def main() -> None:
@@ -187,22 +236,33 @@ def main() -> None:
     for scene_idx, scene in enumerate(scenes):
         if len(records) >= needed:
             break
-        ar = _find_albedo_and_rgb(scene)
-        if ar is None:
+        mr = _find_materials_and_rgb(scene)
+        if mr is None:
             continue
-        albedo_path, rgb_path = ar
+        materials_path, rgb_path = mr
         try:
-            albedo = np.asarray(Image.open(albedo_path).convert("RGB"), dtype=np.float32)
-            rgb = Image.open(rgb_path).convert("RGB")
+            materials = np.asarray(Image.open(materials_path), dtype=np.int32)
+            rgb_pil = Image.open(rgb_path).convert("RGB")
+            rgb_arr = np.asarray(rgb_pil, dtype=np.float32)
         except Exception:
             continue
-        H, W = albedo.shape[:2]
+        # Materials map and RGB share the same _mip2 scale (~1500x1000),
+        # but be defensive: resize the materials map to the RGB grid if
+        # they ever diverge so coordinate sampling stays consistent.
+        if materials.shape[:2] != rgb_arr.shape[:2]:
+            materials = np.asarray(
+                Image.open(materials_path).resize(
+                    (rgb_arr.shape[1], rgb_arr.shape[0]), Image.NEAREST
+                ),
+                dtype=np.int32,
+            )
+        H, W = rgb_arr.shape[:2]
         if H < 2 * MARGIN + 2 * args.patch_size or W < 2 * MARGIN + 2 * args.patch_size:
             continue
 
-        # Try a generous number of point-pair attempts per scene; for
-        # each, accept only if the resulting class is still under quota.
-        # This balances toward the target ≈25% / ≈37.5% / ≈37.5% mix.
+        # Per scene, try several point-pair attempts; each is accepted
+        # only if the resulting class is still under quota. This balances
+        # toward the target ≈25% / ≈37.5% / ≈37.5% mix.
         attempts_per_scene = 8
         for _ in range(attempts_per_scene):
             if len(records) >= needed:
@@ -216,33 +276,34 @@ def main() -> None:
                     break
             else:
                 continue
-            ya = _disk_mean_linear_luminance(albedo, ax, ay, args.patch_size)
-            yb = _disk_mean_linear_luminance(albedo, bx, by, args.patch_size)
-            mx = max(ya, yb, 1e-8)
-            rel = abs(ya - yb) / mx
-            if rel <= REL_THRESHOLD:
-                gt = "C"  # About the same
-            elif ya < yb:
-                gt = "A"  # A is darker
+
+            # Material-segmentation ground truth (Option B):
+            # - Same material ID at both points  -> reflectance is identical
+            #   by construction -> class C "About the same".
+            # - Different materials              -> compare disk-mean linear
+            #   luminance on the scene RGB to decide A-darker vs B-darker.
+            mat_a = _disk_majority_material(materials, ax, ay, args.patch_size)
+            mat_b = _disk_majority_material(materials, bx, by, args.patch_size)
+            if mat_a == mat_b:
+                gt = "C"
             else:
-                gt = "B"  # B is darker
+                ya = _disk_mean_linear_luminance_rgb(rgb_arr, ax, ay, args.patch_size)
+                yb = _disk_mean_linear_luminance_rgb(rgb_arr, bx, by, args.patch_size)
+                # Skip near-tie luminance pairs on different materials —
+                # they're noisy labels for "which is darker" and add no
+                # signal beyond the C class.
+                mx = max(ya, yb, 1e-8)
+                rel = abs(ya - yb) / mx
+                if rel < REL_THRESHOLD:
+                    continue
+                gt = "A" if ya < yb else "B"
             # Reject if this class is already over quota.
             if counts[gt] >= quotas[gt]:
                 continue
             counts[gt] += 1
 
-            # Annotate the displayed RGB (resize albedo points to RGB coords if dims differ).
-            disp = rgb.copy()
-            if disp.size != (W, H):
-                rax = int(ax * disp.size[0] / W)
-                ray = int(ay * disp.size[1] / H)
-                rbx = int(bx * disp.size[0] / W)
-                rby = int(by * disp.size[1] / H)
-            else:
-                rax, ray, rbx, rby = ax, ay, bx, by
-            disp = draw_keypoint(disp, rax, ray, color=(255, 0, 0), radius=10, label="A")
-            disp = draw_keypoint(disp, rbx, rby, color=(0, 0, 255), radius=10, label="B")
-
+            disp = draw_keypoint(rgb_pil.copy(), ax, ay, color=(255, 0, 0), radius=10, label="A")
+            disp = draw_keypoint(disp, bx, by, color=(0, 0, 255), radius=10, label="B")
             out_filename = f"reflectance_{len(records):05d}.png"
             out_path = out_dir / out_filename
             save_image(disp, str(out_path), format="PNG")
