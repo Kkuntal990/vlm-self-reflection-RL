@@ -247,7 +247,7 @@ def _build_one(
     composite = create_side_by_side(
         src_an,
         tgt_an,
-        left_label=f"Source — REF on {src_row.get('object_category', 'object')} ({src_row['action']})",
+        left_label=f"Source — REF ({src_row.get('object_category', 'object')})",
         right_label="Target (find the same functional point)",
     )
     out_filename = f"funccorr_{out_idx:05d}.png"
