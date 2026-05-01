@@ -65,7 +65,14 @@ def _find_nights_root(root: Path) -> Path:
 
 
 def _load_triplets(nights_root: Path) -> list[dict]:
-    """Load (ref_path, candidate_a_path, candidate_b_path, vote) triplets."""
+    """Load (ref_path, candidate_a_path, candidate_b_path, vote) triplets.
+
+    The MIT NIGHTS release ships `data.csv` with columns:
+      id, left_vote, right_vote, votes, ref_path, left_path, right_path,
+      split, is_imagenet, prompt
+    Only rows with split=="train" are kept. Correct candidate is whichever
+    side received the majority of human votes.
+    """
     csv_candidates = list(nights_root.rglob("train.csv")) + list(nights_root.rglob("data.csv"))
     if not csv_candidates:
         raise FileNotFoundError(f"No NIGHTS CSV found under {nights_root}")
@@ -74,22 +81,29 @@ def _load_triplets(nights_root: Path) -> list[dict]:
     with open(csv_path) as f:
         reader = csv.DictReader(f)
         for row in reader:
+            split = (row.get("split") or "train").strip().lower()
+            if split and split != "train":
+                continue
+            ref_rel = row.get("ref_path") or row.get("ref")
+            a_rel = row.get("left_path") or row.get("distort_0_path") or row.get("left")
+            b_rel = row.get("right_path") or row.get("distort_1_path") or row.get("right")
+            if not (ref_rel and a_rel and b_rel):
+                continue
+            ref = nights_root / ref_rel
+            a = nights_root / a_rel
+            b = nights_root / b_rel
             try:
-                ref = (
-                    nights_root / row["ref_path"]
-                    if "ref_path" in row
-                    else nights_root / row.get("ref", "")
-                )
-                a = nights_root / (row.get("distort_0_path") or row.get("left", ""))
-                b = nights_root / (row.get("distort_1_path") or row.get("right", ""))
-                vote_raw = row.get("vote") or row.get("right_vote") or "0"
-                # NIGHTS convention: vote=0 means LEFT (distort_0) is more similar to ref;
-                # vote=1 means RIGHT (distort_1). We map "more similar" -> "correct" candidate.
-                if str(vote_raw).strip() in {"0", "0.0", "left"}:
-                    correct_idx = 0
-                else:
-                    correct_idx = 1
-            except Exception:
+                left_votes = float(row.get("left_vote") or 0)
+                right_votes = float(row.get("right_vote") or 0)
+            except ValueError:
+                continue
+            # Majority vote = "more similar to reference" = correct candidate.
+            # Ties (rare) are skipped to keep the label clean.
+            if right_votes > left_votes:
+                correct_idx = 1
+            elif left_votes > right_votes:
+                correct_idx = 0
+            else:
                 continue
             if ref.exists() and a.exists() and b.exists():
                 triplets.append({"ref": ref, "a": a, "b": b, "correct_idx": correct_idx})
