@@ -3,19 +3,24 @@
 
 Per Appendix A of arXiv:2512.21218:
 
-  Multi-task corpus = 6 tasks x 1000 train each = 6000 total
-  Tasks: Counting, Object_Localization, Visual_Correspondence,
-         Semantic_Correspondence, Functional_Correspondence,
-         Relative_Reflectance
+  Full corpus     = 9 tasks x 1000 train each = 9000 total
+  Multi-task abl. = 6 tasks x 1000 train each = 6000 total
+                    (Counting, Object_Localization, Visual_Correspondence,
+                     Semantic_Correspondence, Functional_Correspondence,
+                     Relative_Reflectance — omits Jigsaw, Art_Style,
+                     Visual_Similarity since base accuracy is already
+                     high on those.)
 
-We omit Functional_Correspondence (FunKPoint not publicly available),
-yielding a 5-task / 5000-example multi-task corpus until FunKPoint
-arrives via direct author request.
+Outputs (under --output-prefix):
+  *_9task_train.jsonl  — all 9 tasks merged (8000 if FunKPoint missing)
+  *_6task_train.jsonl  — paper's multi-task ablation (5000 if FunKPoint
+                         missing)
+  *_manifest.json      — per-task counts.
 
 Usage:
     python scripts/data/livr_v2/merge.py \\
         --data-dir /outputs/livr_v2/data \\
-        --output-prefix /outputs/livr_v2/data/livr_v2_5task
+        --output-prefix /outputs/livr_v2/data/livr_v2
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ ALL_TASKS = [
     "object_localization",
     "visual_correspondence",
     "semantic_correspondence",
+    "functional_correspondence",
     "relative_reflectance",
     "art_style",
     "visual_similarity",
@@ -53,14 +59,13 @@ ALL_TASKS = [
 
 # Paper's specific 6-task multi-task ablation (Appendix A "Multi-Task Setup"
 # omits Jigsaw, Art_Style, Visual_Similarity since base is already strong).
-# We omit Functional_Correspondence too -> 5-task variant for ablation.
 ABLATION_6TASK = [
     "counting",
     "object_localization",
     "visual_correspondence",
     "semantic_correspondence",
+    "functional_correspondence",
     "relative_reflectance",
-    # "functional_correspondence" — skipped (FunKPoint unavailable)
 ]
 
 
@@ -109,25 +114,26 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     manifest = {}
 
-    # Primary corpus: ALL 8 tasks (paper's 9 minus FunKPoint).
-    logger.info("=== Merging all-tasks corpus ===")
+    # Primary corpus: all 9 tasks (Counting, Jigsaw, Object_Localization,
+    # Visual_Correspondence, Semantic_Correspondence, Functional_Correspondence,
+    # Relative_Reflectance, Art_Style, Visual_Similarity).
+    logger.info("=== Merging all-tasks corpus (9 tasks) ===")
     all_train, all_val, all_counts = _merge_tasks(ALL_TASKS, data_dir, rng)
-    _write_jsonl(all_train, Path(f"{args.output_prefix}_8task_train.jsonl"))
-    _write_jsonl(all_val, Path(f"{args.output_prefix}_8task_val.jsonl"))
-    manifest["8task"] = {
+    _write_jsonl(all_train, Path(f"{args.output_prefix}_9task_train.jsonl"))
+    _write_jsonl(all_val, Path(f"{args.output_prefix}_9task_val.jsonl"))
+    manifest["9task"] = {
         "tasks": ALL_TASKS,
         "train": len(all_train),
         "val": len(all_val),
         "per_task": all_counts,
     }
 
-    # Ablation corpus: 5 of paper's 6-task multi-task setup
-    # (Functional_Correspondence omitted — FunKPoint not public).
-    logger.info("=== Merging ablation 5-task corpus ===")
+    # Ablation corpus: paper's 6-task multi-task ablation.
+    logger.info("=== Merging ablation 6-task corpus ===")
     abl_train, abl_val, abl_counts = _merge_tasks(ABLATION_6TASK, data_dir, rng)
-    _write_jsonl(abl_train, Path(f"{args.output_prefix}_5task_train.jsonl"))
-    _write_jsonl(abl_val, Path(f"{args.output_prefix}_5task_val.jsonl"))
-    manifest["5task"] = {
+    _write_jsonl(abl_train, Path(f"{args.output_prefix}_6task_train.jsonl"))
+    _write_jsonl(abl_val, Path(f"{args.output_prefix}_6task_val.jsonl"))
+    manifest["6task"] = {
         "tasks": ABLATION_6TASK,
         "train": len(abl_train),
         "val": len(abl_val),
