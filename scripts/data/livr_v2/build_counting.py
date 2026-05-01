@@ -106,12 +106,15 @@ def _open_image(sample: dict) -> Image.Image | None:
 def _materialize(samples_with_count, out_dir: Path, prefix: str):
     """Download + save images for a list of (orig_idx, sample, count) tuples.
 
-    Returns a list of (out_path, count) for the successfully saved images.
+    Returns a list of (out_path, count, sample) for the successfully saved
+    images. Carrying `sample` through means `_build_records` can read the
+    object label off the original PixMo row without trying to re-align two
+    list iterators (which silently misaligns whenever any URL fetch fails).
     Skips samples whose URL is invalid (this is the "removing bad URLs"
     step from the paper — drives the 534/528 numbers).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[tuple[Path, int]] = []
+    saved: list[tuple[Path, int, dict]] = []
     for idx, (_, sample, count) in enumerate(samples_with_count):
         img = _open_image(sample)
         if img is None:
@@ -120,7 +123,7 @@ def _materialize(samples_with_count, out_dir: Path, prefix: str):
             img = img.convert("RGB")
         out_path = out_dir / f"{prefix}_{idx:05d}.png"
         save_image(img, str(out_path), format="PNG")
-        saved.append((out_path, count))
+        saved.append((out_path, count, sample))
         if (idx + 1) % 200 == 0:
             logger.info("  [%s] saved %d/%d", prefix, len(saved), idx + 1)
     return saved
@@ -160,18 +163,11 @@ def _uniform_sample_train(filtered, rng) -> list[tuple[int, dict, int]]:
     return pool
 
 
-def _build_records(
-    saved: list[tuple[Path, int]], split_name: str, sample_index: dict
-) -> list[dict]:
-    """Build open-ended counting records.
-
-    sample_index maps Path -> the original sample dict so we can recover
-    the object label for the question phrasing.
-    """
+def _build_records(saved: list[tuple[Path, int, dict]], split_name: str) -> list[dict]:
+    """Build open-ended counting records from (path, count, sample) triples."""
     recs = []
-    for img_path, count in saved:
-        sample = sample_index.get(img_path, {})
-        obj_label = sample.get("label", "objects")
+    for img_path, count, sample in saved:
+        obj_label = sample.get("label", "objects") if sample else "objects"
         question = f"How many {obj_label} are in the image? Provide a single integer answer."
         recs.append(
             {
@@ -263,30 +259,10 @@ def main() -> None:
     logger.info("Materializing train pool...")
     train_saved = _materialize(train_pool, out_root / "train", "counting_train")
 
-    # Build a Path -> sample lookup (so we can reach object labels later).
-    sample_index: dict[Path, dict] = {}
-    for source, saved_list in [
-        (test_filt, test_saved),
-        (val_filt, val_saved),
-        (train_pool, train_saved),
-    ]:
-        # The order in `saved_list` mirrors the order in `source`, but with
-        # gaps where URL fetches failed. Re-walk to align.
-        idx_iter = iter(source)
-        for path, _count in saved_list:
-            # Pop samples until we find one that actually rendered (we
-            # can't tell from here which were skipped). This is a best-
-            # effort label lookup; fallback "objects" is fine.
-            try:
-                _, sample, _ = next(idx_iter)
-                sample_index[path] = sample
-            except StopIteration:
-                break
-
     # 3) Dedup train+val vs test (per Appendix A: CLIP + pHash + SSIM).
     if not args.skip_dedup and test_saved:
-        test_paths = [p for p, _ in test_saved]
-        candidates = [p for p, _ in train_saved] + [p for p, _ in val_saved]
+        test_paths = [p for p, _, _ in test_saved]
+        candidates = [p for p, _, _ in train_saved] + [p for p, _, _ in val_saved]
         # Appendix A: "CLIP embeddings together with perceptual hashing
         # and SSIM-based image similarity" — full_dedup ANDs all three
         # so a candidate is dropped only if all three checks agree it's
@@ -299,8 +275,8 @@ def main() -> None:
             ssim_thresh=0.95,
             device=args.clip_device,
         )
-        train_saved = [(p, c) for p, c in train_saved if p in keep_set]
-        val_saved = [(p, c) for p, c in val_saved if p in keep_set]
+        train_saved = [(p, c, s) for p, c, s in train_saved if p in keep_set]
+        val_saved = [(p, c, s) for p, c, s in val_saved if p in keep_set]
         logger.info(
             "After dedup: train=%d  val=%d",
             len(train_saved),
@@ -311,12 +287,12 @@ def main() -> None:
     if len(train_saved) >= N_TRAIN:
         # Re-balance to keep counts roughly uniform after dedup attrition.
         by_count: dict[int, list] = defaultdict(list)
-        for p, c in train_saved:
-            by_count[c].append((p, c))
+        for p, c, s in train_saved:
+            by_count[c].append((p, c, s))
         for c in by_count:
             rng.shuffle(by_count[c])
         per_bucket = N_TRAIN // (MAX_COUNT - MIN_COUNT + 1)
-        balanced: list[tuple[Path, int]] = []
+        balanced: list[tuple[Path, int, dict]] = []
         for c in range(MIN_COUNT, MAX_COUNT + 1):
             balanced.extend(by_count.get(c, [])[:per_bucket])
         # Top up if a bucket was short.
@@ -329,9 +305,9 @@ def main() -> None:
     test_saved = test_saved[:N_TEST]
 
     # 5) Build + write records.
-    train_records = _build_records(train_saved, "train", sample_index)
-    val_records = _build_records(val_saved, "val", sample_index)
-    test_records = _build_records(test_saved, "test", sample_index)
+    train_records = _build_records(train_saved, "train")
+    val_records = _build_records(val_saved, "val")
+    test_records = _build_records(test_saved, "test")
 
     write_jsonl(train_records, f"{args.output_jsonl_prefix}_train.jsonl")
     write_jsonl(val_records, f"{args.output_jsonl_prefix}_val.jsonl")
