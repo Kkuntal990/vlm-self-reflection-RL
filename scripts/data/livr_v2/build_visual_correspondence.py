@@ -242,12 +242,22 @@ def main() -> None:
                 out_path = out_dir / out_filename
                 save_image(composite, str(out_path), format="PNG")
 
+                # Paper Appendix A.4.2 prompt verbatim — explicit framing
+                # of the camera/lighting variation and "(A) Point A" choice
+                # format. Brick-wall rate on terse prompts was 45.4%; the
+                # paper's prompt primes the task properly.
                 question = (
-                    "A reference query point is marked in the source image (left). "
-                    "Which point in the target image (right) corresponds to the same location? "
-                    "(A) (B) (C) (D)"
+                    "A point is circled on the first image, labeled with REF. "
+                    "We change the camera position or lighting and shoot the second image. "
+                    "You are given multiple red-circled points on the second image, "
+                    'choices of "A, B, C, D" are drawn beside each circle. '
+                    "Which point on the second image corresponds to the point in the first image? "
+                    "Select from the following options.\n"
+                    "(A) Point A\n(B) Point B\n(C) Point C\n(D) Point D"
                 )
-                formatted_choices = [f"({OPTION_LETTERS[k]})" for k in range(4)]
+                formatted_choices = [
+                    f"({OPTION_LETTERS[k]}) Point {OPTION_LETTERS[k]}" for k in range(4)
+                ]
                 rec = make_livr_record(
                     question=question,
                     ground_truth=OPTION_LETTERS[correct_pos],

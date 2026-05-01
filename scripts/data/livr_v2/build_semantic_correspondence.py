@@ -255,13 +255,25 @@ def main() -> None:
         out_path = out_dir / out_filename
         save_image(composite, str(out_path), format="PNG")
 
-        category = pdata.get("category", "object")
+        # Paper Appendix A.6.2 prompt verbatim. The 50-word few-shot
+        # example ("two cats … left ear tip … right front paw") primes
+        # the abstract concept of semantic correspondence. Brick-wall on
+        # the terse one-line prompt was 40.9% — base Qwen2.5-VL needs
+        # this priming to engage the task at all.
         question = (
-            f"A semantic keypoint is marked with REF on the {category} in the source image (left). "
-            f"Which point in the target image (right) corresponds to the same semantic location? "
-            f"(A) (B) (C) (D)"
+            "Humans can find corresponding points for different objects in the same category. "
+            "For instance, if there are images of two different cats, then the left ear tip of "
+            "one cat corresponds to the left ear tip of the other cat, and the right front paw "
+            "of one cat corresponds to the right front paw of the other cat.\n"
+            "Given the following two images, a reference point is annotated on the first image, "
+            "labeled with REF. You are given multiple red-circled points on the second image, "
+            'choices of "A, B, C, D" are drawn beside each circle. '
+            "Select between the choices on the second image and find the corresponding point "
+            "for the reference point. Which point is corresponding to the reference point? "
+            "Select from the following choices.\n"
+            "(A) Point A\n(B) Point B\n(C) Point C\n(D) Point D"
         )
-        formatted_choices = [f"({OPTION_LETTERS[k]})" for k in range(4)]
+        formatted_choices = [f"({OPTION_LETTERS[k]}) Point {OPTION_LETTERS[k]}" for k in range(4)]
         rec = make_livr_record(
             question=question,
             ground_truth=OPTION_LETTERS[correct_pos],

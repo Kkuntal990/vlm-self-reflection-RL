@@ -255,14 +255,26 @@ def _build_one(
     save_image(composite, str(out_path), format="PNG")
 
     action = src_row["action"]
-    src_cat = src_row.get("object_category", "object")
-    tgt_cat = tgt_row.get("object_category", "object")
+    # Paper Appendix A.7.2 prompt verbatim. The hammer/pot few-shot
+    # explanation is essential — functional correspondence is the most
+    # abstract of the 9 tasks (43.6% brick-wall on the terse prompt) and
+    # base Qwen2.5-VL effectively can't engage it without the priming.
     question = (
-        f"A functional keypoint relevant to action '{action}' is marked with REF on the "
-        f"{src_cat} in the source image (left). Which point in the target image (right) "
-        f"on the {tgt_cat} corresponds to the same functional role? (A) (B) (C) (D)"
+        "Humans can find corresponding points for the same action between different objects. "
+        'For instance, if a person uses a hammer to "Mash Pound", then the handle of the '
+        "hammer will be the corresponding point to the handle of the pot because they serve "
+        "the same function for the action — to hold; and the bottom of the pot will be the "
+        "corresponding point to the face of the hammer because they both mash the other "
+        "object.\n"
+        "Given the following two images, a reference point is annotated on the first image, "
+        "labeled with REF. You are given multiple red-circled points on the right image, "
+        'choices of "A, B, C, D" are drawn beside each circle. '
+        "Select from the choices on the second image and find the corresponding point for "
+        f'the reference point for the action: "{action}". '
+        "Which point is corresponding to the reference point? Select from the following choices.\n"
+        "(A) Point A\n(B) Point B\n(C) Point C\n(D) Point D"
     )
-    formatted_choices = [f"({OPTION_LETTERS[i]})" for i in range(4)]
+    formatted_choices = [f"({OPTION_LETTERS[i]}) Point {OPTION_LETTERS[i]}" for i in range(4)]
     return make_livr_record(
         question=question,
         ground_truth=OPTION_LETTERS[correct_pos],
