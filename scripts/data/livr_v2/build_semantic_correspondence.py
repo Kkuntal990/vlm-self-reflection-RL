@@ -72,19 +72,50 @@ def _find_spair_root(root: Path) -> Path:
     return candidates[0].parents[2]
 
 
-def _load_train_pairs(spair_root: Path) -> list[dict]:
-    """Load all training pair annotations (with keypoint correspondences)."""
+def _load_train_pairs(
+    spair_root: Path, max_to_load: int | None = None, seed: int = 42, n_workers: int = 32
+) -> list[dict]:
+    """Load training pair annotations (with keypoint correspondences).
+
+    SPair-71k has ~53k training pairs, each as a separate small JSON file.
+    On a high-latency network filesystem (CephFS), the per-file open
+    cost dominates and a sequential loader takes hours. We:
+      1. Read the layout file to get all pair IDs.
+      2. Shuffle (deterministic via `seed`) so ANY prefix is a uniform
+         random sample.
+      3. Optionally cap to `max_to_load` to avoid reading more than we
+         need (we only need ~10k for downstream sampling of 1500).
+      4. Parallelize the per-file open via ThreadPoolExecutor —
+         I/O-bound so threads work fine.
+    """
+    import random as _r
+    from concurrent.futures import ThreadPoolExecutor
+
     layout = spair_root / "Layout" / "large" / "trn.txt"
     with open(layout) as f:
         pair_ids = [line.strip() for line in f if line.strip()]
-    pairs = []
-    for pid in pair_ids:
-        ann = spair_root / "PairAnnotation" / "trn" / f"{pid}.json"
-        if not ann.exists():
-            continue
-        with open(ann) as f:
-            d = json.load(f)
-        pairs.append(d)
+    _r.Random(seed).shuffle(pair_ids)
+    if max_to_load is not None and max_to_load < len(pair_ids):
+        pair_ids = pair_ids[:max_to_load]
+
+    pair_dir = spair_root / "PairAnnotation" / "trn"
+
+    def _load_one(pid: str) -> dict | None:
+        # Skip the .exists() pre-check (extra stat call on every file).
+        # If the file is missing, the open will raise FileNotFoundError
+        # which we catch and skip.
+        ann = pair_dir / f"{pid}.json"
+        try:
+            with open(ann) as f:
+                return json.load(f)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+
+    pairs: list[dict] = []
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        for d in ex.map(_load_one, pair_ids, chunksize=64):
+            if d is not None:
+                pairs.append(d)
     return pairs
 
 
@@ -110,7 +141,11 @@ def main() -> None:
 
     spair_root = _find_spair_root(Path(args.spair_dir))
     logger.info("SPair-71k root: %s", spair_root)
-    raw_pairs = _load_train_pairs(spair_root)
+    # We only need ~1500 valid pairs after filtering. Load 8000 from the
+    # ~53k pool — gives a safe margin for the >=4-keypoint filter and
+    # for image-load failures, while taking minutes instead of hours
+    # over CephFS-style network storage.
+    raw_pairs = _load_train_pairs(spair_root, max_to_load=8000, seed=args.seed)
     logger.info("Loaded %d training pair annotations", len(raw_pairs))
 
     # Filter for >=4 valid keypoint correspondences.
