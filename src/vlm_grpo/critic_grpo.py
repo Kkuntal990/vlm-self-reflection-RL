@@ -1427,9 +1427,7 @@ class SelfReflectionGRPOTrainer:
                         )
                         a1_ratio = torch.exp(torch.clamp(a1_ratio_raw, -20.0, 20.0))
                         a1_clipped = torch.clamp(a1_ratio, 1 - clip_low, 1 + clip_high)
-                        a1_max_len = float(
-                            getattr(self.config, "a1_max_completion_length", 200) or 200
-                        )
+                        a1_max_len = float(self.config.rollout.a1_max_completion_length or 200)
                         traj_resp_loss = (
                             -torch.min(
                                 a1_ratio * resp_advantages[ti], a1_clipped * resp_advantages[ti]
@@ -1480,12 +1478,8 @@ class SelfReflectionGRPOTrainer:
                         # gradient magnitude is consistent regardless of sequence length.
                         # TRL reference: (per_token_loss * mask).sum() / (batch * max_comp_len)
                         # Our per-sample call: sum / max_comp_len, then /n_traj below == /batch.
-                        a1_max_len = float(
-                            getattr(self.config, "a1_max_completion_length", 200) or 200
-                        )
-                        a2_max_len = float(
-                            getattr(self.config, "a2_max_completion_length", 200) or 200
-                        )
+                        a1_max_len = float(self.config.rollout.a1_max_completion_length or 200)
+                        a2_max_len = float(self.config.rollout.a2_max_completion_length or 200)
                         a1_loss = (
                             -torch.min(
                                 a1_ratio * a1_advantages[ti], a1_clipped * a1_advantages[ti]
@@ -1534,8 +1528,8 @@ class SelfReflectionGRPOTrainer:
                         resp_surr1 = resp_ratio * resp_advantages[ti]
                         resp_surr2 = resp_clipped_ratio * resp_advantages[ti]
                         resp_max_len = float(
-                            getattr(self.config, "a1_max_completion_length", 200) or 200
-                        ) + float(getattr(self.config, "a2_max_completion_length", 200) or 200)
+                            self.config.rollout.a1_max_completion_length or 200
+                        ) + float(self.config.rollout.a2_max_completion_length or 200)
                         traj_resp_loss = -torch.min(resp_surr1, resp_surr2).sum() / resp_max_len
 
                         self._resp_total_tokens += resp_ratio.numel()
@@ -1550,7 +1544,7 @@ class SelfReflectionGRPOTrainer:
                     fb_clipped_ratio = torch.clamp(fb_ratio, 1 - clip_low, 1 + clip_high)
                     fb_surr1 = fb_ratio * fb_advantages[ti]
                     fb_surr2 = fb_clipped_ratio * fb_advantages[ti]
-                    f1_max_len = float(getattr(self.config, "f1_max_completion_length", 512) or 512)
+                    f1_max_len = float(self.config.rollout.f1_max_completion_length or 512)
                     traj_fb_loss = -torch.min(fb_surr1, fb_surr2).sum() / f1_max_len
 
                     # Track clip fraction
@@ -1564,15 +1558,9 @@ class SelfReflectionGRPOTrainer:
                     # model, preventing "direct solution collapse" where the
                     # model just improves A1 instead of learning self-correction.
                     if self.config.kl_coeff > 0 and ref_a1_lps is not None:
-                        a1_kl_max_len = float(
-                            getattr(self.config, "a1_max_completion_length", 200) or 200
-                        )
-                        a2_kl_max_len = float(
-                            getattr(self.config, "a2_max_completion_length", 200) or 200
-                        )
-                        f1_kl_max_len = float(
-                            getattr(self.config, "f1_max_completion_length", 512) or 512
-                        )
+                        a1_kl_max_len = float(self.config.rollout.a1_max_completion_length or 200)
+                        a2_kl_max_len = float(self.config.rollout.a2_max_completion_length or 200)
+                        f1_kl_max_len = float(self.config.rollout.f1_max_completion_length or 512)
 
                         a1_kl = _kl_term_drgrpo(ref_a1_lps[ti], mb_a1_lps[j], a1_kl_max_len)
                         a2_kl = _kl_term_drgrpo(ref_a2_lps[ti], mb_a2_lps[j], a2_kl_max_len)
