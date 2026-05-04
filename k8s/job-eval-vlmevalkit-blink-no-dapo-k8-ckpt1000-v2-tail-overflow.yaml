@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: eval-vlmevalkit-blink-v10-base
+  name: eval-vlmevalkit-blink-no-dapo-k8-ckpt1000-v2-tail-overflow
   labels:
     app: ms-swift
     task: benchmark-evaluation
@@ -385,9 +385,9 @@ spec:
 
           mkdir -p ~/LMUData
           BLINK_TSVS=""
-          for tsv in ${BLINK_DATA_DIR}/tsv/BLINK_*.tsv; do
-            name=$(basename "${tsv}" .tsv)
-            cp "${tsv}" ~/LMUData/"${name}.tsv"
+          for task in ${BLINK_TASKS}; do
+            name="BLINK_${task}"
+            cp "${BLINK_DATA_DIR}/tsv/${name}.tsv" ~/LMUData/"${name}.tsv"
             BLINK_TSVS="${BLINK_TSVS} ${name}"
           done
           echo "Evaluating on:${BLINK_TSVS}"
@@ -431,17 +431,20 @@ spec:
         - name: TORCH_HOME
           value: "/cache/torch"
 
-        # Eval target — v10-base final adapter
+        # Eval target — curriculum run, checkpoint-250 (first save from
+        # the K=16 + DAPO + curriculum-filtered 6.4k training).
         - name: MODEL_PATH
-          value: "/outputs/grpo_qwen_livr_v10_lr1e5_v2/final"
+          value: "/outputs/grpo_qwen_livr_v2_9k_no_dapo_k8/checkpoint-1000"
         - name: MODEL_NAME
-          value: "QWEN-2-5VL-v10-base-final-patternA-blink"
+          value: "QWEN-2-5VL-no-dapo-k8-ckpt1000-patternA-blink-v2-tail-overflow"
         - name: OUTPUT_DIR
-          value: "/outputs/benchmark_results/blink_v10_base_final_patternA"
+          value: "/outputs/benchmark_results/blink_no_dapo_k8_ckpt1000_patternA_v2"
         - name: NUM_GPUS
           value: "1"
         - name: BLINK_DATA_DIR
-          value: "/outputs/benchmark_data/blink"
+          value: "/outputs/benchmark_data/blink_v2"
+        - name: BLINK_TASKS
+          value: "IQ_Test Spatial_Relation"
 
         # Pattern-A reflection params
         - name: NUM_TURNS
@@ -449,7 +452,12 @@ spec:
         - name: TAG_MODE
           value: "think_answer"   # matches training's --use_think_answer_tags
         - name: CONVERSATION_LOG_PATH
-          value: "/outputs/benchmark_results/blink_v10_base_final_patternA/conversation_log.jsonl"
+          # MUST match OUTPUT_DIR above. The v3 eval YAML left this pointing
+          # at v10-base's path (copy-paste oversight) which caused
+          # analyze_blink_turns.py to read v10-base's stale log and produce
+          # a turn_analysis.json that looked identical to v10-base's.
+          # Always set this to ${OUTPUT_DIR}/conversation_log.jsonl.
+          value: "/outputs/benchmark_results/blink_no_dapo_k8_ckpt1000_patternA_v2/conversation_log.jsonl"
 
         - name: PYTHONUNBUFFERED
           value: "1"

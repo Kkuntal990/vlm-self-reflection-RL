@@ -1,0 +1,507 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-vlmevalkit-blink-no-dapo-k8-ckpt1000-v2-shard2
+  labels:
+    app: ms-swift
+    task: benchmark-evaluation
+    framework: vlmevalkit
+    mode: self-reflective-patternA
+    benchmark: blink
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: ms-swift
+        task: benchmark-evaluation
+        framework: vlmevalkit
+        mode: self-reflective-patternA
+        benchmark: blink
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: evaluator
+        image: ghcr.io/kkuntal990/ms-swift-qwen:latest
+        imagePullPolicy: Always
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          echo "========================================="
+          echo "BLINK Self-Reflective Eval (Pattern A — v10+ training-faithful)"
+          echo "========================================="
+          echo "Model Path:       ${MODEL_PATH}"
+          echo "Model Name:       ${MODEL_NAME}"
+          echo "Output Dir:       ${OUTPUT_DIR}"
+          echo "Num Turns:        ${NUM_TURNS}"
+          echo "BLINK Data Dir:   ${BLINK_DATA_DIR}"
+          echo "Tag mode:         ${TAG_MODE}"
+          echo ""
+
+          nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+          echo ""
+
+          if [ -d "${MODEL_PATH}" ]; then
+            ls -lh "${MODEL_PATH}/" | head -5
+          fi
+
+          TSV_DIR="${BLINK_DATA_DIR}/tsv"
+          if [ ! -d "${TSV_DIR}" ]; then
+            echo "ERROR: BLINK TSV directory not found: ${TSV_DIR}" && exit 1
+          fi
+          ls -lh "${TSV_DIR}/"
+
+          mkdir -p "${OUTPUT_DIR}"
+
+          VLMEVALKIT_DIR="/tmp/VLMEvalKit"
+          if [ ! -d "${VLMEVALKIT_DIR}" ]; then
+            git clone https://github.com/open-compass/VLMEvalKit.git "${VLMEVALKIT_DIR}"
+          fi
+          pip install --index-url https://pypi.org/simple num2words openai-clip || true
+          pip install -e "${VLMEVALKIT_DIR}" || exit 1
+
+          # Merge LoRA adapter into base model
+          MERGED_PATH="/tmp/merged_model"
+          if [ -f "${MODEL_PATH}/adapter_config.json" ]; then
+            python3 -c "
+          import json, torch
+          with open('${MODEL_PATH}/adapter_config.json') as f:
+              cfg = json.load(f)
+          base = cfg['base_model_name_or_path']
+          from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+          from peft import PeftModel
+          model = Qwen2_5_VLForConditionalGeneration.from_pretrained(base, torch_dtype=torch.bfloat16, device_map='cpu')
+          model = PeftModel.from_pretrained(model, '${MODEL_PATH}')
+          model = model.merge_and_unload()
+          model.save_pretrained('${MERGED_PATH}')
+          AutoProcessor.from_pretrained(base).save_pretrained('${MERGED_PATH}')
+          print('Merge complete')
+          "
+            export MODEL_PATH="${MERGED_PATH}"
+          fi
+
+          python3 -c "
+          import json, os
+          cfg_path = '${MODEL_PATH}/config.json'
+          if os.path.exists(cfg_path):
+              with open(cfg_path) as f: cfg = json.load(f)
+              if 'model_type' not in cfg:
+                  cfg['model_type'] = 'qwen2_5_vl'
+                  with open(cfg_path, 'w') as f: json.dump(cfg, f, indent=2)
+          "
+
+          # Pattern-A self-reflective wrapper. Mirrors src/vlm_grpo/prompts.py
+          # exactly: NO custom system prompt (Qwen default fires), single user
+          # turn per turn (A1/F1/A2), instructions embedded in user text.
+          # Verified byte-for-byte equivalent to training rendering via
+          # scripts/dryrun_eval_vs_training.py.
+          python3 << 'WRAPPER_EOF'
+          import os, textwrap
+          wrapper_code = '''
+          from __future__ import annotations
+          import json, logging, os, re
+
+          logger = logging.getLogger(__name__)
+
+          # --- Instructions (must match src/vlm_grpo/prompts.py defaults) ---
+          THINK_ANSWER_INSTRUCTION = os.environ.get(
+              "THINK_ANSWER_INSTRUCTION",
+              "The reasoning process MUST BE enclosed within <think> </think> tags. "
+              "The final answer MUST BE put in <answer> </answer> tags.",
+          )
+          ANSWER_TAG_INSTRUCTION = os.environ.get(
+              "ANSWER_TAG_INSTRUCTION",
+              "Put your final answer inside <answer> tags. Example: <answer>(A)</answer>",
+          )
+          F1_VERIFIER_INSTRUCTION = os.environ.get(
+              "F1_VERIFIER_INSTRUCTION",
+              "Re-examine the image and determine whether the candidate answer is "
+              "correct or incorrect. The reasoning process MUST BE enclosed within "
+              "<think> </think> tags. The final verdict MUST BE put in \\\\boxed{} as "
+              "either CORRECT or INCORRECT.",
+          )
+          TAG_MODE = os.environ.get("TAG_MODE", "think_answer")  # think_answer | answer_only | none
+
+          # Mirror src/vlm_grpo/trajectory.py extract_answer_from_text(strict=True)
+          # for MCQ: REQUIRE <answer> tag, search only inside payload, anti-hedge.
+          # Patterns assembled from chr(92) to avoid YAML/bash/Python escape hell.
+          _BS = chr(92)
+          _WS = _BS + "s"   # \\s
+          _OP = _BS + "("   # \\(
+          _CP = _BS + ")"   # \\)
+          _DOT = _BS + "."  # \\.
+          _NW = _BS + "w"   # \\w
+          _ANSWER_TAG_RE = re.compile(
+              "<answer>" + _WS + "*(.*?)" + _WS + "*</answer>",
+              re.IGNORECASE | re.DOTALL,
+          )
+          _MCQ_STRICT_RE = re.compile(
+              "^" + _WS + "*(?:" + _OP + "([A-Fa-f])" + _CP + "|([A-Fa-f])[." + _WS + "]?)" + _WS + "*$"
+          )
+          _MCQ_OPTION_RE = re.compile(
+              "(?:" + _OP + "([A-Fa-f])" + _CP + "|(?<!" + _NW + ")([A-Fa-f])" + _DOT + ")"
+          )
+          _MCQ_ANSWER_IS_RE = re.compile(
+              "(?:answer|choice|option)" + _WS + "*(?:is|:)" + _WS + "*" + _OP + "?([A-Fa-f])" + _CP + "?",
+              re.IGNORECASE,
+          )
+          _MCQ_LETTER_RE = re.compile("[A-Fa-f]")
+
+          def _extract_mcq_letter(response):
+              # Step 1: REQUIRE <answer> tag (training strict mode)
+              m = _ANSWER_TAG_RE.search(response)
+              if not m:
+                  return ""  # No tag => format failure, score as wrong
+              payload = m.group(1).strip()
+              if not payload:
+                  return ""
+              # Step 2: strict atomic letter match ("A", "(A)", "A.")
+              sm = _MCQ_STRICT_RE.match(payload)
+              if sm:
+                  return (sm.group(1) or sm.group(2)).upper()
+              # Step 3: option pattern "(A)" or "A." inside payload
+              om = _MCQ_OPTION_RE.search(payload)
+              if om:
+                  return (om.group(1) or om.group(2)).upper()
+              # Step 4: "answer is X" / "option: X"
+              aim = _MCQ_ANSWER_IS_RE.search(payload)
+              if aim:
+                  return aim.group(1).upper()
+              # Step 5: any letter (with anti-hedging — reject if multiple distinct)
+              letters = _MCQ_LETTER_RE.findall(payload.upper())
+              if not letters:
+                  return ""
+              if len(set(letters)) > 1:
+                  return ""  # hedged across options — score as wrong
+              return letters[0]
+
+          def _tag_suffix():
+              if TAG_MODE == "think_answer":
+                  return THINK_ANSWER_INSTRUCTION
+              if TAG_MODE == "answer_only":
+                  return ANSWER_TAG_INSTRUCTION
+              return ""
+
+          # --- Pattern A prompt builders (mirror src/vlm_grpo/prompts.py) ---
+          def _user_msg(image_items, text):
+              return [{"role": "user", "content": image_items + [{"type": "text", "text": text}]}]
+
+          def build_a1_messages(image_items, question):
+              parts = [question]
+              s = _tag_suffix()
+              if s:
+                  parts.append(s)
+              return _user_msg(image_items, "\\n\\n".join(parts))
+
+          def build_f1_messages(image_items, question, a1):
+              text = f"Question: {question}\\nCandidate answer: {a1}\\n\\n{F1_VERIFIER_INSTRUCTION}"
+              return _user_msg(image_items, text)
+
+          def build_a2_messages(image_items, question, a1, fb):
+              parts = [
+                  f"Question: {question}",
+                  f"Your previous answer: {a1}",
+                  f"Feedback on your previous answer: {fb}",
+              ]
+              s = _tag_suffix()
+              if s:
+                  parts.append("Re-examine the image and either correct your answer or keep "
+                               "it if you believe it is right. " + s)
+              else:
+                  parts.append("Re-examine the image and either correct your answer or keep "
+                               "it if you believe it is right.")
+              return _user_msg(image_items, "\\n\\n".join(parts))
+
+          def Qwen2VLSelfReflectiveChat(*args, **kwargs):
+              return _Qwen2VLSelfReflectiveChat(*args, **kwargs)
+
+          class _Qwen2VLSelfReflectiveChat:
+              def __init__(self, model_path, num_turns=1, feedback_max_tokens=512,
+                           conversation_log_path=None, **kwargs):
+                  from vlmeval.vlm.qwen2_vl.model import Qwen2VLChat
+                  self.num_turns = num_turns
+                  self.feedback_max_tokens = feedback_max_tokens
+                  self.conversation_log_path = conversation_log_path or os.environ.get(
+                      "CONVERSATION_LOG_PATH", None)
+                  self._sample_counter = 0
+                  # NO custom system prompt — Qwen default ("You are a helpful
+                  # assistant.") fires from the chat template, matching training.
+                  self._base = Qwen2VLChat(model_path=model_path, **kwargs)
+                  # Deterministic eval (training-time uses temperature for A1/F1/A2,
+                  # but eval should be greedy unless we want stochastic eval too)
+                  self._base.generate_kwargs["temperature"] = 0.0
+                  self._base.generate_kwargs["do_sample"] = False
+                  self.model_path = self._base.model_path
+                  self.INTERLEAVE = self._base.INTERLEAVE
+                  self.VIDEO_LLM = self._base.VIDEO_LLM
+                  self.INSTALL_REQ = self._base.INSTALL_REQ
+                  logger.info(f"Pattern-A wrapper: num_turns={num_turns}, tag_mode={TAG_MODE}, log={self.conversation_log_path}")
+
+              def __getattr__(self, name):
+                  return getattr(self._base, name)
+
+              def _extract_content(self, message, dataset=None):
+                  image_items, text_parts = [], []
+                  for item in message:
+                      if item["type"] == "image":
+                          image_items.extend(self._base._prepare_content([item], dataset=dataset))
+                      elif item["type"] == "text":
+                          text_parts.append(item["value"])
+                  return image_items, "\\n".join(text_parts)
+
+              def _generate_with_messages(self, messages, max_new_tokens=None):
+                  from qwen_vl_utils import process_vision_info
+                  text = self._base.processor.apply_chat_template(
+                      [messages], tokenize=False, add_generation_prompt=True)
+                  images, videos = process_vision_info([messages])
+                  inputs = self._base.processor(
+                      text=text, images=images, videos=videos, padding=True, return_tensors="pt")
+                  inputs = inputs.to("cuda")
+                  gen_kwargs = dict(self._base.generate_kwargs)
+                  if max_new_tokens is not None:
+                      gen_kwargs["max_new_tokens"] = max_new_tokens
+                  generated_ids = self._base.model.generate(**inputs, **gen_kwargs)
+                  generated_ids = [o[len(i):] for i, o in zip(inputs.input_ids, generated_ids)]
+                  return self._base.processor.tokenizer.batch_decode(
+                      generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+              def _prediction_for_can_infer(self, response):
+                  # VLMEvalKit's can_infer doesn't strip < > /, so leaving
+                  # <think>...</think><answer>X</answer> in the string fuses X
+                  # with </answer> and breaks token-level matching. Strip to the
+                  # <answer> payload when present; else fall back to raw (same
+                  # path the BASE model takes — fair comparison). This keeps the
+                  # downstream can_infer call identical for base and trained.
+                  m = _ANSWER_TAG_RE.search(response)
+                  if m:
+                      payload = m.group(1).strip()
+                      if payload:
+                          return payload
+                  return response
+
+              def generate_inner(self, message, dataset=None):
+                  image_items, question_text = self._extract_content(message, dataset)
+
+                  # A1 — Pattern A: single user turn, image + question + tag instruction
+                  a1_msgs = build_a1_messages(image_items, question_text)
+                  a1 = self._generate_with_messages(a1_msgs)
+
+                  if self.num_turns <= 0:
+                      return self._prediction_for_can_infer(a1)
+
+                  conversation = {
+                      "sample_id": self._sample_counter,
+                      "dataset": dataset,
+                      "question": question_text,
+                      "initial_answer": a1,
+                      "a1_extracted": _extract_mcq_letter(a1),
+                      "turns": [],
+                  }
+                  self._sample_counter += 1
+                  current = a1
+
+                  for turn_idx in range(self.num_turns):
+                      before = _extract_mcq_letter(current)
+                      f1_msgs = build_f1_messages(image_items, question_text, current)
+                      fb = self._generate_with_messages(f1_msgs, max_new_tokens=self.feedback_max_tokens)
+                      a2_msgs = build_a2_messages(image_items, question_text, current, fb)
+                      refined = self._generate_with_messages(a2_msgs)
+                      after = _extract_mcq_letter(refined)
+                      conversation["turns"].append({
+                          "turn": turn_idx + 1,
+                          "answer_before": current,
+                          "answer_before_extracted": before,
+                          "feedback": fb,
+                          "answer_after": refined,
+                          "answer_after_extracted": after,
+                      })
+                      current = refined
+                      logger.info(f"Turn {turn_idx+1}: {before} -> {after}")
+
+                  conversation["final_answer"] = current
+                  conversation["final_extracted_strict"] = _extract_mcq_letter(current)
+                  self._log_conversation(conversation)
+                  # Return <answer> payload (or raw if no tag) — VLMEvalKit's
+                  # can_infer extracts the letter from the same string both
+                  # base and trained models would yield (fair comparison).
+                  return self._prediction_for_can_infer(current)
+
+              def _log_conversation(self, conv):
+                  if not self.conversation_log_path:
+                      return
+                  try:
+                      d = os.path.dirname(self.conversation_log_path)
+                      if d:
+                          os.makedirs(d, exist_ok=True)
+                      with open(self.conversation_log_path, "a") as f:
+                          f.write(json.dumps(conv, ensure_ascii=False) + "\\n")
+                  except Exception as e:
+                      logger.warning(f"log failed: {e}")
+
+              def generate(self, message, dataset=None):
+                  return self._base.generate.__func__(self, message, dataset)
+
+              def use_custom_prompt(self, dataset):
+                  return self._base.use_custom_prompt(dataset)
+
+              def build_prompt(self, line, dataset=None):
+                  return self._base.build_prompt(line, dataset=dataset)
+
+              def dump_image(self, line, dataset=None):
+                  return self._base.dump_image(line, dataset=dataset)
+          '''
+          vlmevalkit_dir = os.environ.get('VLMEVALKIT_DIR', '/tmp/VLMEvalKit')
+          wrapper_path = f'{vlmevalkit_dir}/vlmeval/vlm/qwen2vl_self_reflective_patternA.py'
+          with open(wrapper_path, 'w') as f:
+              f.write(textwrap.dedent(wrapper_code))
+          print(f'Wrote Pattern-A wrapper to {wrapper_path}')
+
+          model_path = os.environ['MODEL_PATH']
+          model_name = os.environ['MODEL_NAME']
+          num_turns = int(os.environ.get('NUM_TURNS', '1'))
+          config_path = f'{vlmevalkit_dir}/vlmeval/config.py'
+          with open(config_path) as f:
+              content = f.read()
+          if f"'{model_name}'" not in content:
+              content += (
+                  f"\n# Pattern-A self-reflective Qwen2VL\n"
+                  f"from vlmeval.vlm.qwen2vl_self_reflective_patternA import Qwen2VLSelfReflectiveChat\n"
+                  f"supported_VLM['{model_name}'] = partial(\n"
+                  f"    Qwen2VLSelfReflectiveChat,\n"
+                  f"    model_path='{model_path}',\n"
+                  f"    min_pixels=1003520,\n"
+                  f"    max_pixels=12845056,\n"
+                  f"    num_turns={num_turns},\n"
+                  f"    use_custom_prompt=True,\n"
+                  f")\n"
+              )
+              with open(config_path, 'w') as f:
+                  f.write(content)
+              print(f"Registered '{model_name}' (num_turns={num_turns})")
+          WRAPPER_EOF
+
+          mkdir -p ~/LMUData
+          BLINK_TSVS=""
+          for task in ${BLINK_TASKS}; do
+            name="BLINK_${task}"
+            cp "${BLINK_DATA_DIR}/tsv/${name}.tsv" ~/LMUData/"${name}.tsv"
+            BLINK_TSVS="${BLINK_TSVS} ${name}"
+          done
+          echo "Evaluating on:${BLINK_TSVS}"
+
+          torchrun --nproc-per-node=${NUM_GPUS} ${VLMEVALKIT_DIR}/run.py \
+            --data ${BLINK_TSVS} \
+            --model ${MODEL_NAME} \
+            --work-dir ${OUTPUT_DIR} \
+            --verbose
+
+          echo "=== Eval complete ==="
+          python3 /outputs/scripts/aggregate_blink_results.py \
+            --results_dir "${OUTPUT_DIR}" \
+            --model_name "${MODEL_NAME}" \
+            || echo "Aggregation script not found / failed"
+
+          if [ -f "${CONVERSATION_LOG_PATH}" ]; then
+            python3 /outputs/scripts/analyze_blink_turns.py \
+              --conversation_log "${CONVERSATION_LOG_PATH}" \
+              --blink_tsv_dir "${BLINK_DATA_DIR}/tsv" \
+              --label "${MODEL_NAME}" \
+              --output_json "${OUTPUT_DIR}/turn_analysis.json" \
+              || echo "Turn analysis failed"
+          fi
+
+          ls -lhR "${OUTPUT_DIR}/"
+
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: HF_DATASETS_CACHE
+          value: "/cache/hf/datasets"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+
+        # Eval target — curriculum run, checkpoint-250 (first save from
+        # the K=16 + DAPO + curriculum-filtered 6.4k training).
+        - name: MODEL_PATH
+          value: "/outputs/grpo_qwen_livr_v2_9k_no_dapo_k8/checkpoint-1000"
+        - name: MODEL_NAME
+          value: "QWEN-2-5VL-no-dapo-k8-ckpt1000-patternA-blink-v2"
+        - name: OUTPUT_DIR
+          value: "/outputs/benchmark_results/blink_no_dapo_k8_ckpt1000_patternA_v2"
+        - name: NUM_GPUS
+          value: "1"
+        - name: BLINK_DATA_DIR
+          value: "/outputs/benchmark_data/blink_v2"
+        - name: BLINK_TASKS
+          value: "Object_Localization Relative_Depth Relative_Reflectance Semantic_Correspondence Spatial_Relation Visual_Correspondence Visual_Similarity"
+
+        # Pattern-A reflection params
+        - name: NUM_TURNS
+          value: "1"
+        - name: TAG_MODE
+          value: "think_answer"   # matches training's --use_think_answer_tags
+        - name: CONVERSATION_LOG_PATH
+          # MUST match OUTPUT_DIR above. The v3 eval YAML left this pointing
+          # at v10-base's path (copy-paste oversight) which caused
+          # analyze_blink_turns.py to read v10-base's stale log and produce
+          # a turn_analysis.json that looked identical to v10-base's.
+          # Always set this to ${OUTPUT_DIR}/conversation_log.jsonl.
+          value: "/outputs/benchmark_results/blink_no_dapo_k8_ckpt1000_patternA_v2/conversation_log.jsonl"
+
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+
+        resources:
+          requests:
+            nvidia.com/rtxa6000: "1"
+            memory: "32Gi"
+            cpu: "3"
+          limits:
+            nvidia.com/rtxa6000: "1"
+            memory: "32Gi"
+            cpu: "3"
+
+        volumeMounts:
+        - name: outputs-volume
+          mountPath: /outputs
+        - name: cache-volume
+          mountPath: /cache
+        - name: dev-shm
+          mountPath: /dev/shm
+
+      tolerations:
+        - effect: NoSchedule
+          key: nautilus.io/hardware
+          operator: Equal
+          value: large-gpu
+        - effect: PreferNoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - key: nautilus.io/reservation
+          operator: Exists
+          effect: NoSchedule
+
+      volumes:
+      - name: cache-volume
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: outputs-volume
+        persistentVolumeClaim:
+          claimName: ms-swift-outputs-pvc
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi

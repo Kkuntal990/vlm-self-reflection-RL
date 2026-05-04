@@ -1,9 +1,9 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-livr-9k-v10-fixes-v2
+  name: qwen-grpo-livr-v2-9k-no-dapo-k8
 spec:
-  backoffLimit: 0
+  backoffLimit: 2
   template:
     metadata:
       labels:
@@ -37,8 +37,14 @@ spec:
           nvidia-smi
           echo ""
 
-          # Install dependencies
-          pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
+          # Install dependencies — PIN vllm to exact version. The v10-base
+          # and v10-fixes YAMLs used `vllm>=0.12.0` and worked when 0.12.0
+          # was the latest release. Now pip resolves to vllm==0.20.0 which
+          # drags in torch 2.11 + transformers 5.x and breaks the Qwen2.5-VL
+          # vision encoder forward (NVRTC kernel JIT fails on
+          # `image_grid_thw.prod(-1)`). Pin exact to keep the install stable.
+          # Leave torch/transformers at the trl:0.29.0 image's defaults.
+          pip install "vllm==0.12.0" wandb sentence-transformers 2>&1 | tail -5
 
           # Clone and install project — track the grpo-v10 branch (no commit pin
           # so infra fixes can land without a rebuild).
@@ -117,9 +123,9 @@ spec:
         - name: MODEL_ID
           value: "Qwen/Qwen2.5-VL-7B-Instruct"
         - name: DATASET_PATH
-          value: "/outputs/livr_data/livr_perception_mcq_hightrust_v2.jsonl"
+          value: "/outputs/livr_v2_train_snapshots/snap_20260501_154345_final/data/livr_v2_9task_train.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v10_fixes_v2_dynsamp_klfix"
+          value: "/outputs/grpo_qwen_livr_v2_9k_no_dapo_k8"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
@@ -151,30 +157,25 @@ spec:
         - name: FB_KL_COEFF
           value: "1.0"
 
-        # GRPO core — K=16 for ~2× per-prompt WR opportunity (compute-side
-        # intervention against WR-flip sparsity).
+        # GRPO core — K=8 (paper baseline; no DAPO compute amplification).
         - name: K_SAMPLES
-          value: "16"
+          value: "8"
         - name: LOSS_TYPE
           value: "dr_grpo"
         - name: CLIP_RANGE
           value: "0.2"
-        # DAPO Clip-Higher (arXiv:2503.14476 §3.1): asymmetric upper clip
-        # 0.28 vs lower clip 0.2. Amplifies positive-advantage WR gradients.
+        # DAPO disabled in this run:
+        #   - CLIP_HIGH=0.0 → upper clip falls back to (1+CLIP_RANGE), symmetric.
+        #   - USE_DYNAMIC_SAMPLING="" (empty) → ${USE_DYNAMIC_SAMPLING:+--use_dynamic_sampling}
+        #     evaluates to nothing, so the flag is NOT passed to train_self_reflection.py.
+        # Goal: clean baseline for comparison vs the DAPO+K=16 curriculum run.
         - name: CLIP_HIGH
-          value: "0.28"
-        # DAPO Dynamic Sampling (arXiv:2503.14476 §3.2): drop K-groups with
-        # zero reward variance on BOTH heads (advantage=0, gradient=0). This
-        # run isolates Dynamic Sampling from SSR (SSR remains OFF) so we can
-        # attribute any WR/RW or BLINK delta to Dynamic Sampling alone.
+          value: "0.0"
         - name: USE_DYNAMIC_SAMPLING
-          value: "1"
+          value: ""
         - name: INNER_EPOCHS
           value: "1"
-        # SSR explicitly OFF — Dynamic Sampling alone, no buffer replay,
-        # so dropped slots simply shrink the effective batch (no degenerate
-        # gradient step ever fires; we just pay rollout cost on a few lost
-        # groups per step, which is acceptable for the isolation).
+        # SSR also OFF (default — env var omitted).
 
         # Generation: 386 to fit per-option reasoning + closing tags
         - name: MAX_SAMPLES
@@ -267,9 +268,9 @@ spec:
         - name: W_FB_FORMAT
           value: "0.1"
 
-        # Fresh start — Dynamic Sampling needs to bake in from step 0
+        # Resumed after SIGABRT crash at ~step 1000+ on 2026-05-03 18:29 UTC
         - name: RESUME_CHECKPOINT
-          value: ""
+          value: "/outputs/grpo_qwen_livr_v2_9k_no_dapo_k8/checkpoint-1000"
 
         # Logging
         - name: LOGGING_STEPS
@@ -320,7 +321,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v10-fixes-v2-dynsamp-klfix"
+          value: "grpo-livr-v2-9k-no-dapo-k8"
 
         resources:
           limits:

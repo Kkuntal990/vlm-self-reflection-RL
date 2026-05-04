@@ -1,15 +1,15 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-livr-9k-v10-base-ssr
+  name: qwen-grpo-livr-v2-9k-curriculum
 spec:
-  backoffLimit: 0
+  backoffLimit: 2
   template:
     metadata:
       labels:
         app: grpo-trainer
         model: qwen2-5-vl-7b
-        task: livr-perception-grpo-v10-base
+        task: livr-perception-grpo-v10-fixes-v2
     spec:
       restartPolicy: Never
       containers:
@@ -20,20 +20,31 @@ spec:
         - |
           set -e
           echo "========================================="
-          echo "v10-base: Qwen2.5-VL-7B-Instruct + Pattern A prompting"
+          echo "v10-fixes-v2: Qwen2.5-VL-7B + Pattern A + DAPO Dynamic Sampling + Dr.GRPO KL"
           echo "Start weights: ${MODEL_ID} (base Instruct checkpoint)"
           echo "Model: ${MODEL_ID}"
           echo "Dataset: ${DATASET_PATH}"
           echo "Output: ${OUTPUT_DIR}"
           echo "GPUs: ${NUM_GPUS}"
+          echo "Dynamic Sampling: ${USE_DYNAMIC_SAMPLING:-1}  (DAPO §3.2)"
+          echo "Clip-Higher: ${CLIP_HIGH:-0.28}              (DAPO §3.1)"
+          echo "K samples:   ${K_SAMPLES:-16}"
+          echo "A1 KL coef:  ${A1_KL_COEFF:-700.0}           (Dr.GRPO sum/max_len norm)"
+          echo "SSR:         OFF (independent isolation of Dynamic Sampling)"
           echo "========================================="
 
           # GPU check
           nvidia-smi
           echo ""
 
-          # Install dependencies
-          pip install "vllm>=0.12.0" wandb sentence-transformers 2>&1 | tail -5
+          # Install dependencies — PIN vllm to exact version. The v10-base
+          # and v10-fixes YAMLs used `vllm>=0.12.0` and worked when 0.12.0
+          # was the latest release. Now pip resolves to vllm==0.20.0 which
+          # drags in torch 2.11 + transformers 5.x and breaks the Qwen2.5-VL
+          # vision encoder forward (NVRTC kernel JIT fails on
+          # `image_grid_thw.prod(-1)`). Pin exact to keep the install stable.
+          # Leave torch/transformers at the trl:0.29.0 image's defaults.
+          pip install "vllm==0.12.0" wandb sentence-transformers 2>&1 | tail -5
 
           # Clone and install project — track the grpo-v10 branch (no commit pin
           # so infra fixes can land without a rebuild).
@@ -59,25 +70,27 @@ spec:
             --use_think_answer_tags \
             --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.50} \
             --max_samples ${MAX_SAMPLES:-0} \
-            --k_samples ${K_SAMPLES:-8} \
-            --max_completion_length ${MAX_COMPLETION_LENGTH:-256} \
-            --a1_max_completion_length ${A1_MAX_COMPLETION:-256} \
-            --f1_max_completion_length ${F1_MAX_COMPLETION:-256} \
-            --a2_max_completion_length ${A2_MAX_COMPLETION:-256} \
+            --k_samples ${K_SAMPLES:-16} \
+            --max_completion_length ${MAX_COMPLETION_LENGTH:-386} \
+            --a1_max_completion_length ${A1_MAX_COMPLETION:-386} \
+            --f1_max_completion_length ${F1_MAX_COMPLETION:-386} \
+            --a2_max_completion_length ${A2_MAX_COMPLETION:-386} \
             --temperature ${TEMPERATURE:-1.0} \
             --feedback_temperature ${FEEDBACK_TEMPERATURE:-1.0} \
             --a2_temperature ${A2_TEMPERATURE:-0.7} \
-            --learning_rate ${LEARNING_RATE:-1e-6} \
+            --learning_rate ${LEARNING_RATE:-1e-5} \
             --per_device_train_batch_size ${BATCH_SIZE:-2} \
             --gradient_accumulation_steps ${GRAD_ACC:-1} \
             --num_train_epochs ${EPOCHS:-1} \
             --num_inner_epochs ${INNER_EPOCHS:-1} \
             --kl_coeff ${KL_COEFF:-0.02} \
-            --a1_kl_coeff ${A1_KL_COEFF:-150.0} \
+            --a1_kl_coeff ${A1_KL_COEFF:-700.0} \
             --a2_kl_coeff ${A2_KL_COEFF:-1.0} \
             --fb_kl_coeff ${FB_KL_COEFF:-1.0} \
             ${SEPARATE_TURN_LOSS:+--separate_turn_loss} \
             --clip_range ${CLIP_RANGE:-0.2} \
+            --clip_high ${CLIP_HIGH:-0.28} \
+            ${USE_DYNAMIC_SAMPLING:+--use_dynamic_sampling} \
             --loss_type ${LOSS_TYPE:-dr_grpo} \
             --lora_r ${LORA_R:-64} \
             --lora_alpha ${LORA_ALPHA:-128} \
@@ -96,9 +109,6 @@ spec:
             --response_alpha ${RESPONSE_ALPHA:-1.0} \
             --feedback_alpha ${FEEDBACK_ALPHA:-1.0} \
             --freeze_a1_steps ${FREEZE_A1_STEPS:-280} \
-            --use_ssr \
-            --ssr_buffer_size ${SSR_BUFFER_SIZE:-256} \
-            --ssr_alpha ${SSR_ALPHA:-1.0} \
             --logging_steps ${LOGGING_STEPS:-10} \
             --save_steps ${SAVE_STEPS:-250} \
             --seed ${SEED:-42} \
@@ -113,37 +123,66 @@ spec:
         - name: MODEL_ID
           value: "Qwen/Qwen2.5-VL-7B-Instruct"
         - name: DATASET_PATH
-          value: "/outputs/livr_data/livr_perception_mcq_hightrust.jsonl"
+          value: "/outputs/livr_v2/data/livr_v2_9k_curriculum_filtered.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v10_ssr"
+          value: "/outputs/grpo_qwen_livr_v2_9k_curriculum"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
 
-        # v10: binary verification + shaped reward + SCoRe Stage I (v8b weights)
+        # v10-fixes-v2 deltas vs v10-fixes:
+        #   + DAPO Dynamic Sampling (USE_DYNAMIC_SAMPLING=1) — drops zero-var
+        #     K-groups before policy update so every gradient step is
+        #     non-degenerate. Decoupled from SSR (still off) for clean
+        #     isolation of the dynamic-sampling effect.
+        #   + Dr.GRPO-consistent KL normalization (sum/max_len, was .mean()).
+        #   + A1_KL_COEFF 150 → 700 (post-normalization, makes KL gradient
+        #     ≈ 2× policy gradient per token after the freeze lifts; was
+        #     ≈ 0.4× under the old setup, which let A1 drift freely).
+        #   = Everything else identical to v10-fixes (K=16, CLIP_HIGH=0.28,
+        #     WW penalty −0.5 in code, SSR off, same data + reward weights).
         - name: SEPARATE_TURN_LOSS
           value: "1"
         - name: KL_COEFF
           value: "0.02"
+        # Dr.GRPO-consistent KL: k3 estimator now aggregates as sum/max_len
+        # (was .mean(), which was length-biased and silently weakened the
+        # anchor by 280/386 ≈ 0.73× on full-length completions). With the
+        # corrected normalization, A1_KL_COEFF=700 gives effective per-token
+        # KL gradient ≈ 2× policy gradient post-freeze (vs ~0.4× at the old
+        # 150 setting), so the A1 distribution actually stays anchored.
         - name: A1_KL_COEFF
-          value: "150.0"
+          value: "700.0"
         - name: A2_KL_COEFF
           value: "1.0"
         - name: FB_KL_COEFF
           value: "1.0"
 
-        # GRPO core
+        # GRPO core — K=16 for ~2× per-prompt WR opportunity (compute-side
+        # intervention against WR-flip sparsity).
         - name: K_SAMPLES
-          value: "8"
+          value: "16"
         - name: LOSS_TYPE
           value: "dr_grpo"
         - name: CLIP_RANGE
           value: "0.2"
+        # DAPO Clip-Higher (arXiv:2503.14476 §3.1): asymmetric upper clip
+        # 0.28 vs lower clip 0.2. Amplifies positive-advantage WR gradients.
+        - name: CLIP_HIGH
+          value: "0.28"
+        # DAPO Dynamic Sampling (arXiv:2503.14476 §3.2): drop K-groups with
+        # zero reward variance on BOTH heads (advantage=0, gradient=0). This
+        # run isolates Dynamic Sampling from SSR (SSR remains OFF) so we can
+        # attribute any WR/RW or BLINK delta to Dynamic Sampling alone.
+        - name: USE_DYNAMIC_SAMPLING
+          value: "1"
         - name: INNER_EPOCHS
           value: "1"
+        # SSR explicitly OFF — Dynamic Sampling alone, no buffer replay,
+        # so dropped slots simply shrink the effective batch (no degenerate
+        # gradient step ever fires; we just pay rollout cost on a few lost
+        # groups per step, which is acceptable for the isolation).
 
-        # Generation: 512 to fit per-option reasoning + closing tags
-        # (v10 first-run analysis showed p90 A1 length ≈ 280 tokens, so 256
-        # was truncating ~15% of A1s mid-reasoning before <answer> tag).
+        # Generation: 386 to fit per-option reasoning + closing tags
         - name: MAX_SAMPLES
           value: "0"
         - name: MAX_COMPLETION_LENGTH
@@ -163,13 +202,12 @@ spec:
 
         # Optimization
         - name: LEARNING_RATE
-          value: "1e-6"
+          value: "1e-5"
         - name: BATCH_SIZE
           value: "2"
         # GRAD_ACC is currently ignored by critic_grpo.py (it calls
         # optimizer.step() every train_step). Keeping at 1 to match
-        # the actual training behavior. Revisit in v11 if we wire
-        # Accelerator.accumulate() into the GRPO inner loop.
+        # the actual training behavior.
         - name: GRAD_ACC
           value: "1"
         - name: EPOCHS
@@ -186,15 +224,12 @@ spec:
         # vLLM
         - name: VLLM_GPU_MEM
           value: "0.50"
-        # Track the grpo-v10 branch (no commit pin). Pin only if reproducing.
+        # Track the feature/two-stage-critic-first branch — that's where the
+        # use_dynamic_sampling code lives. grpo-v10 does NOT yet have it.
         - name: GIT_BRANCH
-          value: "grpo-v10"
+          value: "feature/two-stage-critic-first"
 
-        # === User-message instruction text (v10+: Pattern A) ===
-        # No custom system prompt. Qwen2.5-VL chat template injects its
-        # default "You are a helpful assistant." Instructions below are
-        # embedded in the user message alongside the question/candidate.
-        # Matches LLaVA-Critic-R1 convention (arXiv:2509.00676, Qwen2.5-VL-7B).
+        # === User-message instruction text (Pattern A) ===
         - name: THINK_ANSWER_INSTRUCTION
           value: |
             The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in <answer> </answer> tags.
@@ -212,11 +247,7 @@ spec:
         - name: FREEZE_A1_STEPS
           value: "280"
 
-        # v10: α=1 everywhere (SCoRe paper default). With binary r_a1, r_a2
-        # in {-1,+1}, shaped term α·(r2-r1) has range ±2 → ±0.8 weighted.
-        # Larger α (e.g., 5 or 10) made transitions dominate group advantages
-        # and caused training collapse. RESPONSE_ALPHA/FEEDBACK_ALPHA override
-        # REWARD_SHAPING_ALPHA per-turn.
+        # v10: α=1 everywhere (SCoRe paper default).
         - name: REWARD_SHAPING_ALPHA
           value: "1.0"
         - name: RESPONSE_ALPHA
@@ -224,11 +255,6 @@ spec:
         - name: FEEDBACK_ALPHA
           value: "1.0"
         # Response weights: must sum to 1.0 (convex combination).
-        # Per-turn split: each turn = 0.9·correctness + 0.1·format.
-        # With turn weight 0.3 and no_regression 0.4:
-        #   a1: 0.27 corr + 0.03 fmt = 0.30
-        #   a2: 0.27 corr + 0.03 fmt = 0.30
-        #   no_regression:                0.40
         - name: W_A1_CORRECTNESS
           value: "0.27"
         - name: W_A1_FORMAT
@@ -240,8 +266,6 @@ spec:
         - name: W_NO_REGRESSION
           value: "0.40"
         # Feedback weights: must sum to 1.0.
-        # Format is pinned at 0.1; remaining 0.9 split evenly across
-        # downstream / verification_accuracy.
         - name: W_DOWNSTREAM
           value: "0.45"
         - name: W_VERIFICATION_ACCURACY
@@ -249,7 +273,7 @@ spec:
         - name: W_FB_FORMAT
           value: "0.1"
 
-        # Fresh start — reward structure differs from v9/v9b
+        # Fresh start — Dynamic Sampling needs to bake in from step 0
         - name: RESUME_CHECKPOINT
           value: ""
 
@@ -302,7 +326,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-9k-v10-base"
+          value: "grpo-livr-v2-9k-curriculum-filtered"
 
         resources:
           limits:

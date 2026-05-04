@@ -1,0 +1,169 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-vlmevalkit-blink-base-vanilla-v2-shard2
+  labels:
+    app: ms-swift
+    task: benchmark-evaluation
+    framework: vlmevalkit
+    mode: vanilla-base
+    benchmark: blink
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: ms-swift
+        task: benchmark-evaluation
+        framework: vlmevalkit
+        mode: vanilla-base
+        benchmark: blink
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: evaluator
+        image: ghcr.io/kkuntal990/ms-swift-qwen:latest
+        imagePullPolicy: Always
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+
+          echo "========================================="
+          echo "BLINK Vanilla Base Eval (NO wrapper, NO override)"
+          echo "========================================="
+          echo "Model:            ${MODEL_NAME}"
+          echo "Output Dir:       ${OUTPUT_DIR}"
+          echo "BLINK Data Dir:   ${BLINK_DATA_DIR}"
+          echo ""
+
+          nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+          echo ""
+
+          TSV_DIR="${BLINK_DATA_DIR}/tsv"
+          if [ ! -d "${TSV_DIR}" ]; then
+            echo "ERROR: BLINK TSV directory not found: ${TSV_DIR}" && exit 1
+          fi
+          ls -lh "${TSV_DIR}/"
+
+          mkdir -p "${OUTPUT_DIR}"
+
+          VLMEVALKIT_DIR="/tmp/VLMEvalKit"
+          if [ ! -d "${VLMEVALKIT_DIR}" ]; then
+            git clone https://github.com/open-compass/VLMEvalKit.git "${VLMEVALKIT_DIR}"
+          fi
+          pip install --index-url https://pypi.org/simple num2words openai-clip || true
+          pip install -e "${VLMEVALKIT_DIR}" || exit 1
+
+          # Sanity-check: confirm the built-in registration is intact and we
+          # are NOT importing any of our wrapper modules.
+          python3 -c "
+          from vlmeval.config import supported_VLM
+          import functools
+          entry = supported_VLM['${MODEL_NAME}']
+          target = entry.func if isinstance(entry, functools.partial) else entry
+          print('Registered class for ${MODEL_NAME}:', target.__module__ + '.' + target.__name__)
+          assert 'self_reflective' not in target.__module__, 'WRAPPER LEAKED INTO VANILLA EVAL'
+          assert target.__name__ == 'Qwen2VLChat', f'Expected Qwen2VLChat, got {target.__name__}'
+          print('OK — using vanilla Qwen2VLChat')
+          "
+
+          mkdir -p ~/LMUData
+          BLINK_TSVS=""
+          for task in ${BLINK_TASKS}; do
+            name="BLINK_${task}"
+            cp "${BLINK_DATA_DIR}/tsv/${name}.tsv" ~/LMUData/"${name}.tsv"
+            BLINK_TSVS="${BLINK_TSVS} ${name}"
+          done
+          echo "Evaluating on:${BLINK_TSVS}"
+
+          torchrun --nproc-per-node=${NUM_GPUS} ${VLMEVALKIT_DIR}/run.py \
+            --data ${BLINK_TSVS} \
+            --model ${MODEL_NAME} \
+            --work-dir ${OUTPUT_DIR} \
+            --verbose
+
+          echo "=== Eval complete ==="
+          python3 /outputs/scripts/aggregate_blink_results.py \
+            --results_dir "${OUTPUT_DIR}" \
+            --model_name "${MODEL_NAME}" \
+            || echo "Aggregation script not found / failed"
+
+          ls -lhR "${OUTPUT_DIR}/"
+
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: HF_DATASETS_CACHE
+          value: "/cache/hf/datasets"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+
+        # Vanilla Qwen2.5-VL-7B-Instruct via VLMEvalKit's built-in registration.
+        # No PatternA wrapper, no MCQ-letter regex, no system-prompt override.
+        - name: MODEL_NAME
+          value: "Qwen2.5-VL-7B-Instruct"
+        - name: OUTPUT_DIR
+          value: "/outputs/benchmark_results/blink_base_vanilla_v2"
+        - name: NUM_GPUS
+          value: "1"
+        - name: BLINK_DATA_DIR
+          value: "/outputs/benchmark_data/blink_v2"
+        - name: BLINK_TASKS
+          value: "Object_Localization Relative_Depth Relative_Reflectance Semantic_Correspondence Spatial_Relation Visual_Correspondence Visual_Similarity"
+
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+
+        resources:
+          requests:
+            nvidia.com/rtxa6000: "1"
+            memory: "32Gi"
+            cpu: "3"
+          limits:
+            nvidia.com/rtxa6000: "1"
+            memory: "32Gi"
+            cpu: "3"
+
+        volumeMounts:
+        - name: outputs-volume
+          mountPath: /outputs
+        - name: cache-volume
+          mountPath: /cache
+        - name: dev-shm
+          mountPath: /dev/shm
+
+      tolerations:
+        - effect: NoSchedule
+          key: nautilus.io/hardware
+          operator: Equal
+          value: large-gpu
+        - effect: PreferNoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - key: nautilus.io/reservation
+          operator: Exists
+          effect: NoSchedule
+
+      volumes:
+      - name: cache-volume
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: outputs-volume
+        persistentVolumeClaim:
+          claimName: ms-swift-outputs-pvc
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi

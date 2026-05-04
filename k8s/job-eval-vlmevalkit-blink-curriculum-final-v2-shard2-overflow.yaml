@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: eval-vlmevalkit-blink-v10-fixes-v4
+  name: eval-vlmevalkit-blink-curriculum-final-v2-shard2-overflow
   labels:
     app: ms-swift
     task: benchmark-evaluation
@@ -385,9 +385,9 @@ spec:
 
           mkdir -p ~/LMUData
           BLINK_TSVS=""
-          for tsv in ${BLINK_DATA_DIR}/tsv/BLINK_*.tsv; do
-            name=$(basename "${tsv}" .tsv)
-            cp "${tsv}" ~/LMUData/"${name}.tsv"
+          for task in ${BLINK_TASKS}; do
+            name="BLINK_${task}"
+            cp "${BLINK_DATA_DIR}/tsv/${name}.tsv" ~/LMUData/"${name}.tsv"
             BLINK_TSVS="${BLINK_TSVS} ${name}"
           done
           echo "Evaluating on:${BLINK_TSVS}"
@@ -431,17 +431,20 @@ spec:
         - name: TORCH_HOME
           value: "/cache/torch"
 
-        # Eval target — v10-fixes-v4 final adapter (tied-rewards run)
+        # Eval target — curriculum run, checkpoint-250 (first save from
+        # the K=16 + DAPO + curriculum-filtered 6.4k training).
         - name: MODEL_PATH
-          value: "/outputs/grpo_qwen_livr_v10_fixes_v4_tied/final"
+          value: "/outputs/grpo_qwen_livr_v2_9k_curriculum/final"
         - name: MODEL_NAME
-          value: "QWEN-2-5VL-v10-fixes-v4-final-patternA-blink"
+          value: "QWEN-2-5VL-curriculum-final-patternA-blink-v2-overflow"
         - name: OUTPUT_DIR
-          value: "/outputs/benchmark_results/blink_v10_fixes_v4_final_patternA"
+          value: "/outputs/benchmark_results/blink_curriculum_final_patternA_v2"
         - name: NUM_GPUS
           value: "1"
         - name: BLINK_DATA_DIR
-          value: "/outputs/benchmark_data/blink"
+          value: "/outputs/benchmark_data/blink_v2"
+        - name: BLINK_TASKS
+          value: "Visual_Correspondence Visual_Similarity"
 
         # Pattern-A reflection params
         - name: NUM_TURNS
@@ -454,7 +457,7 @@ spec:
           # analyze_blink_turns.py to read v10-base's stale log and produce
           # a turn_analysis.json that looked identical to v10-base's.
           # Always set this to ${OUTPUT_DIR}/conversation_log.jsonl.
-          value: "/outputs/benchmark_results/blink_v10_fixes_v4_final_patternA/conversation_log.jsonl"
+          value: "/outputs/benchmark_results/blink_curriculum_final_patternA_v2/conversation_log.jsonl"
 
         - name: PYTHONUNBUFFERED
           value: "1"

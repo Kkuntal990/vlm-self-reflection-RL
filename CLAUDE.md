@@ -110,26 +110,47 @@ GRPO³ uses two separate reward signals per trajectory — one for response qual
 ### Prompt Mismatch Warning
 The balanced_70k dataset's `messages` contain a system prompt with `Thought: [reasoning] / Answer: [final answer]` format. This is NOT the prompt used during GRPO training. GRPO hardcodes its own prompts in `prompts.py`. If you switch to using the dataset's messages, the prompt format will change.
 
-## Current Experiment: LIVR 9K MCQ with Think/Answer Tags
+## Current Experiments: LIVR-v2 9K with Pattern-A self-reflection
 
-**Job**: `qwen-grpo-livr-9k-think-tags` on pod `vlm-jupyter-eval2` (4x A100-80GB)
-**K8s YAML**: `k8s/job-qwen-grpo-livr-9k.yaml`
-**Branch**: `feature/vllm-deepspeed` (commit `2fc4dd2`)
-**Started**: 2026-04-11, ~2250 samples/process, ~34s/sample
+Two parallel training runs over the LIVR-v2 9-task dataset (1000 samples per task,
+single composite image per sample):
 
-### Dataset: LIVR Perception MCQ (9K)
-- **Path**: `/outputs/livr_data/livr_perception_mcq.jsonl`
-- **Construction scripts**: `scripts/livr/build_*.py` (9 tasks, 1000 each)
-- 9 tasks: Counting, Jigsaw, ObjLoc, VisCorr, ArtStyle, SemCorr, FunCorr, RelReflect, VisSim
-- All MCQ with ground truth in `(A)` format (matches BLINK eval)
-- `answer_type=mcq` only, `VLM_USE_LLM_JUDGE=0` (deterministic matching sufficient)
+| Job | YAML | DAPO | Notes |
+|---|---|---|---|
+| `qwen-grpo-livr-v2-9k-curriculum` | `k8s/job-qwen-grpo-livr-v2-9k-curriculum.yaml` | Yes (K=16, dynamic sampling + clip-higher) | Curriculum-filtered subset (drops trivial + brick-wall difficulties) |
+| `qwen-grpo-livr-v2-9k-no-dapo-k8` | `k8s/job-qwen-grpo-livr-v2-9k-curriculum-no-dapo-k8.yaml` | No (K=8, vanilla GRPO) | Full 9-task dataset, ablation against DAPO |
+
+### Dataset: LIVR-v2 9K
+- **Build pipeline**: `k8s/job-build-livr-v2-sources.yaml` → `k8s/job-build-livr-v2.yaml`
+- **Output**: `/outputs/livr_v2/data/livr_v2_9task_train.jsonl` (full) or
+  `/outputs/livr_v2/data/livr_v2_9k_curriculum_filtered.jsonl` (curriculum subset)
+- **Tasks (1000 each)**: Counting, Jigsaw, ObjLoc, ArtStyle, RelReflect, VisCorr, SemCorr, FunCorr, VisSim
+- **Image format**: a SINGLE pre-composited PNG per sample with all candidate sub-images
+  + region labels drawn in (matches LIVR paper's composite design but does the
+  composing offline rather than at inference time). Driven by
+  `scripts/data/livr_v2/livr_common.py` (`create_reference_and_options`,
+  `create_side_by_side`, `create_grid_image`).
+- All tasks are MCQ with ground truth in `(A)` format. `answer_type=mcq`,
+  deterministic matching (`VLM_USE_LLM_JUDGE=0`).
+- **Difficulty profiling** (for curriculum): `k8s/job-profile-livr-v2-9k-difficulty.yaml`
+  drives `scripts/data/profile_difficulty_a1.py` →
+  `scripts/analysis/difficulty_buckets.py`, then
+  `scripts/data/filter_by_difficulty.py` drops un-learnable buckets.
+
+### Pattern-A self-reflection (single user turn per turn)
+A1, F1, A2 all use a single-user-message format with no custom system prompt
+(Qwen's chat-template default fires). The candidate answer A1 and the feedback F1
+are quoted as TEXT inside the next user message rather than chained as separate
+assistant/user turns. Eval-side wrappers in the BLINK PatternA YAMLs mirror
+`src/vlm_grpo/prompts.py` byte-for-byte. See `src/vlm_grpo/prompts.py` docstring
+for the literature precedent (LLaVA-Critic-R1, Critique-GRPO, CriticGPT).
 
 ### Think/Answer Tags (`--use_think_answer_tags`)
-- A1/A2 system prompt includes tag format instruction (`VL_ASSISTANT_SYSTEM_PROMPT_WITH_TAGS`)
+- A1/A2 user message appends a tag-format instruction
 - Expected output: `<think>reasoning</think><answer>(A)</answer>`
-- F1 (critic) is freeform — no tags
+- F1 (critic) is freeform — no `<think>/<answer>` tags expected, with a tag-leak
+  penalty (`compute_f1_tag_penalty` in `composition.py`) when leakage occurs
 - Tag format reward: +0.5 (valid tags + valid inner), -0.5 (tags but bad inner), -1.0 (no tags)
-- `w_a2_format` auto-raised to 0.5 when tags enabled
 
 ### MCQ-Aware Reward Asymmetry
 Deterministic types (MCQ/YesNo/Numeric) use different no-regression and downstream values than open-ended:
@@ -137,23 +158,19 @@ Deterministic types (MCQ/YesNo/Numeric) use different no-regression and downstre
 - **Downstream**: RR=+3, RW=-1.5, WR=+3, WW=-1 (RR raised to match WR so feedback head is also tied — exact tie on combined reward between RR and WR)
 - **Feedback format**: De-coupled from calibration — pure word count only (0/<3/-2, 3-6/-1, >6/0)
 
-### Key Training Config
-- K=8 samples, batch=2, grad_acc=2 (effective batch=16), lr=1e-6, dr_grpo loss
+### Key Training Config (curriculum DAPO)
+- K=16 samples, batch=2, grad_acc=2 (effective batch=16), lr=1e-5, dr_grpo loss
+- DAPO: dynamic sampling (drops zero-variance K-groups) + clip-higher
 - LoRA r=64 alpha=128, max_completion=256, feedback_temp=0.7, a2_temp=1.0
 - vLLM colocate with sleep mode, gpu_mem=0.50
 - save_steps=250 (in global_step, not samples — first checkpoint ~sample 500)
 
-### F1 Tag Leakage Fix (v2)
-- **Problem**: Think tags leak from A1/A2 into F1 (0.3% → 38% by step 500) despite critic prompt having no tag instructions
-- Think-tagged F1 produces worse outcomes: R→R drops from 43.5% to 27.7%
-- **Fix**: `compute_f1_tag_penalty()` in `composition.py` — returns -2.0 when F1 contains `<think>/<answer>` tags
-- Weight `w_fb_tag_penalty=0.5` → effective -1.0 penalty per tagged F1
-- Critic system prompt also strengthened with "Do NOT use XML tags"
-- v2 job resumes from v1 checkpoint-250, writes to `/outputs/grpo_qwen_livr_v2/`
-
 ### Known Issues
-- Model puts verbose text inside `<answer>` tags (e.g., `(B) full text` instead of `(B)`), causing a2_format=-0.5. Expected to improve with training.
-- Relative reflectance task: model struggles consistently (COCO luminance proxy may be too hard)
+- Multi-view_Reasoning + Visual_Correspondence on BLINK score near random — these
+  tasks aren't in LIVR training (Multi-view) or use a denser-marker composite
+  (Correspondence) that diverges from LIVR's Source/Target layout.
+- BLINK IQ_Test under `vlmevalkit` exact-matching is unscorable for verbose base
+  predictions; needs the GPT judge enabled to extract a letter from prose.
 
 ## How to Run
 
@@ -256,35 +273,58 @@ Do NOT exec into training job pods for log analysis — use the helper pod which
 │       ├── stability.py          # No-regression + minimal-edit rewards
 │       └── verifier.py           # Top-level verify_answer dispatcher (deterministic + judge)
 │
-├── tests/                        # pytest suite mirroring src/vlm_grpo structure
-│   ├── test_binary_verification.py  # Binary CORRECT/INCORRECT verdict pipeline
+├── tests/                        # pytest suite
 │   ├── test_correctness.py          # A2 correctness reward
 │   ├── test_deterministic.py        # MCQ / YesNo / numeric matchers
+│   ├── test_difficulty_buckets.py   # Curriculum difficulty bucketing
+│   ├── test_dynamic_sampling.py     # DAPO dynamic-sampling K-group filter
 │   ├── test_feedback.py             # Calibration + downstream
+│   ├── test_kl_term.py              # Per-turn Schulman k3 KL
 │   ├── test_rollout.py              # RolloutConfig + batch rollout
 │   ├── test_stability.py            # No-regression + minimal-edit
 │   ├── test_trajectory.py           # Tag parsing + answer extraction
 │   ├── test_two_traj_composition.py # End-to-end response + feedback composition
-│   └── test_verifier.py             # Dispatcher + judge integration
+│   ├── test_verification.py         # Verifier dispatcher (deterministic + judge)
+│   └── test_verifier.py             # Top-level verify_answer
 │
 ├── scripts/
-│   ├── data/                     # Dataset construction
-│   │   ├── livr/                 # LIVR perception MCQ builders (9 tasks + merge)
-│   │   ├── convert_livr_to_sharegpt.py   # JSONL → ShareGPT format
-│   │   └── upload_livr_mixed_to_hf.py    # HuggingFace dataset upload
-│   ├── preference/               # Preference data for offline alignment (SFT / DPO)
-│   │   ├── build_feedback_preference_data.py
-│   │   └── build_pairwise_preference_data.py
-│   └── ops/                      # Cluster / training ops helpers
-│       ├── auto_resume_monitor.sh
-│       └── monitor_training.sh
+│   ├── analysis/
+│   │   └── difficulty_buckets.py        # Bucket samples by A1 pass-rate
+│   └── data/
+│       ├── blink_composite_rebuild.py   # Composite BLINK images to match training format
+│       ├── filter_by_difficulty.py      # Drop trivial / brick-wall buckets for curriculum
+│       ├── profile_difficulty_a1.py     # Run A1 over training data, log per-sample correctness
+│       └── livr_v2/                     # LIVR-v2 dataset builders
+│           ├── build_*.py               #   9 per-task builders
+│           ├── livr_common.py           #   shared composite/grid layout helpers
+│           ├── download_sources.py      #   pull source datasets (COCO, NIGHTS, ...)
+│           ├── dedup.py                 #   per-task dedup + cross-split overlap removal
+│           ├── merge.py                 #   merge 9 tasks into one JSONL
+│           ├── repair_counting_labels.py
+│           └── rerun_after_pipeline.sh
 │
-└── k8s/                          # Kubernetes configs
-    ├── job-qwen-grpo-livr-9k-v8.yaml    # Current: v8 binary verification
-    ├── job-qwen-grpo-livr-9k-v9.yaml    # Current: v9 rebalanced rewards + <feedback> tags
-    ├── job-qwen-grpo-livr-9k-v9b.yaml   # Current: v9b v8b rerun with token-cap fix
-    ├── jupyter-1gpu-dev.yaml            # Dev helper pod (PVC mount)
-    ├── multi_gpu.yaml                   # Accelerate multi-GPU launch config
-    ├── deepspeed_zero3.yaml             # Accelerate + DeepSpeed ZeRO-3 launch config
-    └── ds_zero3_config.json             # DeepSpeed ZeRO-3 engine config
+└── k8s/                                 # Kubernetes configs
+    │
+    ├── ─── Active training & data ───
+    ├── job-qwen-grpo-livr-v2-9k-curriculum.yaml          # Curriculum DAPO training
+    ├── job-qwen-grpo-livr-v2-9k-curriculum-no-dapo-k8.yaml  # No-DAPO ablation training
+    ├── job-build-livr-v2-sources.yaml                    # Download LIVR source datasets
+    ├── job-build-livr-v2.yaml                            # Build composite LIVR-v2 dataset
+    ├── job-profile-livr-v2-9k-difficulty.yaml            # Difficulty profiler for curriculum
+    │
+    ├── ─── Active eval (BLINK PatternA over composite TSVs) ───
+    ├── job-eval-vlmevalkit-blink-base-vanilla-v2.yaml             # Vanilla base, single shard
+    ├── job-eval-vlmevalkit-blink-base-vanilla-v2-shard{1,2}.yaml  # Sharded vanilla base
+    ├── job-eval-vlmevalkit-blink-curriculum-final-v2-shard{1,2}.yaml          # Curr-final main
+    ├── job-eval-vlmevalkit-blink-curriculum-final-v2-shard{1,2}-overflow.yaml # Slow-tail
+    ├── job-eval-vlmevalkit-blink-curriculum-final-v2-tail-overflow.yaml       # IQ + SpatRel
+    ├── job-eval-vlmevalkit-blink-no-dapo-k8-ckpt1000-v2-shard{1,2}.yaml          # No-dapo main
+    ├── job-eval-vlmevalkit-blink-no-dapo-k8-ckpt1000-v2-shard{1,2}-overflow.yaml # Slow-tail
+    ├── job-eval-vlmevalkit-blink-no-dapo-k8-ckpt1000-v2-tail-overflow.yaml       # IQ + SpatRel
+    │
+    └── ─── Infrastructure ───
+        ├── jupyter-1gpu-dev.yaml         # Helper pod for PVC reads + scratch scripts
+        ├── multi_gpu.yaml                # Accelerate multi-GPU launch config
+        ├── deepspeed_zero3.yaml          # Accelerate + DeepSpeed ZeRO-3 launch config
+        └── ds_zero3_config.json          # DeepSpeed ZeRO-3 engine config
 ```

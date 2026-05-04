@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: profile-livr-difficulty
+  name: profile-livr-v2-9k-difficulty
   labels:
     app: vlm-grpo
     task: difficulty-profile
@@ -126,15 +126,15 @@ spec:
         - name: MODEL_ID
           value: "Qwen/Qwen2.5-VL-7B-Instruct"
         - name: DATASET_PATH
-          value: "/outputs/livr_data/livr_perception_mcq.jsonl"
+          value: "/outputs/livr_v2/data/livr_v2_9task_train.jsonl"
         - name: IMAGE_BASE_DIR
-          value: "/outputs/image_base"
+          value: "/outputs/livr_v2/image_base"
         - name: OUTPUT_PATH
-          value: "/outputs/livr_data/livr_difficulty_a1.jsonl"
+          value: "/outputs/livr_v2/data/livr_v2_9k_difficulty_a1.jsonl"
         - name: BUCKETED_PATH
-          value: "/outputs/livr_data/livr_difficulty_a1_bucketed.jsonl"
+          value: "/outputs/livr_v2/data/livr_v2_9k_difficulty_a1_bucketed.jsonl"
         - name: REPORT_PATH
-          value: "/outputs/livr_data/livr_difficulty_report.md"
+          value: "/outputs/livr_v2/data/livr_v2_9k_difficulty_report.md"
         - name: K_SAMPLES
           value: "8"
         - name: MAX_COMPLETION
