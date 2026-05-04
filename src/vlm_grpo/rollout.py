@@ -42,6 +42,7 @@ from vlm_grpo.rewards.composition import (
     CriticRewardBreakdown,
     TrajectoryFeedbackRewardBreakdown,
     TrajectoryResponseRewardBreakdown,
+    compute_baseline_a1_reward_breakdown,
     compute_feedback_reward_breakdown,
     compute_response_reward_breakdown,
 )
@@ -356,6 +357,7 @@ def generate_self_reflection_rollout(
     device: str = "cuda",
     model_type: str = "llava",
     vllm_engine: Any = None,
+    baseline_weights: Any = None,
 ) -> list[SelfReflectionRolloutResult]:
     """Generate K full self-reflection trajectories per sample.
 
@@ -384,6 +386,18 @@ def generate_self_reflection_rollout(
         List of SelfReflectionRolloutResult, one per sample
     """
     import torch
+
+    if getattr(config, "single_turn_a1", False):
+        return generate_baseline_a1_rollout(
+            model=model,
+            processor=processor,
+            samples=samples,
+            config=config,
+            baseline_weights=baseline_weights,
+            device=device,
+            model_type=model_type,
+            vllm_engine=vllm_engine,
+        )
 
     n = len(samples)
     k = config.k_samples
@@ -575,6 +589,219 @@ def generate_self_reflection_rollout(
     return results
 
 
+def generate_baseline_a1_rollout(
+    model: Any,
+    processor: Any,
+    samples: list[dict],
+    config: RolloutConfig,
+    baseline_weights: Any,
+    device: str = "cuda",
+    model_type: str = "llava",
+    vllm_engine: Any = None,
+) -> list[SelfReflectionRolloutResult]:
+    """Generate K A1-only trajectories per sample for the single-turn GRPO baseline.
+
+    Skips the F1 (critic) and A2 (refiner) steps entirely. Produces results in
+    the same ``SelfReflectionRolloutResult`` shape as the multi-turn path so the
+    trainer's downstream group-aggregation, zero-variance filtering, and metric
+    plumbing keep working — but the F1/A2 fields are populated with empty
+    strings and the per-trajectory ``feedback_breakdowns`` are populated with
+    zero-reward stubs so the trainer can short-circuit feedback work via
+    ``single_turn_a1``.
+
+    Args:
+        model: HuggingFace model (used when vLLM engine is absent).
+        processor: HuggingFace processor for chat-template formatting.
+        samples: List of sample dicts (question, image, ground_truth, ...).
+        config: Rollout configuration; ``config.single_turn_a1`` is expected to
+            be True at the call site.
+        baseline_weights: ``BaselineA1RewardWeights`` instance. Required.
+        device: Device string for HF generation fallback.
+        model_type: Model family ("llava" or "qwen2vl").
+        vllm_engine: Optional VLLMRolloutEngine for fast generation.
+
+    Returns:
+        List of SelfReflectionRolloutResult, one per sample. Each carries:
+          - ``answer1s``: K A1 completions
+          - ``feedbacks`` / ``answer2s``: K empty strings (no F1/A2)
+          - ``response_breakdowns``: K BaselineA1RewardBreakdown entries
+          - ``feedback_breakdowns``: K zero-reward feedback stubs (so legacy
+            trainer code that iterates them does not crash; trainer is
+            expected to ignore the feedback head when ``single_turn_a1=True``)
+
+    Raises:
+        ValueError: when baseline_weights is None.
+    """
+    import torch
+
+    if baseline_weights is None:
+        raise ValueError(
+            "generate_baseline_a1_rollout requires baseline_weights "
+            "(BaselineA1RewardWeights instance) — got None"
+        )
+
+    n = len(samples)
+    k = config.k_samples
+    gen_batch = config.batch_size
+
+    questions = [s.get("question", "").replace("<image>", "").strip() for s in samples]
+    images = [s.get("image") for s in samples]
+    ground_truths = [s.get("ground_truth", "") for s in samples]
+    answer_types = [s.get("answer_type", "open") for s in samples]
+    choices_list = [s.get("choices", "") for s in samples]
+    dataset_names = [s.get("dataset_name", "unknown") for s in samples]
+    sample_indices = [s.get("sample_index", i) for i, s in enumerate(samples)]
+
+    all_a1s: list[str] = []
+
+    with torch.no_grad():
+        for chunk_start in range(0, n, gen_batch):
+            chunk_end = min(chunk_start + gen_batch, n)
+            chunk_qs = questions[chunk_start:chunk_end]
+            chunk_imgs = images[chunk_start:chunk_end]
+
+            use_tags = config.use_think_answer_tags
+            use_answer_only = getattr(config, "use_answer_tag_only", False)
+            a1_prompts = [
+                build_initial_answer_prompt(
+                    q,
+                    use_think_answer_tags=use_tags,
+                    use_answer_tag_only=use_answer_only,
+                )
+                for q in chunk_qs
+                for _ in range(k)
+            ]
+            imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
+
+            if vllm_engine is not None:
+                texts = [
+                    processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+                    for m in a1_prompts
+                ]
+                chunk_a1s = vllm_engine.generate_batch(
+                    prompts=texts,
+                    images=imgs_expanded,
+                    max_new_tokens=config.a1_max_completion_length,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                )
+            else:
+                chunk_a1s = _generate_batch_completions(
+                    model,
+                    processor,
+                    a1_prompts,
+                    imgs_expanded,
+                    device,
+                    max_new_tokens=config.a1_max_completion_length,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    model_type=model_type,
+                )
+            all_a1s.extend(chunk_a1s)
+
+            logger.info(
+                f"Baseline A1 rollout: {chunk_end}/{n} samples (chunk={len(chunk_qs)}, k={k})"
+            )
+
+    # Zero-reward stub for the feedback head so legacy iteration code (e.g.
+    # zero-variance group filter, metrics aggregation) stays well-defined
+    # even though the trainer will not compute a feedback loss.
+    fb_stub = TrajectoryFeedbackRewardBreakdown(
+        total_reward=0.0,
+        components={"downstream": 0.0, "verification": 0.0, "format": 0.0},
+        weighted_components={"downstream": 0.0, "verification": 0.0, "format": 0.0},
+    )
+
+    results: list[SelfReflectionRolloutResult] = []
+    for i in range(n):
+        traj_slice = slice(i * k, (i + 1) * k)
+        answer1s = all_a1s[traj_slice]
+
+        result = SelfReflectionRolloutResult(
+            sample_index=sample_indices[i],
+            question=questions[i],
+            image_path=samples[i].get("image_path", ""),
+            ground_truth=ground_truths[i],
+            answer_type=answer_types[i],
+            choices=choices_list[i],
+            dataset_name=dataset_names[i],
+        )
+
+        for a1 in answer1s:
+            base_bd = compute_baseline_a1_reward_breakdown(
+                a1_text=a1,
+                ground_truth=ground_truths[i],
+                answer_type=answer_types[i],
+                choices=choices_list[i],
+                weights=baseline_weights,
+            )
+            # Reuse the existing "response_*" fields so the trainer's
+            # downstream advantage / metric plumbing does not need a parallel
+            # baseline-only path.
+            result.response_rewards.append(base_bd.total_reward)
+            result.feedback_rewards.append(0.0)
+            result.response_breakdowns.append(base_bd)  # BaselineA1RewardBreakdown
+            result.feedback_breakdowns.append(fb_stub)
+
+        result.answer1s = list(answer1s)
+        result.feedbacks = [""] * len(answer1s)
+        result.answer2s = [""] * len(answer1s)
+        results.append(result)
+
+    return results
+
+
+def compute_baseline_a1_metrics(
+    results: list[SelfReflectionRolloutResult],
+) -> dict[str, float]:
+    """Compute aggregate metrics for single-turn A1 baseline rollouts.
+
+    Mirrors ``compute_self_reflection_metrics`` but uses A1-only fields so
+    transition rates (RR/WW/...) are not invented. Reward, accuracy, and
+    format-violation counters are derived from the BaselineA1RewardBreakdown
+    entries stored in ``response_breakdowns``.
+
+    Args:
+        results: List of SelfReflectionRolloutResult from
+            ``generate_baseline_a1_rollout``.
+
+    Returns:
+        Dict of metric name -> value.
+    """
+    if not results:
+        return {}
+
+    total = 0
+    a1_correct_count = 0
+    fmt_violation_count = 0
+    reward_sum = 0.0
+
+    for r in results:
+        for bd in r.response_breakdowns:
+            total += 1
+            reward_sum += bd.total_reward
+            if getattr(bd, "a1_correct", False):
+                a1_correct_count += 1
+            if bd.components.get("a1_format", 1.0) == 0.0:
+                fmt_violation_count += 1
+
+    n = max(total, 1)
+    return {
+        "sr/total_trajectories": float(total),
+        "sr/a1_accuracy": a1_correct_count / n,
+        "sr/a2_accuracy": float("nan"),
+        "sr/rr_rate": float("nan"),
+        "sr/rw_rate": float("nan"),
+        "sr/wr_rate": float("nan"),
+        "sr/ww_rate": float("nan"),
+        "sr/response_reward_mean": reward_sum / n,
+        "sr/feedback_reward_mean": 0.0,
+        "sr/a1_format_violation_rate": fmt_violation_count / n,
+        "sr/a2_format_violation_rate": float("nan"),
+        "sr/fb_format_violation_rate": float("nan"),
+    }
+
+
 def compute_self_reflection_metrics(
     results: list[SelfReflectionRolloutResult],
 ) -> dict[str, float]:
@@ -588,6 +815,17 @@ def compute_self_reflection_metrics(
     """
     if not results:
         return {}
+
+    # Single-turn baseline path: response_breakdowns hold BaselineA1RewardBreakdown
+    # which has no a2_correct field, so RR/WW/... rates are not defined here.
+    # Detect by class name to avoid an isinstance import cycle.
+    first_bd = None
+    for r in results:
+        if r.response_breakdowns:
+            first_bd = r.response_breakdowns[0]
+            break
+    if first_bd is not None and type(first_bd).__name__ == "BaselineA1RewardBreakdown":
+        return compute_baseline_a1_metrics(results)
 
     total = 0
     a1_correct_count = 0

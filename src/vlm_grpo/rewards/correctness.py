@@ -62,6 +62,37 @@ def compute_a2_correctness_reward(
     return -1.0
 
 
+def compute_a1_correctness_01(
+    a1_text: str,
+    ground_truth: str,
+    answer_type: str,
+    tolerance: float = 0.01,
+) -> float:
+    """R_a1_correct_01: binary {0.0, 1.0} A1 correctness for the single-turn baseline.
+
+    Used by the ``single_turn_a1`` GRPO baseline (config.RolloutConfig.single_turn_a1)
+    where the reward range is constrained to [0, 1] to keep all components on a
+    common positive scale. Returns 1.0 when ``verify_answer`` says A1 matches the
+    ground truth, else 0.0. NOT gated by format — format compliance is a separate
+    component (see ``compute_a1_format_01`` in rewards.composition).
+
+    Counting and open-ended types still bottom out to a binary verdict here
+    rather than the continuous score path used by ``compute_a2_correctness_reward``,
+    so the baseline reward stays strictly in {0, 1}.
+
+    Args:
+        a1_text: Raw A1 text (extraction is delegated to verify_answer).
+        ground_truth: Ground truth answer.
+        answer_type: Answer type ("mcq", "yesno", "numeric", "counting", "open").
+        tolerance: Numeric tolerance for comparison.
+
+    Returns:
+        1.0 if A1 is correct, 0.0 otherwise.
+    """
+    result = verify_answer(a1_text, ground_truth, answer_type, tolerance=tolerance)
+    return 1.0 if result.is_correct else 0.0
+
+
 def compute_downstream_improvement_reward(
     a1: str,
     a2_extracted: str,

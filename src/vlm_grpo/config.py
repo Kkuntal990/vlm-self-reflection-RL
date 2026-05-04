@@ -120,6 +120,10 @@ class RolloutConfig:
     reward_shaping_alpha: float = 0.0
     response_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
     feedback_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
+    # Baseline mode: skip F1 and A2 generation/loss entirely. Train GRPO on
+    # A1 alone with a single 2-component [0,1] reward. Used to isolate
+    # algorithm bugs from multi-turn / two-reward composition issues.
+    single_turn_a1: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -228,6 +232,36 @@ class FeedbackRewardWeights:
 
 
 @dataclass
+class BaselineA1RewardWeights:
+    """Weights for single-turn A1 baseline reward composition.
+
+    reward = w_a1_correctness * R_a1_correct_01
+           + w_a1_format      * R_a1_format_01
+
+    Both components live in [0, 1], so the convex combination is in [0, 1].
+    Default 0.9 / 0.1 makes correctness the dominant signal while keeping a
+    small format-anchor bonus to nudge the model to follow the
+    <think>/<answer> tag structure used by the eval pipeline.
+
+    Used only when ``RolloutConfig.single_turn_a1=True``.
+
+    Attributes:
+        w_a1_correctness: Weight for binary {0,1} A1 correctness reward.
+        w_a1_format: Weight for binary {0,1} A1 format-compliance reward.
+    """
+
+    w_a1_correctness: float = 0.9
+    w_a1_format: float = 0.1
+
+    def __post_init__(self) -> None:
+        _validate_weight_sum("BaselineA1RewardWeights", self.to_dict())
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+@dataclass
 class SelfReflectionConfig:
     """Top-level configuration for full self-reflection GRPO training.
 
@@ -281,6 +315,7 @@ class SelfReflectionConfig:
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     response_weights: ResponseRewardWeights = field(default_factory=ResponseRewardWeights)
     feedback_weights: FeedbackRewardWeights = field(default_factory=FeedbackRewardWeights)
+    baseline_weights: BaselineA1RewardWeights = field(default_factory=BaselineA1RewardWeights)
     learning_rate: float = 1e-5
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 4

@@ -1,0 +1,294 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-grpo-livr-v2-9k-baseline-a1
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: grpo-trainer
+        model: qwen2-5-vl-7b
+        task: livr-perception-grpo-baseline-a1
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: huggingface/trl:0.29.0
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "========================================="
+          echo "BASELINE: Qwen2.5-VL-7B + Pattern A + SINGLE-TURN A1 ONLY"
+          echo "Goal: isolate GRPO algorithm bugs from multi-turn / two-reward composition."
+          echo "Reward: 0.9 * a1_correctness_01 + 0.1 * a1_format_01  (range [0, 1])"
+          echo "Turns: A1 only (no F1, no A2). KL applied to A1 only."
+          echo "Start weights: ${MODEL_ID} (fresh base Instruct checkpoint, NOT SFT-v2)"
+          echo "Model: ${MODEL_ID}"
+          echo "Dataset: ${DATASET_PATH}"
+          echo "Output: ${OUTPUT_DIR}"
+          echo "GPUs: ${NUM_GPUS}"
+          echo "K samples:   ${K_SAMPLES:-16}"
+          echo "KL_COEFF:    ${KL_COEFF:-0.001}  (DeepSeek-R1 normal β)"
+          echo "A1_KL_COEFF: ${A1_KL_COEFF:-1.0} (effective β = 0.001)"
+          echo "DAPO:        OFF"
+          echo "SSR:         OFF"
+          echo "========================================="
+
+          # GPU check
+          nvidia-smi
+          echo ""
+
+          # Pin vllm to 0.12.0 (same rationale as the multi-turn YAML — keep
+          # torch / transformers compatible with the trl:0.29.0 image and
+          # avoid the 0.20.0 NVRTC kernel JIT regression on Qwen2.5-VL).
+          pip install "vllm==0.12.0" wandb sentence-transformers 2>&1 | tail -5
+
+          # Clone and install project — track the grpo-baseline branch where
+          # the single-turn-A1 code lives.
+          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          cd /workspace/vlm-self-reflection-RL
+          git checkout "${GIT_BRANCH:-grpo-baseline}"
+          pip install -e . 2>&1 | tail -3
+
+          # Create output dir
+          mkdir -p "${OUTPUT_DIR}"
+
+          # Run training. --single_turn_a1 short-circuits F1/A2 in both the
+          # rollout engine and the trainer. The --w_a2_*, --w_no_regression,
+          # --w_downstream*, --w_fb_format, --reward_shaping_alpha,
+          # --separate_turn_loss, --freeze_a1_steps flags are still parsed
+          # but the trainer ignores them in single-turn mode (kept here
+          # only so the multi-turn arg surface keeps a single source of truth).
+          accelerate launch \
+            --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
+            --num_processes=${NUM_GPUS:-4} \
+            train_self_reflection.py \
+            --model_id "${MODEL_ID}" \
+            --model_type qwen2vl \
+            --dataset_path "${DATASET_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            --image_base_dir "${IMAGE_BASE_DIR}" \
+            --use_vllm \
+            --use_think_answer_tags \
+            --single_turn_a1 \
+            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.50} \
+            --max_samples ${MAX_SAMPLES:-0} \
+            --k_samples ${K_SAMPLES:-16} \
+            --max_completion_length ${MAX_COMPLETION_LENGTH:-386} \
+            --a1_max_completion_length ${A1_MAX_COMPLETION:-386} \
+            --temperature ${TEMPERATURE:-1.0} \
+            --learning_rate ${LEARNING_RATE:-1e-5} \
+            --per_device_train_batch_size ${BATCH_SIZE:-2} \
+            --gradient_accumulation_steps ${GRAD_ACC:-1} \
+            --num_train_epochs ${EPOCHS:-1} \
+            --num_inner_epochs ${INNER_EPOCHS:-1} \
+            --kl_coeff ${KL_COEFF:-0.001} \
+            --a1_kl_coeff ${A1_KL_COEFF:-1.0} \
+            --clip_range ${CLIP_RANGE:-0.2} \
+            --loss_type ${LOSS_TYPE:-dr_grpo} \
+            --lora_r ${LORA_R:-64} \
+            --lora_alpha ${LORA_ALPHA:-128} \
+            --freeze_vision_tower \
+            --max_pixels ${MAX_PIXELS:-401408} \
+            --min_pixels ${MIN_PIXELS:-200704} \
+            --w_a1_correctness ${W_A1_CORRECTNESS:-0.9} \
+            --w_a1_format ${W_A1_FORMAT:-0.1} \
+            --logging_steps ${LOGGING_STEPS:-10} \
+            --save_steps ${SAVE_STEPS:-250} \
+            --seed ${SEED:-42} \
+            --debug \
+            ${RESUME_CHECKPOINT:+--resume_from_checkpoint "$RESUME_CHECKPOINT"} \
+            2>&1 | tee -a "${OUTPUT_DIR}/training.log"
+
+          echo "=== Training complete ==="
+
+        env:
+        # Model and data
+        - name: MODEL_ID
+          value: "Qwen/Qwen2.5-VL-7B-Instruct"
+        - name: DATASET_PATH
+          value: "/outputs/livr_v2_train_snapshots/snap_20260501_154345_final/data/livr_v2_9task_train.jsonl"
+        - name: OUTPUT_DIR
+          value: "/outputs/grpo_qwen_livr_v2_9k_baseline_a1"
+        - name: IMAGE_BASE_DIR
+          value: "/outputs/image_base"
+
+        # Single-turn baseline KL: normal DeepSeek-R1 β = 0.001 (was 0.02 *
+        # 700 = 14.0 effective in v10's no-dapo run, which alone could
+        # explain the flat reward mean — gradient pinned to reference).
+        - name: KL_COEFF
+          value: "0.001"
+        - name: A1_KL_COEFF
+          value: "1.0"
+
+        # GRPO core — K=16 raised from K=8 in v10 to reduce advantage variance
+        # in baseline so any signal-vs-noise issue is more visible.
+        - name: K_SAMPLES
+          value: "16"
+        - name: LOSS_TYPE
+          value: "dr_grpo"
+        - name: CLIP_RANGE
+          value: "0.2"
+        - name: INNER_EPOCHS
+          value: "1"
+
+        # Generation: only A1 generated, but keep length budget identical
+        # to no-dapo run so the comparison is apples-to-apples.
+        - name: MAX_SAMPLES
+          value: "0"
+        - name: MAX_COMPLETION_LENGTH
+          value: "386"
+        - name: A1_MAX_COMPLETION
+          value: "386"
+        - name: TEMPERATURE
+          value: "1.0"
+
+        # Optimization
+        - name: LEARNING_RATE
+          value: "1e-5"
+        - name: BATCH_SIZE
+          value: "2"
+        - name: GRAD_ACC
+          value: "1"
+        - name: EPOCHS
+          value: "1"
+        - name: NUM_GPUS
+          value: "4"
+
+        # LoRA
+        - name: LORA_R
+          value: "64"
+        - name: LORA_ALPHA
+          value: "128"
+
+        # vLLM. Keep gpu_mem at 0.50 — A1-only rollout halves the activation
+        # footprint vs A1+F1+A2, so K=16 should still fit. If we OOM in the
+        # first step, drop to 0.45.
+        - name: VLLM_GPU_MEM
+          value: "0.50"
+        - name: GIT_BRANCH
+          value: "grpo-baseline"
+
+        # === User-message instruction text (Pattern A) ===
+        - name: THINK_ANSWER_INSTRUCTION
+          value: |
+            The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in <answer> </answer> tags.
+
+        # Qwen2.5-VL image resolution
+        - name: MAX_PIXELS
+          value: "401408"
+        - name: MIN_PIXELS
+          value: "200704"
+
+        # Single-turn baseline reward weights: 0.9 / 0.1, both [0, 1].
+        - name: W_A1_CORRECTNESS
+          value: "0.9"
+        - name: W_A1_FORMAT
+          value: "0.1"
+
+        # Logging
+        - name: LOGGING_STEPS
+          value: "10"
+        - name: SAVE_STEPS
+          value: "250"
+        - name: SEED
+          value: "42"
+
+        # LLM Judge disabled for MCQ
+        - name: VLM_USE_LLM_JUDGE
+          value: "0"
+
+        # HuggingFace
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+
+        # Python and CUDA
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: ""
+        - name: NCCL_TIMEOUT
+          value: "1800"
+        - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+          value: "1800"
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        - name: DO_NOT_TRACK
+          value: "1"
+        - name: VLLM_ENABLE_V1_MULTIPROCESSING
+          value: "0"
+        - name: WANDB_PROJECT
+          value: "vlm-self-reflection-grpo"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-api-key
+              key: key
+        - name: WANDB_RUN_NAME
+          value: "grpo-livr-v2-9k-baseline-a1"
+
+        resources:
+          limits:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+          requests:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+
+        volumeMounts:
+        - name: cache
+          mountPath: /cache
+        - name: outputs
+          mountPath: /outputs
+        - name: dev-shm
+          mountPath: /dev/shm
+
+      tolerations:
+      - key: nautilus.io/reservation
+        operator: Exists
+        effect: NoSchedule
+      - key: nautilus.io/hardware
+        operator: Equal
+        value: large-gpu
+      - effect: PreferNoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      - key: nautilus.io/issue
+        operator: Exists
+        effect: NoSchedule
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+
+      volumes:
+      - name: cache
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: ms-swift-outputs-pvc
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi

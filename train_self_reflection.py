@@ -250,6 +250,19 @@ def parse_args() -> argparse.Namespace:
         help="Use <answer>...</answer> tag only (no <think>). Model reasons freely, "
         "wraps final answer in <answer> tags for structured extraction.",
     )
+    parser.add_argument(
+        "--single_turn_a1",
+        action="store_true",
+        help=(
+            "Single-turn A1-only baseline mode. Skips F1 (critic) and A2 (refiner) "
+            "generation/loss entirely; trains GRPO on A1 with a 2-component [0,1] "
+            "reward (0.9*correctness + 0.1*format by default). Used to isolate "
+            "algorithm bugs from multi-turn / two-reward composition issues. "
+            "When set, the --w_a1_correctness / --w_a1_format flags are interpreted "
+            "as the baseline weights; --w_a2_*, --w_no_regression and feedback "
+            "flags are ignored. KL is applied to A1 only."
+        ),
+    )
     parser.add_argument("--min_pixels", type=int, default=200704, help="Min pixels per image")
     parser.add_argument(
         "--loss_type",
@@ -344,6 +357,7 @@ def main() -> None:
 
     # Build configs
     from vlm_grpo.config import (
+        BaselineA1RewardWeights,
         FeedbackRewardWeights,
         ResponseRewardWeights,
         RolloutConfig,
@@ -362,6 +376,14 @@ def main() -> None:
         w_verification_accuracy=args.w_verification_accuracy,
         w_format=args.w_fb_format,
     )
+    # Baseline weights reuse --w_a1_correctness / --w_a1_format. The
+    # multi-turn defaults (0.27 / 0.03) sum to 0.30, so a baseline run must
+    # override them via the YAML (e.g. 0.9 / 0.1) for the convex-combination
+    # warning to stay quiet.
+    baseline_weights = BaselineA1RewardWeights(
+        w_a1_correctness=args.w_a1_correctness,
+        w_a1_format=args.w_a1_format,
+    )
     rollout_config = RolloutConfig(
         k_samples=args.k_samples,
         max_completion_length=args.max_completion_length,
@@ -378,6 +400,7 @@ def main() -> None:
         reward_shaping_alpha=args.reward_shaping_alpha,
         response_alpha=args.response_alpha,
         feedback_alpha=args.feedback_alpha,
+        single_turn_a1=args.single_turn_a1,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -389,6 +412,7 @@ def main() -> None:
         rollout=rollout_config,
         response_weights=response_weights,
         feedback_weights=feedback_weights,
+        baseline_weights=baseline_weights,
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -428,6 +452,10 @@ def main() -> None:
 
     logger.info(f"Response weights: {response_weights.to_dict()}")
     logger.info(f"Feedback weights: {feedback_weights.to_dict()}")
+    if args.single_turn_a1:
+        logger.info(
+            f"Single-turn A1 baseline ENABLED. Baseline weights: {baseline_weights.to_dict()}"
+        )
 
     # Load dataset
     from vlm_grpo.data import load_self_reflection_dataset

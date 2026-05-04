@@ -226,9 +226,7 @@ class TestFeedbackBreakdown:
         # total = 0.45·11 + 0.45·1 + 0.1·0 = 5.4
         assert bd.total_reward == pytest.approx(5.4, abs=0.01)
 
-    def test_ww_miscalibrated_asymmetric_gate(
-        self, weights: FeedbackRewardWeights
-    ) -> None:
+    def test_ww_miscalibrated_asymmetric_gate(self, weights: FeedbackRewardWeights) -> None:
         """F1 sycophantic CORRECT + WW (A2 still wrong) — negative downstream flows.
 
         Asymmetric gate: only positive downstream is gated when verdict wrong;
@@ -254,9 +252,7 @@ class TestFeedbackBreakdown:
         assert bd.components["format"] == 1.0
         assert bd.total_reward == pytest.approx(-0.80, abs=0.01)
 
-    def test_wr_sycophantic_positive_downstream_gated(
-        self, weights: FeedbackRewardWeights
-    ) -> None:
+    def test_wr_sycophantic_positive_downstream_gated(self, weights: FeedbackRewardWeights) -> None:
         """F1 sycophantic CORRECT + WR (A2 variance-flip right) — positive gated."""
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>(B) looks right.</think> \\boxed{CORRECT}",
@@ -275,9 +271,7 @@ class TestFeedbackBreakdown:
         assert bd.components["downstream"] == 0.0
         assert bd.total_reward == pytest.approx(-0.35, abs=0.01)
 
-    def test_rw_wrong_incorrect_causes_harm(
-        self, weights: FeedbackRewardWeights
-    ) -> None:
+    def test_rw_wrong_incorrect_causes_harm(self, weights: FeedbackRewardWeights) -> None:
         """F1 wrong INCORRECT on a right A1 → A2 follows bad advice and regresses.
 
         The worst case: F1 actively caused harm. Asymmetric gate lets the

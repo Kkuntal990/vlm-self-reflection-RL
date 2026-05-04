@@ -119,6 +119,7 @@ single composite image per sample):
 |---|---|---|---|
 | `qwen-grpo-livr-v2-9k-curriculum` | `k8s/job-qwen-grpo-livr-v2-9k-curriculum.yaml` | Yes (K=16, dynamic sampling + clip-higher) | Curriculum-filtered subset (drops trivial + brick-wall difficulties) |
 | `qwen-grpo-livr-v2-9k-no-dapo-k8` | `k8s/job-qwen-grpo-livr-v2-9k-curriculum-no-dapo-k8.yaml` | No (K=8, vanilla GRPO) | Full 9-task dataset, ablation against DAPO |
+| `qwen-grpo-livr-v2-9k-baseline-a1` | `k8s/job-qwen-grpo-livr-v2-9k-baseline-a1.yaml` | No (K=16, single-turn A1 only) | Single-turn baseline (`--single_turn_a1`) — strips F1+A2, trains GRPO on A1 with `0.9 * a1_correctness_01 + 0.1 * a1_format_01` (range [0,1]) and normal β=0.001 KL. Used to isolate algorithm bugs from multi-turn / two-reward composition issues. Branch: `grpo-baseline`. |
 
 ### Dataset: LIVR-v2 9K
 - **Build pipeline**: `k8s/job-build-livr-v2-sources.yaml` → `k8s/job-build-livr-v2.yaml`

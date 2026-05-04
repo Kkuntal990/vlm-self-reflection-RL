@@ -33,7 +33,10 @@ import sys
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from vlm_grpo.rewards.correctness import compute_a2_correctness_reward
+from vlm_grpo.rewards.correctness import (
+    compute_a1_correctness_01,
+    compute_a2_correctness_reward,
+)
 from vlm_grpo.rewards.feedback import compute_downstream_aware_reward
 from vlm_grpo.rewards.stability import compute_no_regression_reward
 from vlm_grpo.rewards.verifier import verify_answer
@@ -786,6 +789,126 @@ class TrajectoryFeedbackRewardBreakdown:
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
+
+
+# =============================================================================
+# Single-turn A1 baseline reward (used when RolloutConfig.single_turn_a1=True)
+# =============================================================================
+
+
+def compute_a1_format_01(a1_text: str, answer_type: str) -> float:
+    """R_a1_format_01: binary {0.0, 1.0} format check for the single-turn baseline.
+
+    1.0 only when BOTH conditions hold:
+      1. The output contains both ``<think>...</think>`` and ``<answer>...</answer>``
+         (any order, any inner content).
+      2. The inner content of ``<answer>`` is a clean atomic answer for the
+         expected type — same definition as ``_is_clean_atomic_answer`` (MCQ
+         letter, integer, yes/no, numeric, or any non-empty string for open).
+
+    Uses the same atomic-answer notion as the multi-turn ``_compute_tag_format_reward``
+    so the baseline's format signal is consistent with the eval pipeline (which
+    extracts via ``<answer>`` tags).
+
+    Args:
+        a1_text: Raw A1 output text.
+        answer_type: Expected answer type ("mcq", "yesno", "numeric",
+            "counting", "open").
+
+    Returns:
+        1.0 if both tags present AND inner is a clean atomic answer.
+        0.0 otherwise.
+    """
+    from vlm_grpo.trajectory import extract_from_answer_tags, has_think_answer_tags
+
+    if not has_think_answer_tags(a1_text):
+        return 0.0
+    inner = extract_from_answer_tags(a1_text).strip()
+    if not inner:
+        return 0.0
+    if not _is_clean_atomic_answer(inner, answer_type):
+        return 0.0
+    return 1.0
+
+
+@dataclass
+class BaselineA1RewardBreakdown:
+    """Reward breakdown for single-turn A1 baseline GRPO.
+
+    Reward = ``w_a1_correctness * R_a1_correct_01 + w_a1_format * R_a1_format_01``.
+
+    Both components are in [0, 1] and weights default to 0.9 / 0.1, so
+    ``total_reward`` lives in [0, 1].
+
+    Attributes:
+        total_reward: Weighted sum of the two components.
+        components: Raw component values (each in {0.0, 1.0}).
+        weighted_components: Component values multiplied by their weights.
+        a1_correct: Whether A1 matched the ground truth.
+        a1_format_valid: Whether A1 passed the strict tag-format check.
+        a1_extracted: Strict atomic-answer extraction from ``<answer>`` tags
+            (empty string when format invalid).
+    """
+
+    total_reward: float
+    components: dict[str, float]
+    weighted_components: dict[str, float]
+    a1_correct: bool
+    a1_format_valid: bool
+    a1_extracted: str
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+def compute_baseline_a1_reward_breakdown(
+    a1_text: str,
+    ground_truth: str,
+    answer_type: str,
+    choices: str,
+    weights: Any,
+) -> BaselineA1RewardBreakdown:
+    """Compute the 2-component A1-only reward used by the single-turn baseline.
+
+    This is the lone reward path when ``RolloutConfig.single_turn_a1=True``;
+    no F1 / A2 / no_regression / shaped-improvement components participate.
+
+    Args:
+        a1_text: Raw A1 output text.
+        ground_truth: Ground truth answer.
+        answer_type: Answer type ("mcq", "yesno", "numeric", "counting", "open").
+        choices: MCQ choices string (kept for API parity, unused here).
+        weights: ``BaselineA1RewardWeights`` instance.
+
+    Returns:
+        BaselineA1RewardBreakdown with both components, weighted sum, and
+        derived flags (a1_correct, a1_format_valid, a1_extracted).
+    """
+    r_correct = compute_a1_correctness_01(a1_text, ground_truth, answer_type)
+    r_format = compute_a1_format_01(a1_text, answer_type)
+    a1_extracted = extract_answer_from_text(a1_text, answer_type, choices, strict=True)
+    a1_correct = r_correct == 1.0
+    a1_format_valid = r_format == 1.0
+
+    components = {
+        "a1_correctness": r_correct,
+        "a1_format": r_format,
+    }
+    weighted_components = {
+        "a1_correctness": r_correct * weights.w_a1_correctness,
+        "a1_format": r_format * weights.w_a1_format,
+    }
+    total_reward = sum(weighted_components.values())
+
+    return BaselineA1RewardBreakdown(
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+        a1_correct=a1_correct,
+        a1_format_valid=a1_format_valid,
+        a1_extracted=a1_extracted,
+    )
 
 
 def compute_response_reward_breakdown(
