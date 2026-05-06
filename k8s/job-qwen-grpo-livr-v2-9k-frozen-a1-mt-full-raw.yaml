@@ -201,7 +201,7 @@ spec:
 
         # Optimization
         - name: LEARNING_RATE
-          value: "1e-6"
+          value: "1e-5"
         - name: BATCH_SIZE
           value: "2"
         # GRAD_ACC is currently ignored by critic_grpo.py (it calls

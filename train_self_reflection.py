@@ -329,11 +329,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Path to checkpoint dir whose LoRA adapter weights should INITIALIZE this "
-        "run. Unlike --resume_from_checkpoint, this does NOT load optimizer state, does "
-        "NOT inherit global_step, and does NOT skip samples. Use this to start a fresh "
-        "training schedule on top of a previously trained adapter (e.g. start a new "
-        "epoch with the weights from another run as the starting point). Should not be "
-        "set together with --resume_from_checkpoint.",
+        "run. Loads adapter weights AND optimizer state (if optimizer.pt exists). "
+        "Unlike --resume_from_checkpoint, this does NOT inherit global_step and does "
+        "NOT skip samples. Use this to start a fresh training schedule on top of a "
+        "previously trained adapter (e.g. start a new epoch with the weights from "
+        "another run as the starting point). Should not be set together with "
+        "--resume_from_checkpoint.",
     )
 
     # Debug
@@ -719,14 +720,19 @@ def main() -> None:
             "precedence (it inherits global_step + optimizer state)."
         )
 
-    # Init from checkpoint: load LoRA adapter weights ONLY. Does NOT load
-    # optimizer state, does NOT inherit global_step, does NOT skip samples.
-    # The trainer starts a fresh full training schedule with these weights as
-    # the LoRA init. Use case: warm-start a new run from a previously trained
-    # adapter when --resume_from_checkpoint would inherit the source's step
-    # counter and silently truncate the schedule (we hit this with the
+    # Init from checkpoint: load LoRA adapter weights, AND optimizer state if
+    # present, but skip trainer_state.json (so global_step stays 0) and the
+    # LR scheduler position (so we run a full fresh schedule). Use case:
+    # warm-start a new run from a previously trained adapter when
+    # --resume_from_checkpoint would inherit the source's step counter and
+    # silently truncate the schedule (we hit this with the
     # baseline-a1 → frozen-a1-mt runs: resuming from baseline-a1's
     # checkpoint-1000 only ran 125 of the 1125 scheduled steps).
+    #
+    # Loading the optimizer state restores Adam's m/v moments so the first
+    # gradient step doesn't overshoot baseline-a1's already-trained weights.
+    # Without this (commit aed88ef), peak LR + cold Adam moments degraded
+    # the starting weights instead of fine-tuning them.
     if args.init_from_checkpoint and not args.resume_from_checkpoint:
         from pathlib import Path
 
@@ -746,9 +752,35 @@ def main() -> None:
         adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
         unwrapped = accelerator.unwrap_model(model)
         set_peft_model_state_dict(unwrapped, adapter_state)
+        logger.info(f"Loaded LoRA adapter from {adapter_path}")
+
+        # Optimizer state: load if present so Adam moments carry over. Without
+        # this, peak LR on cold Adam (m=v=0) destroys the starting weights.
+        # Falls back to fresh optimizer (with warning) on missing/corrupt file.
+        optimizer_status = "fresh"
+        optim_path = init_path / "optimizer.pt"
+        if optim_path.exists():
+            try:
+                optim_state = torch.load(str(optim_path), map_location=str(accelerator.device))
+                optimizer.load_state_dict(optim_state)
+                optimizer_status = "inherited"
+                logger.info(f"Loaded optimizer state from {optim_path}")
+            except Exception as e:  # noqa: BLE001 — broad to keep training resilient
+                logger.warning(
+                    f"Failed to load optimizer state from {optim_path} ({e!r}); "
+                    f"continuing with fresh optimizer state. "
+                    f"Peak LR + cold Adam may degrade starting weights."
+                )
+        else:
+            logger.warning(
+                f"--init_from_checkpoint: optimizer.pt not found at {optim_path}. "
+                f"Continuing with fresh optimizer state. "
+                f"Peak LR + cold Adam may degrade starting weights."
+            )
+
         logger.info(
             f"Initialized from checkpoint weights at {init_path} "
-            f"(global_step=0, fresh optimizer, fresh schedule)"
+            f"(global_step=0, optimizer={optimizer_status}, fresh schedule)"
         )
 
     # Resume from checkpoint: load LoRA adapter + optimizer state + skip samples

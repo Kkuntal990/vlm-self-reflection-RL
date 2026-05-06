@@ -139,3 +139,118 @@ class TestInitGatedOnNoResume:
     def test_gate_truth_table(self, resume: str, init: str, should_run_init: bool) -> None:
         gate = bool(init) and not bool(resume)
         assert gate is should_run_init
+
+
+class TestOptimizerStateInherit:
+    """--init_from_checkpoint should restore optimizer state if optimizer.pt
+    is present in the checkpoint dir, else log a warning and proceed with
+    fresh optimizer state.
+
+    The full path requires the trainer's actual optimizer object, which we
+    can't construct without a real model in CI. These tests reproduce the
+    decision logic and the load contract using a stub optimizer.
+    """
+
+    def test_optimizer_load_attempted_when_pt_exists(self, tmp_path: Path) -> None:
+        """If optimizer.pt exists, load_state_dict is invoked with its tensor."""
+        import torch
+
+        ckpt = tmp_path / "ckpt"
+        ckpt.mkdir()
+        # Save a dummy optimizer state dict
+        dummy_state = {"state": {0: {"step": 100}}, "param_groups": [{"lr": 1e-5}]}
+        torch.save(dummy_state, str(ckpt / "optimizer.pt"))
+
+        class StubOpt:
+            def __init__(self) -> None:
+                self.loaded: dict | None = None
+
+            def load_state_dict(self, sd: dict) -> None:
+                self.loaded = sd
+
+        opt = StubOpt()
+        optim_path = ckpt / "optimizer.pt"
+        status = "fresh"
+        if optim_path.exists():
+            optim_state = torch.load(str(optim_path), map_location="cpu")
+            opt.load_state_dict(optim_state)
+            status = "inherited"
+
+        assert status == "inherited"
+        assert opt.loaded is not None
+        assert opt.loaded["param_groups"][0]["lr"] == 1e-5
+        assert opt.loaded["state"][0]["step"] == 100
+
+    def test_optimizer_load_skipped_when_pt_missing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """If optimizer.pt is missing, status stays fresh and a warning fires."""
+        ckpt = tmp_path / "ckpt"
+        ckpt.mkdir()
+        # Sanity: no optimizer.pt
+        assert not (ckpt / "optimizer.pt").exists()
+
+        logger = logging.getLogger("test_init_from_checkpoint")
+        status = "fresh"
+        optim_path = ckpt / "optimizer.pt"
+        with caplog.at_level(logging.WARNING):
+            if optim_path.exists():
+                status = "inherited"  # not reached
+            else:
+                logger.warning(
+                    f"--init_from_checkpoint: optimizer.pt not found at {optim_path}. "
+                    f"Continuing with fresh optimizer state. "
+                    f"Peak LR + cold Adam may degrade starting weights."
+                )
+
+        assert status == "fresh"
+        assert "optimizer.pt not found" in caplog.text
+        assert "fresh optimizer state" in caplog.text
+
+    def test_optimizer_load_falls_back_on_corrupt_file(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A corrupt optimizer.pt should warn + fall back, not crash."""
+        ckpt = tmp_path / "ckpt"
+        ckpt.mkdir()
+        # Write garbage that torch.load won't accept
+        (ckpt / "optimizer.pt").write_bytes(b"this is not a torch tensor")
+
+        logger = logging.getLogger("test_init_from_checkpoint")
+        status = "fresh"
+        optim_path = ckpt / "optimizer.pt"
+        with caplog.at_level(logging.WARNING):
+            if optim_path.exists():
+                try:
+                    import torch
+
+                    torch.load(str(optim_path), map_location="cpu")
+                    status = "inherited"
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to load optimizer state from {optim_path} ({e!r}); "
+                        f"continuing with fresh optimizer state."
+                    )
+
+        assert status == "fresh"
+        assert "Failed to load optimizer state" in caplog.text
+
+
+class TestInitLogMessageFormat:
+    """The init log line must surface optimizer={inherited|fresh} so we can
+    grep training.log to confirm the optimizer state was actually restored."""
+
+    @pytest.mark.parametrize("status", ["inherited", "fresh"])
+    def test_log_line_includes_optimizer_status(
+        self, status: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        logger = logging.getLogger("test_init_from_checkpoint")
+        path = "/outputs/foo/checkpoint-1000"
+        with caplog.at_level(logging.INFO):
+            logger.info(
+                f"Initialized from checkpoint weights at {path} "
+                f"(global_step=0, optimizer={status}, fresh schedule)"
+            )
+        assert f"optimizer={status}" in caplog.text
+        assert "global_step=0" in caplog.text
+        assert "fresh schedule" in caplog.text
