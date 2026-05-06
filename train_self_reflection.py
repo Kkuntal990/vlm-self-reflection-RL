@@ -324,6 +324,17 @@ def parse_args() -> argparse.Namespace:
         help="Path to checkpoint dir to resume from (e.g. /outputs/.../checkpoint-500). "
         "Loads LoRA adapter weights + optimizer state, skips already-processed samples.",
     )
+    parser.add_argument(
+        "--init_from_checkpoint",
+        type=str,
+        default="",
+        help="Path to checkpoint dir whose LoRA adapter weights should INITIALIZE this "
+        "run. Unlike --resume_from_checkpoint, this does NOT load optimizer state, does "
+        "NOT inherit global_step, and does NOT skip samples. Use this to start a fresh "
+        "training schedule on top of a previously trained adapter (e.g. start a new "
+        "epoch with the weights from another run as the starting point). Should not be "
+        "set together with --resume_from_checkpoint.",
+    )
 
     # Debug
     parser.add_argument(
@@ -699,6 +710,46 @@ def main() -> None:
         # Sync all ranks before continuing — prevents DeepSpeed hangs when
         # main process is still loading weights asynchronously.
         accelerator.wait_for_everyone()
+
+    # Mutual-exclusion warn (don't hard-fail; let user decide).
+    if args.resume_from_checkpoint and args.init_from_checkpoint:
+        logger.warning(
+            "Both --resume_from_checkpoint and --init_from_checkpoint are set. "
+            "--init_from_checkpoint will be IGNORED; --resume_from_checkpoint takes "
+            "precedence (it inherits global_step + optimizer state)."
+        )
+
+    # Init from checkpoint: load LoRA adapter weights ONLY. Does NOT load
+    # optimizer state, does NOT inherit global_step, does NOT skip samples.
+    # The trainer starts a fresh full training schedule with these weights as
+    # the LoRA init. Use case: warm-start a new run from a previously trained
+    # adapter when --resume_from_checkpoint would inherit the source's step
+    # counter and silently truncate the schedule (we hit this with the
+    # baseline-a1 → frozen-a1-mt runs: resuming from baseline-a1's
+    # checkpoint-1000 only ran 125 of the 1125 scheduled steps).
+    if args.init_from_checkpoint and not args.resume_from_checkpoint:
+        from pathlib import Path
+
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        init_path = Path(args.init_from_checkpoint)
+        logger.info(f"Initializing from checkpoint weights at: {init_path}")
+
+        adapter_path = init_path / "adapter_model.safetensors"
+        if not adapter_path.exists():
+            raise FileNotFoundError(
+                f"--init_from_checkpoint requested from {init_path} but "
+                f"adapter_model.safetensors is missing. Aborting to avoid "
+                f"silently running on random LoRA init."
+            )
+        adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
+        unwrapped = accelerator.unwrap_model(model)
+        set_peft_model_state_dict(unwrapped, adapter_state)
+        logger.info(
+            f"Initialized from checkpoint weights at {init_path} "
+            f"(global_step=0, fresh optimizer, fresh schedule)"
+        )
 
     # Resume from checkpoint: load LoRA adapter + optimizer state + skip samples
     resume_step = 0
