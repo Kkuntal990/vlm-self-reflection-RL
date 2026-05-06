@@ -1,0 +1,392 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-grpo-livr-v2-9k-frozen-a1-mt-full-raw
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: grpo-trainer
+        model: qwen2-5-vl-7b
+        task: livr-perception-grpo-v10-fixes-v2
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: huggingface/trl:0.29.0
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "========================================="
+          echo "v10-fixes-v2: Qwen2.5-VL-7B + Pattern A + DAPO Dynamic Sampling + Dr.GRPO KL"
+          echo "Start weights: ${MODEL_ID} (base Instruct checkpoint)"
+          echo "Model: ${MODEL_ID}"
+          echo "Dataset: ${DATASET_PATH}"
+          echo "Output: ${OUTPUT_DIR}"
+          echo "GPUs: ${NUM_GPUS}"
+          echo "Dynamic Sampling: ${USE_DYNAMIC_SAMPLING:-1}  (DAPO §3.2)"
+          echo "Clip-Higher: ${CLIP_HIGH:-0.28}              (DAPO §3.1)"
+          echo "K samples:   ${K_SAMPLES:-16}"
+          echo "A1 KL coef:  ${A1_KL_COEFF:-700.0}           (Dr.GRPO sum/max_len norm)"
+          echo "SSR:         OFF (independent isolation of Dynamic Sampling)"
+          echo "========================================="
+
+          # GPU check
+          nvidia-smi
+          echo ""
+
+          # Install dependencies — PIN vllm to exact version. The v10-base
+          # and v10-fixes YAMLs used `vllm>=0.12.0` and worked when 0.12.0
+          # was the latest release. Now pip resolves to vllm==0.20.0 which
+          # drags in torch 2.11 + transformers 5.x and breaks the Qwen2.5-VL
+          # vision encoder forward (NVRTC kernel JIT fails on
+          # `image_grid_thw.prod(-1)`). Pin exact to keep the install stable.
+          # Leave torch/transformers at the trl:0.29.0 image's defaults.
+          pip install "vllm==0.12.0" wandb sentence-transformers 2>&1 | tail -5
+
+          # Clone and install project — track the grpo-v10 branch (no commit pin
+          # so infra fixes can land without a rebuild).
+          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          cd /workspace/vlm-self-reflection-RL
+          git checkout "${GIT_BRANCH:-grpo-v10}"
+          pip install -e . 2>&1 | tail -3
+
+          # Create output dir
+          mkdir -p "${OUTPUT_DIR}"
+
+          # Run training
+          accelerate launch \
+            --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
+            --num_processes=${NUM_GPUS:-4} \
+            train_self_reflection.py \
+            --model_id "${MODEL_ID}" \
+            --model_type qwen2vl \
+            --dataset_path "${DATASET_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            --image_base_dir "${IMAGE_BASE_DIR}" \
+            --use_vllm \
+            --use_think_answer_tags \
+            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.50} \
+            --max_samples ${MAX_SAMPLES:-0} \
+            --k_samples ${K_SAMPLES:-16} \
+            --max_completion_length ${MAX_COMPLETION_LENGTH:-386} \
+            --a1_max_completion_length ${A1_MAX_COMPLETION:-386} \
+            --f1_max_completion_length ${F1_MAX_COMPLETION:-386} \
+            --a2_max_completion_length ${A2_MAX_COMPLETION:-386} \
+            --temperature ${TEMPERATURE:-1.0} \
+            --feedback_temperature ${FEEDBACK_TEMPERATURE:-1.0} \
+            --a2_temperature ${A2_TEMPERATURE:-0.7} \
+            --learning_rate ${LEARNING_RATE:-1e-5} \
+            --per_device_train_batch_size ${BATCH_SIZE:-2} \
+            --gradient_accumulation_steps ${GRAD_ACC:-1} \
+            --num_train_epochs ${EPOCHS:-1} \
+            --num_inner_epochs ${INNER_EPOCHS:-1} \
+            --kl_coeff ${KL_COEFF:-0.02} \
+            --a1_kl_coeff ${A1_KL_COEFF:-700.0} \
+            --a2_kl_coeff ${A2_KL_COEFF:-1.0} \
+            --fb_kl_coeff ${FB_KL_COEFF:-1.0} \
+            ${SEPARATE_TURN_LOSS:+--separate_turn_loss} \
+            --clip_range ${CLIP_RANGE:-0.2} \
+            --clip_high ${CLIP_HIGH:-0.28} \
+            ${USE_DYNAMIC_SAMPLING:+--use_dynamic_sampling} \
+            --loss_type ${LOSS_TYPE:-dr_grpo} \
+            --lora_r ${LORA_R:-64} \
+            --lora_alpha ${LORA_ALPHA:-128} \
+            --freeze_vision_tower \
+            --max_pixels ${MAX_PIXELS:-401408} \
+            --min_pixels ${MIN_PIXELS:-200704} \
+            --w_a1_correctness ${W_A1_CORRECTNESS:-0.27} \
+            --w_a1_format ${W_A1_FORMAT:-0.03} \
+            --w_a2_correctness ${W_A2_CORRECTNESS:-0.27} \
+            --w_a2_format ${W_A2_FORMAT:-0.03} \
+            --w_no_regression ${W_NO_REGRESSION:-0.40} \
+            --w_downstream ${W_DOWNSTREAM:-0.45} \
+            --w_verification_accuracy ${W_VERIFICATION_ACCURACY:-0.45} \
+            --w_fb_format ${W_FB_FORMAT:-0.1} \
+            --reward_shaping_alpha ${REWARD_SHAPING_ALPHA:-1.0} \
+            --response_alpha ${RESPONSE_ALPHA:-1.0} \
+            --feedback_alpha ${FEEDBACK_ALPHA:-1.0} \
+            --freeze_a1_steps ${FREEZE_A1_STEPS:-280} \
+            --logging_steps ${LOGGING_STEPS:-10} \
+            --save_steps ${SAVE_STEPS:-250} \
+            --seed ${SEED:-42} \
+            --debug \
+            ${INIT_CHECKPOINT:+--init_from_checkpoint "$INIT_CHECKPOINT"} \
+            2>&1 | tee -a "${OUTPUT_DIR}/training.log"
+
+          echo "=== Training complete ==="
+
+        env:
+        # Model and data
+        - name: MODEL_ID
+          value: "Qwen/Qwen2.5-VL-7B-Instruct"
+        - name: DATASET_PATH
+          value: "/outputs/livr_v2_train_snapshots/snap_20260501_154345_final/data/livr_v2_9task_train.jsonl"
+        - name: OUTPUT_DIR
+          value: "/outputs/grpo_qwen_livr_v2_9k_frozen_a1_mt_full_raw"
+        - name: IMAGE_BASE_DIR
+          value: "/outputs/image_base"
+
+        # v10-fixes-v2 deltas vs v10-fixes:
+        #   + DAPO Dynamic Sampling (USE_DYNAMIC_SAMPLING=1) — drops zero-var
+        #     K-groups before policy update so every gradient step is
+        #     non-degenerate. Decoupled from SSR (still off) for clean
+        #     isolation of the dynamic-sampling effect.
+        #   + Dr.GRPO-consistent KL normalization (sum/max_len, was .mean()).
+        #   + A1_KL_COEFF 150 → 700 (post-normalization, makes KL gradient
+        #     ≈ 2× policy gradient per token after the freeze lifts; was
+        #     ≈ 0.4× under the old setup, which let A1 drift freely).
+        #   = Everything else identical to v10-fixes (K=16, CLIP_HIGH=0.28,
+        #     WW penalty −0.5 in code, SSR off, same data + reward weights).
+        - name: SEPARATE_TURN_LOSS
+          value: "1"
+        # Normal DeepSeek-R1 β = 0.001 (was 0.02 × 700 = 14.0 effective in v10's
+        # no-dapo run, which alone could explain v10's flat reward mean — the
+        # gradient was pinned to the reference model). Single-turn baseline
+        # showed clean reward climb at this β; using same value here.
+        - name: KL_COEFF
+          value: "0.001"
+        # Dr.GRPO-consistent KL: k3 estimator now aggregates as sum/max_len
+        # (was .mean(), which was length-biased and silently weakened the
+        # anchor by 280/386 ≈ 0.73× on full-length completions). With the
+        # corrected normalization, A1_KL_COEFF=700 gives effective per-token
+        # KL gradient ≈ 2× policy gradient post-freeze (vs ~0.4× at the old
+        # 150 setting), so the A1 distribution actually stays anchored.
+        - name: A1_KL_COEFF
+          value: "1.0"
+        - name: A2_KL_COEFF
+          value: "1.0"
+        - name: FB_KL_COEFF
+          value: "1.0"
+
+        # GRPO core — K=8 (paper baseline; no DAPO compute amplification).
+        - name: K_SAMPLES
+          value: "16"
+        - name: LOSS_TYPE
+          value: "dr_grpo"
+        - name: CLIP_RANGE
+          value: "0.2"
+        # DAPO disabled in this run:
+        #   - CLIP_HIGH=0.0 → upper clip falls back to (1+CLIP_RANGE), symmetric.
+        #   - USE_DYNAMIC_SAMPLING="" (empty) → ${USE_DYNAMIC_SAMPLING:+--use_dynamic_sampling}
+        #     evaluates to nothing, so the flag is NOT passed to train_self_reflection.py.
+        # Goal: clean baseline for comparison vs the DAPO+K=16 curriculum run.
+        - name: CLIP_HIGH
+          value: "0.0"
+        - name: USE_DYNAMIC_SAMPLING
+          value: ""
+        - name: INNER_EPOCHS
+          value: "1"
+        # SSR also OFF (default — env var omitted).
+
+        # Generation: 386 to fit per-option reasoning + closing tags
+        - name: MAX_SAMPLES
+          value: "0"
+        - name: MAX_COMPLETION_LENGTH
+          value: "386"
+        - name: A1_MAX_COMPLETION
+          value: "386"
+        - name: F1_MAX_COMPLETION
+          value: "386"
+        - name: A2_MAX_COMPLETION
+          value: "386"
+        - name: TEMPERATURE
+          value: "1.0"
+        - name: FEEDBACK_TEMPERATURE
+          value: "1.0"
+        - name: A2_TEMPERATURE
+          value: "0.7"
+
+        # Optimization
+        - name: LEARNING_RATE
+          value: "1e-5"
+        - name: BATCH_SIZE
+          value: "2"
+        # GRAD_ACC is currently ignored by critic_grpo.py (it calls
+        # optimizer.step() every train_step). Keeping at 1 to match
+        # the actual training behavior.
+        - name: GRAD_ACC
+          value: "1"
+        - name: EPOCHS
+          value: "1"
+        - name: NUM_GPUS
+          value: "4"
+
+        # LoRA
+        - name: LORA_R
+          value: "64"
+        - name: LORA_ALPHA
+          value: "128"
+
+        # vLLM
+        - name: VLLM_GPU_MEM
+          value: "0.45"
+        # Track the feature/two-stage-critic-first branch — that's where the
+        # use_dynamic_sampling code lives. grpo-v10 does NOT yet have it.
+        - name: GIT_BRANCH
+          value: "grpo-frozen-a1-mt-full"
+
+        # === User-message instruction text (Pattern A) ===
+        - name: THINK_ANSWER_INSTRUCTION
+          value: |
+            The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in <answer> </answer> tags.
+        - name: F1_VERIFIER_INSTRUCTION
+          value: |
+            Re-examine the image and determine whether the candidate answer is correct or incorrect. The reasoning process MUST BE enclosed within <think> </think> tags. The final verdict MUST BE put in \boxed{} as either CORRECT or INCORRECT.
+
+        # Qwen2.5-VL image resolution
+        - name: MAX_PIXELS
+          value: "401408"
+        - name: MIN_PIXELS
+          value: "200704"
+
+        # A1 frozen throughout: starting weights are baseline-a1 ckpt-1000
+        # (a strong A1 already trained via single-turn GRPO). Only F1 + A2
+        # log-prob updates flow into the loss. 1e6 >> total global_steps so
+        # A1 stays frozen for the full run.
+        - name: FREEZE_A1_STEPS
+          value: "1000000"
+
+        # v10: α=1 everywhere (SCoRe paper default).
+        - name: REWARD_SHAPING_ALPHA
+          value: "1.0"
+        - name: RESPONSE_ALPHA
+          value: "1.0"
+        - name: FEEDBACK_ALPHA
+          value: "1.0"
+        # Response weights: A1 components dropped to 0 (A1 frozen, no gradient
+        # signal needed from A1 reward). Mass redistributed to A2 + no-regression.
+        # Must sum to 1.0 (convex combination).
+        - name: W_A1_CORRECTNESS
+          value: "0.0"
+        - name: W_A1_FORMAT
+          value: "0.0"
+        - name: W_A2_CORRECTNESS
+          value: "0.45"
+        - name: W_A2_FORMAT
+          value: "0.05"
+        - name: W_NO_REGRESSION
+          value: "0.50"
+        # Feedback weights: must sum to 1.0.
+        - name: W_DOWNSTREAM
+          value: "0.45"
+        - name: W_VERIFICATION_ACCURACY
+          value: "0.45"
+        - name: W_FB_FORMAT
+          value: "0.1"
+
+        # Initialize LoRA weights from baseline-a1 ckpt-1000 (single-turn GRPO
+        # winner — 61.4% BLINK avg, +5.3pp over base). Uses --init_from_checkpoint
+        # (NOT --resume_from_checkpoint) so global_step=0 and the trainer runs a
+        # full 1125-step epoch. The earlier r01 run used --resume_from_checkpoint
+        # which inherited the source's global_step=1000 and only ran 125 of the
+        # 1125 scheduled steps (~11% of an epoch).
+        - name: INIT_CHECKPOINT
+          value: "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"
+
+        # Logging
+        - name: LOGGING_STEPS
+          value: "10"
+        - name: SAVE_STEPS
+          value: "250"
+        - name: SEED
+          value: "42"
+
+        # LLM Judge disabled for MCQ
+        - name: VLM_USE_LLM_JUDGE
+          value: "0"
+
+        # HuggingFace
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+
+        # Python and CUDA
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: ""
+        - name: NCCL_TIMEOUT
+          value: "1800"
+        - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+          value: "1800"
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        - name: DO_NOT_TRACK
+          value: "1"
+        - name: VLLM_ENABLE_V1_MULTIPROCESSING
+          value: "0"
+        - name: WANDB_PROJECT
+          value: "vlm-self-reflection-grpo"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-api-key
+              key: key
+        - name: WANDB_RUN_NAME
+          value: "grpo-livr-v2-9k-frozen-a1-mt-full-raw"
+
+        resources:
+          limits:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+          requests:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+
+        volumeMounts:
+        - name: cache
+          mountPath: /cache
+        - name: outputs
+          mountPath: /outputs
+        - name: dev-shm
+          mountPath: /dev/shm
+
+      tolerations:
+      - key: nautilus.io/reservation
+        operator: Exists
+        effect: NoSchedule
+      - key: nautilus.io/hardware
+        operator: Equal
+        value: large-gpu
+      - effect: PreferNoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      - key: nautilus.io/issue
+        operator: Exists
+        effect: NoSchedule
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+
+      volumes:
+      - name: cache
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: ms-swift-outputs-pvc
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
