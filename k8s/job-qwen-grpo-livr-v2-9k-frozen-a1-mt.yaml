@@ -222,7 +222,7 @@ spec:
 
         # vLLM
         - name: VLLM_GPU_MEM
-          value: "0.50"
+          value: "0.45"
         # Track the feature/two-stage-critic-first branch — that's where the
         # use_dynamic_sampling code lives. grpo-v10 does NOT yet have it.
         - name: GIT_BRANCH
