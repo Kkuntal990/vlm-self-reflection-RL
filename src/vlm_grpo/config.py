@@ -124,6 +124,14 @@ class RolloutConfig:
     # A1 alone with a single 2-component [0,1] reward. Used to isolate
     # algorithm bugs from multi-turn / two-reward composition issues.
     single_turn_a1: bool = False
+    # Multi-turn rescaled-reward mode: per-component [0, 1] normalization of
+    # the multi-turn response + feedback reward composition. Equalizes
+    # per-unit-weight gradient magnitude across components and produces
+    # strictly non-negative resp_reward / fb_reward / total_reward. See
+    # ``compute_response_reward_breakdown_01`` and
+    # ``compute_feedback_reward_breakdown_01`` in
+    # ``src/vlm_grpo/rewards/composition.py``.
+    use_rescaled_rewards: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

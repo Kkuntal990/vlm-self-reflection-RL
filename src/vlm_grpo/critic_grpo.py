@@ -602,11 +602,15 @@ class SelfReflectionGRPOTrainer:
                 epoch_steps += 1
 
                 rw_rate = step_result.rollout_metrics.get("sr/rw_rate", 0)
+                total_reward_mean = (
+                    step_result.response_reward_mean + step_result.feedback_reward_mean
+                )
                 pbar.set_postfix(
                     epoch=f"{epoch + 1}/{num_epochs}",
                     loss=f"{step_result.loss:.4f}",
                     resp_r=f"{step_result.response_reward_mean:.3f}",
                     fb_r=f"{step_result.feedback_reward_mean:.3f}",
+                    total_r=f"{total_reward_mean:.3f}",
                     rw_rate=f"{rw_rate:.3f}",
                 )
                 pbar.update(len(batch))
@@ -629,6 +633,7 @@ class SelfReflectionGRPOTrainer:
                         f"resp_reward={step_result.response_reward_mean:.3f}, "
                         f"a1_reward={a1_r_str}, a2_reward={a2_r_str}, "
                         f"fb_reward={step_result.feedback_reward_mean:.3f}, "
+                        f"total_reward={total_reward_mean:.3f}, "
                         f"rw_rate={rw_rate:.3f}"
                     )
 
@@ -644,6 +649,7 @@ class SelfReflectionGRPOTrainer:
                         # Rewards
                         "reward/resp_mean": step_result.response_reward_mean,
                         "reward/fb_mean": step_result.feedback_reward_mean,
+                        "reward/total_mean": total_reward_mean,
                         "reward/a1_mean": step_result.a1_reward_mean,
                         "reward/a2_mean": step_result.a2_reward_mean,
                         "reward/resp_std": step_result.rollout_metrics.get(
@@ -708,6 +714,7 @@ class SelfReflectionGRPOTrainer:
                         "ema/ww_rate": metrics.get("sr/ww_rate", 0),
                         "ema/resp_reward": step_result.response_reward_mean,
                         "ema/fb_reward": step_result.feedback_reward_mean,
+                        "ema/total_reward": total_reward_mean,
                         "ema/entropy": step_result.rollout_metrics.get("sr/entropy", 0),
                         "ema/resp_adv_abs": step_result.rollout_metrics.get(
                             "sr/resp_adv_abs_mean", 0
@@ -895,9 +902,11 @@ class SelfReflectionGRPOTrainer:
                     logger.info(f"  A1: {result.answer1s[j]}")
                     logger.info(f"  F1: {result.feedbacks[j]}")
                     logger.info(f"  A2: {result.answer2s[j]}")
+                    total_r = result.response_rewards[j] + result.feedback_rewards[j]
                     logger.info(
                         f"  resp_reward={result.response_rewards[j]:.3f} "
-                        f"fb_reward={result.feedback_rewards[j]:.3f}"
+                        f"fb_reward={result.feedback_rewards[j]:.3f} "
+                        f"total_reward={total_r:.3f}"
                     )
                     if result.response_breakdowns:
                         rb = result.response_breakdowns[j]
@@ -932,6 +941,7 @@ class SelfReflectionGRPOTrainer:
                         "a2_extracted": getattr(rb, "a2_extracted", None) if rb else None,
                         "resp_reward": result.response_rewards[j],
                         "fb_reward": result.feedback_rewards[j],
+                        "total_reward": result.response_rewards[j] + result.feedback_rewards[j],
                         "resp_components": rb.components if rb else {},
                         "fb_components": fb.components if fb else {},
                         "global_step": self.global_step,

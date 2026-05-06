@@ -251,6 +251,22 @@ def parse_args() -> argparse.Namespace:
         "wraps final answer in <answer> tags for structured extraction.",
     )
     parser.add_argument(
+        "--use_rescaled_rewards",
+        action="store_true",
+        help=(
+            "Use the per-component [0, 1]-rescaled multi-turn reward composition "
+            "(`compute_response_reward_breakdown_01` / "
+            "`compute_feedback_reward_breakdown_01`). Each reward component "
+            "(a2_correctness, no_regression, a2_format, downstream, verification, "
+            "fb_format) is normalized to [0, 1] from its raw range; with "
+            "weights summing to 1.0, resp_reward / fb_reward / total_reward "
+            "are all strictly non-negative. Equalizes per-unit-weight gradient "
+            "magnitude across components — matches the design that worked in "
+            "the single-turn baseline-a1 run. Ignored when --single_turn_a1 "
+            "is also set (baseline path has its own [0, 1] reward)."
+        ),
+    )
+    parser.add_argument(
         "--single_turn_a1",
         action="store_true",
         help=(
@@ -401,6 +417,7 @@ def main() -> None:
         response_alpha=args.response_alpha,
         feedback_alpha=args.feedback_alpha,
         single_turn_a1=args.single_turn_a1,
+        use_rescaled_rewards=args.use_rescaled_rewards,
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
@@ -828,7 +845,9 @@ def _run_sanity_check(
     """
     from vlm_grpo.rewards.composition import (
         compute_feedback_reward_breakdown,
+        compute_feedback_reward_breakdown_01,  # noqa: F401  (importable for tests/sanity)
         compute_response_reward_breakdown,
+        compute_response_reward_breakdown_01,  # noqa: F401
     )
 
     logger.info("=" * 70)

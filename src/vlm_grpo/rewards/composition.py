@@ -1144,3 +1144,513 @@ def compute_feedback_reward_breakdown(
         components=components,
         weighted_components=weighted_components,
     )
+
+
+# =============================================================================
+# Per-component [0, 1] rescaled rewards (used when
+# RolloutConfig.use_rescaled_rewards=True)
+# =============================================================================
+
+
+def _to_unit(x: float, lo: float, hi: float) -> float:
+    """Map ``x`` from ``[lo, hi]`` into ``[0, 1]`` via ``(x - lo) / (hi - lo)``.
+
+    Out-of-range inputs are clipped to ``[0, 1]``. Used by the rescaled
+    reward path to renormalize each multi-turn component to a unit range so
+    per-unit-weight gradient magnitude is equalized across components.
+
+    Args:
+        x: Raw value to rescale.
+        lo: Lower bound of the raw range (maps to 0).
+        hi: Upper bound of the raw range (maps to 1).
+
+    Returns:
+        Float in ``[0, 1]``.
+    """
+    if hi <= lo:
+        return 0.0
+    val = (x - lo) / (hi - lo)
+    if val < 0.0:
+        return 0.0
+    if val > 1.0:
+        return 1.0
+    return val
+
+
+# Raw component ranges as implemented in ``compute_response_reward_breakdown``
+# and ``compute_feedback_reward_breakdown``.
+#
+# These are inline values inside the existing breakdowns (NOT the values from
+# the standalone ``stability.compute_no_regression_reward`` /
+# ``feedback.compute_downstream_aware_reward`` functions, which differ).
+#
+# IMPORTANT: keep these in sync with the inline values if either function is
+# edited. See the per-component rationale in the docstrings below.
+_A1_CORR_RANGE = (-1.0, 1.0)
+_A2_CORR_RANGE = (-1.0, 1.0)
+# no_regression: deterministic det:{-2,+3}; open:{-3,+2}. Combined min/max
+# across both branches gives the safest unified rescale.
+_NO_REG_DET_RANGE = (-2.0, 3.0)
+_NO_REG_OPEN_RANGE = (-3.0, 2.0)
+# downstream (default, transition mode): deterministic det:{-1.5,+3};
+# open:{-2,+2}. After asymmetric gating (clamp to <=0 when verification
+# fails), the negative arm doesn't change, so the raw range bounds are still
+# the right normalizer.
+_DOWNSTREAM_DET_RANGE = (-1.5, 3.0)
+_DOWNSTREAM_OPEN_RANGE = (-2.0, 2.0)
+# verification: ±1
+_VERIFY_RANGE = (-1.0, 1.0)
+# format rewards (a1, a2, fb) are already binary {0, +1} in the active
+# multi-turn path (see ``_compute_tag_format_reward``,
+# ``_compute_answer_tag_only_format_reward``, ``compute_feedback_format_reward``)
+# so they need no rescaling. The bare-mode {-1, 0} branch is rescaled to
+# {0, 1} via ``_FORMAT_BARE_RANGE`` only when called.
+_FORMAT_BARE_RANGE = (-1.0, 0.0)
+
+
+def _format_to_01(raw: float) -> float:
+    """Rescale a format reward to [0, 1].
+
+    The active tag-mode and answer-tag-only paths already return {0, +1}, so
+    this is a no-op for them. The bare path returns {-1, 0}, which gets
+    rescaled to {0, 1}.
+
+    Args:
+        raw: Raw format reward.
+
+    Returns:
+        Format reward in ``[0, 1]``.
+    """
+    if raw < 0.0:
+        return _to_unit(raw, _FORMAT_BARE_RANGE[0], _FORMAT_BARE_RANGE[1])
+    # Already binary {0, +1} from tag-mode paths.
+    if raw > 1.0:
+        return 1.0
+    return raw
+
+
+def compute_a2_correctness_01(
+    a2_extracted: str,
+    ground_truth: str,
+    answer_type: str,
+    tolerance: float = 0.01,
+) -> float:
+    """[0, 1]-rescaled A2 correctness reward.
+
+    For deterministic types (MCQ / yesno / numeric): binary {0, 1}.
+    For counting / open: continuous [0, 1] via raw_score (already in [0, 1]
+    inside ``compute_a2_correctness_reward`` before the ``2*score - 1``
+    expansion — we recover it via ``(raw + 1) / 2`` to avoid duplicating the
+    cascade).
+
+    Args:
+        a2_extracted: Normalized extracted A2 answer (or raw text accepted by
+            ``compute_a2_correctness_reward``).
+        ground_truth: Ground truth answer.
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open",
+            "counting").
+        tolerance: Numeric tolerance for comparison.
+
+    Returns:
+        Float in ``[0, 1]``.
+    """
+    raw = compute_a2_correctness_reward(
+        a2_extracted=a2_extracted,
+        ground_truth=ground_truth,
+        answer_type=answer_type,
+        tolerance=tolerance,
+    )
+    return _to_unit(raw, _A2_CORR_RANGE[0], _A2_CORR_RANGE[1])
+
+
+def compute_no_regression_01(
+    a2_extracted: str,
+    ground_truth: str,
+    answer_type: str,
+    a1_is_correct: bool,
+    tolerance: float = 0.01,
+) -> float:
+    """[0, 1]-rescaled no-regression reward (matches the inline values in
+    ``compute_response_reward_breakdown``).
+
+    Inline raw values (NOT the stability.compute_no_regression_reward values):
+        Deterministic: RR=+1, RW=-2, WR=+3, WW=0  (range [-2, +3])
+        Open-ended:    RR=+1, RW=-3, WR=+2, WW=0  (range [-3, +2])
+
+    Args:
+        a2_extracted: Normalized extracted A2 answer.
+        ground_truth: Ground truth answer.
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open",
+            "counting").
+        a1_is_correct: Whether A1 was correct.
+        tolerance: Numeric tolerance for comparison.
+
+    Returns:
+        Float in ``[0, 1]``.
+    """
+    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+
+    a2_result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
+    a2_correct = a2_result.is_correct
+
+    if answer_type in DETERMINISTIC_TYPES:
+        if a1_is_correct:
+            raw = 1.0 if a2_correct else -2.0
+        else:
+            raw = 3.0 if a2_correct else 0.0
+        return _to_unit(raw, _NO_REG_DET_RANGE[0], _NO_REG_DET_RANGE[1])
+    if a1_is_correct:
+        raw = 1.0 if a2_correct else -3.0
+    else:
+        raw = 2.0 if a2_correct else 0.0
+    return _to_unit(raw, _NO_REG_OPEN_RANGE[0], _NO_REG_OPEN_RANGE[1])
+
+
+def compute_a2_format_01(
+    a2_text: str,
+    answer_type: str,
+    ground_truth: str = "",
+    use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
+) -> float:
+    """[0, 1]-rescaled A2 format reward.
+
+    Reuses ``_compute_refiner_format_reward`` which returns {0, +1} in tag
+    modes (already in [0, 1]) and {-1, 0} in bare mode (needs rescaling).
+
+    Args:
+        a2_text: Raw A2 text from the refiner.
+        answer_type: Expected answer type.
+        ground_truth: Ground truth (for LLM format fallback).
+        use_think_answer_tags: Whether to check for <think>+<answer> tags.
+        use_answer_tag_only: Whether to check for <answer> tag only.
+
+    Returns:
+        Float in ``[0, 1]``.
+    """
+    raw = _compute_refiner_format_reward(
+        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+    )
+    return _format_to_01(raw)
+
+
+def compute_downstream_01(
+    feedback_text: str,
+    a1_text: str,
+    a2_text: str,
+    ground_truth: str,
+    answer_type: str,
+    use_improvement_reward: bool = False,
+    reward_shaping_alpha: float = 0.0,
+    tolerance: float = 0.01,
+) -> float:
+    """[0, 1]-rescaled downstream-aware reward (transition mode only).
+
+    Mirrors the inline computation in ``compute_feedback_reward_breakdown``:
+        Deterministic: RR=+1, RW=-1.5, WR=+3, WW=-1  (range [-1.5, +3])
+        Open-ended:    RR=+1, RW=-2,   WR=+2, WW=-1  (range [-2, +2])
+
+    Empty F1 → 0.0 raw → rescaled to the lower-bound mid-value (treated as
+    "no contribution"). Then the same asymmetric gate (``min(raw, 0)`` when
+    verification fails) is applied BEFORE rescaling so the [0, 1] mapping
+    captures the gated value.
+
+    Improvement-mode and shaped-alpha modes are NOT supported by this
+    rescaler (their raw range varies with α). When either is set, falls
+    back to scaling the raw value with the open-ended bounds for safety
+    (the user's frozen-a1-mt-r01 run uses neither).
+
+    Args:
+        feedback_text: F1 text (used for the empty-check short-circuit).
+        a1_text: Initial answer text.
+        a2_text: Refined answer text.
+        ground_truth: Ground truth answer.
+        answer_type: Answer type.
+        use_improvement_reward: If True, returns ``(raw + 2) / 4`` to put
+            ``r_a2 - r_a1`` ∈ {-2, 0, +2} into [0, 1].
+        reward_shaping_alpha: SCoRe-style alpha. If > 0, scales raw with the
+            theoretical envelope ``[-1 - 2α, 1 + 2α]``.
+        tolerance: Numeric tolerance for comparison.
+
+    Returns:
+        Float in ``[0, 1]``.
+    """
+    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+
+    if not feedback_text.strip():
+        # Empty F1 raw=0; map to the mid of the deterministic range so the
+        # K-group baseline still varies meaningfully.
+        return _to_unit(0.0, _DOWNSTREAM_DET_RANGE[0], _DOWNSTREAM_DET_RANGE[1])
+
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, tolerance=tolerance)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type, tolerance=tolerance)
+    a1_correct = a1_result.is_correct
+    a2_correct = a2_result.is_correct
+
+    if reward_shaping_alpha > 0:
+        # r_a2 + α(r_a2 - r_a1), with r_* in {-1, +1}
+        # range: [-1 - 2α, 1 + 2α]
+        r_a1 = 1.0 if a1_correct else -1.0
+        r_a2 = 1.0 if a2_correct else -1.0
+        raw = r_a2 + reward_shaping_alpha * (r_a2 - r_a1)
+        lo = -1.0 - 2.0 * reward_shaping_alpha
+        hi = 1.0 + 2.0 * reward_shaping_alpha
+        return _to_unit(raw, lo, hi)
+
+    if use_improvement_reward:
+        r_a1 = 1.0 if a1_correct else -1.0
+        r_a2 = 1.0 if a2_correct else -1.0
+        raw = r_a2 - r_a1
+        return _to_unit(raw, -2.0, 2.0)
+
+    if answer_type in DETERMINISTIC_TYPES:
+        if a1_correct:
+            raw = 1.0 if a2_correct else -1.5
+        else:
+            raw = 3.0 if a2_correct else -1.0
+        return _to_unit(raw, _DOWNSTREAM_DET_RANGE[0], _DOWNSTREAM_DET_RANGE[1])
+    if a1_correct:
+        raw = 1.0 if a2_correct else -2.0
+    else:
+        raw = 2.0 if a2_correct else -1.0
+    return _to_unit(raw, _DOWNSTREAM_OPEN_RANGE[0], _DOWNSTREAM_OPEN_RANGE[1])
+
+
+def compute_verification_01(feedback_text: str, a1_is_correct: bool) -> float:
+    """[0, 1]-rescaled verification (calibration) reward.
+
+    Wraps ``compute_verification_accuracy_reward`` which returns ±1.
+
+    Args:
+        feedback_text: F1 text.
+        a1_is_correct: Whether A1 was actually correct.
+
+    Returns:
+        Float in ``[0, 1]``.
+    """
+    raw = compute_verification_accuracy_reward(feedback_text, a1_is_correct)
+    return _to_unit(raw, _VERIFY_RANGE[0], _VERIFY_RANGE[1])
+
+
+def compute_fb_format_01(feedback_text: str) -> float:
+    """[0, 1] feedback-format reward.
+
+    The active path (``compute_feedback_format_reward``) already returns
+    {0, +1} so this is effectively a pass-through, included for symmetry
+    with the rest of the ``_01`` family.
+
+    Args:
+        feedback_text: Raw F1 output.
+
+    Returns:
+        Float in ``[0, 1]``.
+    """
+    raw = compute_feedback_format_reward(feedback_text)
+    if raw < 0.0:
+        return 0.0
+    if raw > 1.0:
+        return 1.0
+    return raw
+
+
+def compute_response_reward_breakdown_01(
+    a1_text: str,
+    a2_text: str,
+    ground_truth: str,
+    answer_type: str,
+    choices: str,
+    weights: Any,
+    use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
+    reward_shaping_alpha: float = 0.0,
+) -> TrajectoryResponseRewardBreakdown:
+    """[0, 1]-rescaled response reward (parallel to
+    ``compute_response_reward_breakdown``).
+
+    Each component is in [0, 1]; with ResponseRewardWeights summing to 1.0,
+    ``total_reward`` lands in [0, 1] (not [0, sum_of_weights] strictly,
+    because the inline ``no_regression`` raw values don't all reach the
+    upper bound from a given a1_correct branch — see
+    ``_NO_REG_DET_RANGE``).
+
+    Args:
+        a1_text: Initial answer text.
+        a2_text: Refined answer text.
+        ground_truth: Ground truth answer.
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open",
+            "counting").
+        choices: MCQ choices string.
+        weights: ResponseRewardWeights instance.
+        use_think_answer_tags: Whether to check for tag format.
+        use_answer_tag_only: Whether to check for <answer>-only format.
+        reward_shaping_alpha: SCoRe-style shaped reward alpha (passed
+            through but currently does NOT replace the inline transition
+            values — the rescaled path uses the discrete RR/RW/WR/WW
+            values, matching the ``alpha=0`` branch of the raw breakdown).
+
+    Returns:
+        ``TrajectoryResponseRewardBreakdown`` with each ``components[k]`` in
+        [0, 1] and ``weighted_components[k] = weight_k × component_k``.
+    """
+    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+
+    tag_mode = use_think_answer_tags or use_answer_tag_only
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=tag_mode)
+    a1_correct = a1_result.is_correct
+    a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
+    a2_correct = a2_result.is_correct
+
+    r_a1_format = compute_a2_format_01(
+        a1_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+    )
+    r_a2_format = compute_a2_format_01(
+        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+    )
+    a2_format_valid = r_a2_format > 0.5
+
+    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=tag_mode)
+
+    # A1 / A2 correctness (rescaled to [0, 1])
+    r_a1 = 1.0 if a1_correct else 0.0
+    if answer_type in ("counting", "open") and a2_result.score is not None:
+        r_a2 = a2_result.score  # already in [0, 1]
+    else:
+        r_a2 = 1.0 if a2_correct else 0.0
+
+    # No-regression (rescaled). When alpha > 0, the inline raw path uses
+    # ``α * (r_a2_raw - r_a1_raw)`` with r_*_raw in {-1, +1}; we mirror
+    # that and rescale via the symmetric envelope.
+    if reward_shaping_alpha > 0:
+        r_a1_raw = 1.0 if a1_correct else -1.0
+        r_a2_raw = 1.0 if a2_correct else -1.0
+        raw_no_reg = reward_shaping_alpha * (r_a2_raw - r_a1_raw)
+        # range: [-2α, +2α]
+        r_no_reg = _to_unit(raw_no_reg, -2.0 * reward_shaping_alpha, 2.0 * reward_shaping_alpha)
+    elif answer_type in DETERMINISTIC_TYPES:
+        if a1_correct:
+            raw_no_reg = 1.0 if a2_correct else -2.0
+        else:
+            raw_no_reg = 3.0 if a2_correct else 0.0
+        r_no_reg = _to_unit(raw_no_reg, _NO_REG_DET_RANGE[0], _NO_REG_DET_RANGE[1])
+    else:
+        if a1_correct:
+            raw_no_reg = 1.0 if a2_correct else -3.0
+        else:
+            raw_no_reg = 2.0 if a2_correct else 0.0
+        r_no_reg = _to_unit(raw_no_reg, _NO_REG_OPEN_RANGE[0], _NO_REG_OPEN_RANGE[1])
+
+    components = {
+        "a1_correctness": r_a1,
+        "a1_format": r_a1_format,
+        "a2_correctness": r_a2,
+        "a2_format": r_a2_format,
+        "no_regression": r_no_reg,
+    }
+    weighted_components = {
+        "a1_correctness": r_a1 * weights.w_a1_correctness,
+        "a1_format": r_a1_format * weights.w_a1_format,
+        "a2_correctness": r_a2 * weights.w_a2_correctness,
+        "a2_format": r_a2_format * weights.w_a2_format,
+        "no_regression": r_no_reg * weights.w_no_regression,
+    }
+    total_reward = sum(weighted_components.values())
+
+    return TrajectoryResponseRewardBreakdown(
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+        a1_correct=a1_correct,
+        a2_correct=a2_correct,
+        a2_extracted=a2_extracted,
+        a2_format_valid=a2_format_valid,
+    )
+
+
+def compute_feedback_reward_breakdown_01(
+    feedback_text: str,
+    a1_text: str,
+    a2_text: str,
+    ground_truth: str,
+    answer_type: str,
+    choices: str,
+    weights: Any,
+    use_improvement_reward: bool = False,
+    reward_shaping_alpha: float = 0.0,
+) -> TrajectoryFeedbackRewardBreakdown:
+    """[0, 1]-rescaled feedback reward (parallel to
+    ``compute_feedback_reward_breakdown``).
+
+    Each component is in [0, 1]; with FeedbackRewardWeights summing to 1.0,
+    ``total_reward`` lands in [0, 1].
+
+    The asymmetric gate from the raw breakdown (clamp downstream to <=0
+    when verification fails) becomes a clamp to ``<= mid_zero`` after
+    rescaling — i.e., when verification fails, downstream is clamped to
+    ``min(value, _to_unit(0.0, lo, hi))``. This preserves the "F1 was
+    ineffectual" vs "F1 actively caused harm" discrimination.
+
+    Args:
+        feedback_text: F1 output text.
+        a1_text: Initial answer text.
+        a2_text: Refined answer text.
+        ground_truth: Ground truth answer.
+        answer_type: Answer type.
+        choices: MCQ choices string (unused, kept for API compat).
+        weights: FeedbackRewardWeights instance.
+        use_improvement_reward: If True, use R(A2)-R(A1)-style downstream.
+        reward_shaping_alpha: SCoRe-style shaped reward alpha.
+
+    Returns:
+        ``TrajectoryFeedbackRewardBreakdown`` with each ``components[k]`` in
+        [0, 1] and ``weighted_components[k] = weight_k × component_k``.
+    """
+    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    a1_correct = a1_result.is_correct
+
+    r_verification = compute_verification_01(feedback_text, a1_correct)
+    r_fb_format = compute_fb_format_01(feedback_text)
+
+    raw_downstream_01 = compute_downstream_01(
+        feedback_text=feedback_text,
+        a1_text=a1_text,
+        a2_text=a2_text,
+        ground_truth=ground_truth,
+        answer_type=answer_type,
+        use_improvement_reward=use_improvement_reward,
+        reward_shaping_alpha=reward_shaping_alpha,
+    )
+
+    # Asymmetric gate: when verification rescaled <= 0.5 (i.e. raw <= 0,
+    # meaning F1's verdict was wrong), clamp positive downstream to the
+    # rescaled "raw=0" midpoint to suppress sycophancy farming. Negative
+    # downstream (rescaled value below the midpoint) still flows through.
+    if answer_type in (
+        "mcq",
+        "yesno",
+        "numeric",
+    ):
+        downstream_zero = _to_unit(0.0, _DOWNSTREAM_DET_RANGE[0], _DOWNSTREAM_DET_RANGE[1])
+    else:
+        downstream_zero = _to_unit(0.0, _DOWNSTREAM_OPEN_RANGE[0], _DOWNSTREAM_OPEN_RANGE[1])
+    if r_verification <= 0.5:
+        r_downstream_gated = min(raw_downstream_01, downstream_zero)
+    else:
+        r_downstream_gated = raw_downstream_01
+
+    components = {
+        "downstream": r_downstream_gated,
+        "verification": r_verification,
+        "format": r_fb_format,
+    }
+    weighted_components = {
+        "downstream": r_downstream_gated * weights.w_downstream,
+        "verification": r_verification * weights.w_verification_accuracy,
+        "format": r_fb_format * weights.w_format,
+    }
+    total_reward = sum(weighted_components.values())
+
+    return TrajectoryFeedbackRewardBreakdown(
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+    )

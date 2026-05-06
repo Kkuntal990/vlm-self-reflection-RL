@@ -44,7 +44,9 @@ from vlm_grpo.rewards.composition import (
     TrajectoryResponseRewardBreakdown,
     compute_baseline_a1_reward_breakdown,
     compute_feedback_reward_breakdown,
+    compute_feedback_reward_breakdown_01,
     compute_response_reward_breakdown,
+    compute_response_reward_breakdown_01,
 )
 
 logging.basicConfig(
@@ -553,8 +555,19 @@ def generate_self_reflection_rollout(
             dataset_name=dataset_names[i],
         )
 
+        use_rescaled = getattr(config, "use_rescaled_rewards", False)
+        resp_fn = (
+            compute_response_reward_breakdown_01
+            if use_rescaled
+            else compute_response_reward_breakdown
+        )
+        fb_fn = (
+            compute_feedback_reward_breakdown_01
+            if use_rescaled
+            else compute_feedback_reward_breakdown
+        )
         for a1, f1, a2 in zip(answer1s, feedbacks, answer2s):
-            resp_bd = compute_response_reward_breakdown(
+            resp_bd = resp_fn(
                 a1_text=a1,
                 a2_text=a2,
                 ground_truth=ground_truths[i],
@@ -565,7 +578,7 @@ def generate_self_reflection_rollout(
                 use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
                 reward_shaping_alpha=_get_response_alpha(config),
             )
-            fb_bd = compute_feedback_reward_breakdown(
+            fb_bd = fb_fn(
                 feedback_text=f1,
                 a1_text=a1,
                 a2_text=a2,
