@@ -142,9 +142,7 @@ spec:
         #     ≈ 0.4× under the old setup, which let A1 drift freely).
         #   = Everything else identical to v10-fixes (K=16, CLIP_HIGH=0.28,
         #     WW penalty −0.5 in code, SSR off, same data + reward weights).
-        - name: SEPARATE_TURN_LOSS
-          value: "1"
-        # Normal DeepSeek-R1 β = 0.001 (was 0.02 × 700 = 14.0 effective in v10's
+# Normal DeepSeek-R1 β = 0.001 (was 0.02 × 700 = 14.0 effective in v10's
         # no-dapo run, which alone could explain v10's flat reward mean — the
         # gradient was pinned to the reference model). Single-turn baseline
         # showed clean reward climb at this β; using same value here.
