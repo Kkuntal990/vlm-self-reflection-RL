@@ -153,6 +153,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--use_gdpo_normalization",
+        action="store_true",
+        help=(
+            "Enable GDPO per-component K-group advantage normalization "
+            "(Liu 2026, arXiv:2601.05242). Each reward component is "
+            "K-group-normalized independently, then a weighted sum is taken, "
+            "then the result is batch-renormalized. Equalizes per-component "
+            "gradient contribution — low-variance components (e.g. saturated "
+            "format reward) no longer get drowned out by high-variance ones. "
+            "Existing per-component weights remain as multipliers on the "
+            "normalized advantages; uniform weights recover the paper's design."
+        ),
+    )
+    parser.add_argument(
         "--use_improvement_reward",
         action="store_true",
         help="Use R(A2)-R(A1) improvement reward for F1 (Critique-GRPO)",
@@ -459,6 +473,7 @@ def main() -> None:
         ssr_buffer_size=args.ssr_buffer_size,
         ssr_alpha=args.ssr_alpha,
         use_dynamic_sampling=args.use_dynamic_sampling,
+        use_gdpo_normalization=args.use_gdpo_normalization,
         use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
         freeze_a1_steps=args.freeze_a1_steps,

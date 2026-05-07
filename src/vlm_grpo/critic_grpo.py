@@ -564,6 +564,11 @@ class SelfReflectionGRPOTrainer:
         logger.info(f"  Inner optimization epochs per step: {config.num_inner_epochs}")
         logger.info(f"  Dataset size: {len(train_dataset)}")
         logger.info("  Two-reward design: response (A1+A2) + feedback (F1)")
+        if getattr(config, "use_gdpo_normalization", False):
+            logger.info(
+                "  GDPO normalization ENABLED (arXiv:2601.05242): per-component "
+                "K-group normalize -> weighted sum -> batch-renormalize"
+            )
 
         all_metrics = {}
         should_stop = False
@@ -1141,8 +1146,65 @@ class SelfReflectionGRPOTrainer:
         fb_rewards_t = torch.tensor(all_fb_rewards, device=self.device)
         loss_type = getattr(self.config, "loss_type", "grpo")
         separate_turns = getattr(self.config, "separate_turn_loss", False)
+        use_gdpo = getattr(self.config, "use_gdpo_normalization", False)
 
-        if separate_turns:
+        if use_gdpo:
+            # GDPO (Liu 2026, arXiv:2601.05242, Eqs. 4-7): per-component
+            # K-group normalize, weighted sum, then batch-renormalize.
+            # We assemble the per-component matrix from the breakdowns and
+            # call _compute_gdpo_advantages for each head.
+            resp_components_keys = [
+                "a1_correctness",
+                "a1_format",
+                "a2_correctness",
+                "a2_format",
+                "no_regression",
+            ]
+            fb_components_keys = ["downstream", "verification", "format"]
+            resp_components_rows: list[list[float]] = []
+            fb_components_rows: list[list[float]] = []
+            for result in rollout_results:
+                for rb in result.response_breakdowns:
+                    resp_components_rows.append(
+                        [float(rb.components.get(key, 0.0)) for key in resp_components_keys]
+                    )
+                for fb in result.feedback_breakdowns:
+                    fb_components_rows.append(
+                        [float(fb.components.get(key, 0.0)) for key in fb_components_keys]
+                    )
+            resp_components_t = torch.tensor(
+                resp_components_rows, dtype=resp_rewards_t.dtype, device=self.device
+            )
+            fb_components_t = torch.tensor(
+                fb_components_rows, dtype=fb_rewards_t.dtype, device=self.device
+            )
+            rw = self.config.response_weights
+            fw = self.config.feedback_weights
+            resp_weights_t = torch.tensor(
+                [
+                    rw.w_a1_correctness,
+                    rw.w_a1_format,
+                    rw.w_a2_correctness,
+                    rw.w_a2_format,
+                    rw.w_no_regression,
+                ],
+                dtype=resp_rewards_t.dtype,
+                device=self.device,
+            )
+            fb_weights_t = torch.tensor(
+                [fw.w_downstream, fw.w_verification_accuracy, fw.w_format],
+                dtype=fb_rewards_t.dtype,
+                device=self.device,
+            )
+            resp_advantages = self._compute_gdpo_advantages(resp_components_t, resp_weights_t, k)
+            fb_advantages = self._compute_gdpo_advantages(fb_components_t, fb_weights_t, k)
+            # GDPO doesn't currently support separate-turn A1/A2 advantages;
+            # leave them None so the trainer falls back to the joint resp path.
+            a1_advantages = None
+            a2_advantages = None
+            a1_rewards_t = None
+            a2_rewards_t = None
+        elif separate_turns:
             # SCoRe-style: separate advantages for A1 and A2.
             #   A1 reward = a1_correctness + a1_format       (turn-local signal)
             #   A2 reward = a2_correctness + a2_format       (turn-local signal)
@@ -1169,14 +1231,14 @@ class SelfReflectionGRPOTrainer:
             a2_advantages = self._compute_group_advantages(a2_rewards_t, k, loss_type=loss_type)
             # Joint resp_advantages still used for logging/metrics
             resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
+            fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
         else:
             a1_advantages = None
             a2_advantages = None
             a1_rewards_t = None
             a2_rewards_t = None
             resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
-
-        fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
+            fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
 
         # Compute frac_reward_zero_std for BOTH response and feedback rewards:
         # fraction of K-groups where all trajectories got identical rewards
@@ -2097,6 +2159,72 @@ class SelfReflectionGRPOTrainer:
                     advantages[start:] = (group - mean) / (std + 1e-8)
 
         return advantages
+
+    def _compute_gdpo_advantages(
+        self,
+        components: Any,  # tensor of shape [N*K, n_components]
+        weights: Any,  # tensor of shape [n_components]
+        k: int,
+    ) -> Any:
+        """Compute GDPO advantages: per-component K-group normalize, weighted
+        sum, then batch-renormalize (Liu et al. 2026, arXiv:2601.05242, Eqs. 4-7).
+
+        For each prompt's K-group of size k:
+          1. For each component j: A_j_i = (r_j_i - mean_k) / (std_k + eps)
+          2. A_sum_i = sum_j(w_j * A_j_i)
+          3. Batch-renormalize across all N*K samples:
+             Â_i = (A_sum_i - batch_mean) / (batch_std + eps)
+
+        Components with std=0 in the group contribute 0 to the advantage
+        (no information), implemented via std clamp.
+
+        Args:
+            components: Tensor of raw per-component rewards, shape [N*K, n_components]
+            weights: Per-component weight multipliers, shape [n_components]
+            k: K-group size
+
+        Returns:
+            Tensor of GDPO advantages, shape [N*K]
+        """
+        import torch
+
+        eps = 1e-8
+        n_total, n_components = components.shape
+        n_groups = n_total // k
+
+        # Step 1+2: per-component K-group normalize, then weighted sum.
+        # We compute per-group means/stds across the K dimension.
+        a_sum = torch.zeros(n_total, dtype=components.dtype, device=components.device)
+        for gi in range(n_groups):
+            start = gi * k
+            end = start + k
+            group = components[start:end]  # [k, n_components]
+            mean = group.mean(dim=0, keepdim=True)  # [1, n_components]
+            std = group.std(dim=0, keepdim=True)  # [1, n_components]
+            # std=0 components: divide by eps would blow up; instead
+            # zero out their normalized advantage cleanly.
+            std_safe = torch.where(std > eps, std, torch.full_like(std, float("inf")))
+            normalized = (group - mean) / (std_safe + eps)  # [k, n_components]
+            # Weighted sum across components
+            a_sum[start:end] = (normalized * weights.unsqueeze(0)).sum(dim=1)
+
+        # Handle remainder (tail not divisible by k) — same pattern
+        remaining = n_total - n_groups * k
+        if remaining > 0:
+            start = n_groups * k
+            group = components[start:]
+            mean = group.mean(dim=0, keepdim=True)
+            std = group.std(dim=0, keepdim=True)
+            std_safe = torch.where(std > eps, std, torch.full_like(std, float("inf")))
+            normalized = (group - mean) / (std_safe + eps)
+            a_sum[start:] = (normalized * weights.unsqueeze(0)).sum(dim=1)
+
+        # Step 3: batch-wide renormalization
+        batch_mean = a_sum.mean()
+        batch_std = a_sum.std()
+        if batch_std > eps:
+            return (a_sum - batch_mean) / (batch_std + eps)
+        return a_sum - batch_mean
 
     def _check_early_stopping(self, val_metrics: dict[str, float]) -> bool:
         """Check if training should stop based on validation metrics.

@@ -349,6 +349,13 @@ class SelfReflectionConfig:
     # SSR buffer; when SSR is off the policy update simply runs on the
     # smaller effective batch (every gradient step is still non-degenerate).
     use_dynamic_sampling: bool = False
+    # GDPO per-component K-group advantage normalization (Liu 2026,
+    # arXiv:2601.05242). When True, _compute_group_advantages normalizes
+    # each reward component within its K-group separately, then takes a
+    # weighted sum, then batch-renormalizes — equalizing per-component
+    # gradient contribution. When False, falls back to standard GRPO
+    # group-normalize-then-sum behavior (bit-for-bit unchanged).
+    use_gdpo_normalization: bool = False
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
     freeze_a1_steps: int = 0
