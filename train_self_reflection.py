@@ -122,6 +122,15 @@ def parse_args() -> argparse.Namespace:
         "--a2_temperature", type=float, default=0.3, help="A2 temperature (0=greedy)"
     )
     parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--lr_warmup_steps",
+        type=int,
+        default=0,
+        help=(
+            "Linearly ramp LR from 0 to learning_rate over the first N global_steps, "
+            "then hold constant. 0 = no warmup (constant LR from step 0, default)."
+        ),
+    )
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument(
         "--rollout_batch_size",
@@ -457,6 +466,7 @@ def main() -> None:
         feedback_weights=feedback_weights,
         baseline_weights=baseline_weights,
         learning_rate=args.learning_rate,
+        lr_warmup_steps=args.lr_warmup_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_train_epochs,

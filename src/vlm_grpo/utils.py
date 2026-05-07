@@ -82,6 +82,29 @@ def normalized_edit_distance(s1: str, s2: str) -> float:
     return prev[len2] / max_len
 
 
+def compute_warmup_lr(global_step: int, peak_lr: float, warmup_steps: int) -> float:
+    """Compute the effective LR for the current global_step under linear warmup.
+
+    Linearly ramps from 0 -> peak_lr over the first ``warmup_steps`` steps,
+    then holds constant at ``peak_lr`` for the rest of training. When
+    ``warmup_steps == 0`` the warmup is disabled and ``peak_lr`` is returned
+    at every step (bit-for-bit identical to no-warmup behavior).
+
+    Args:
+        global_step: Current global training step (0-indexed).
+        peak_lr: Target / configured learning rate.
+        warmup_steps: Number of steps over which to ramp from 0 -> peak_lr.
+
+    Returns:
+        Effective learning rate to apply at this step.
+    """
+    if warmup_steps <= 0:
+        return peak_lr
+    if global_step >= warmup_steps:
+        return peak_lr
+    return peak_lr * (global_step / warmup_steps)
+
+
 def hash_sample(question: str, image_path: str) -> str:
     """Create a deterministic hash for a sample.
 

@@ -41,6 +41,8 @@ from typing import Any, Optional
 
 from tqdm import tqdm
 
+from vlm_grpo.utils import compute_warmup_lr
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -1670,6 +1672,17 @@ class SelfReflectionGRPOTrainer:
             # but gradients are non-zero (REINFORCE gradient estimator).
             # Confirmed by TRL issue #3452: loss=0 with grad_norm>0 is expected.
             grad_norm = torch.nn.utils.clip_grad_norm_(inner_model.parameters(), 1.0).item()
+
+            # Linear LR warmup: 0 -> learning_rate over lr_warmup_steps. When
+            # lr_warmup_steps == 0 (default), compute_warmup_lr returns
+            # learning_rate at every step -> behavior bit-for-bit unchanged.
+            warmup_steps = getattr(self.config, "lr_warmup_steps", 0)
+            if warmup_steps > 0:
+                effective_lr = compute_warmup_lr(
+                    self.global_step, self.config.learning_rate, warmup_steps
+                )
+                for g in self.optimizer.param_groups:
+                    g["lr"] = effective_lr
 
             # Skip optimizer step if any gradient contains NaN/inf
             has_nan_grad = not math.isfinite(grad_norm)

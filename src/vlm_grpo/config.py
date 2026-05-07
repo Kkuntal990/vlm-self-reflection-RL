@@ -325,6 +325,10 @@ class SelfReflectionConfig:
     feedback_weights: FeedbackRewardWeights = field(default_factory=FeedbackRewardWeights)
     baseline_weights: BaselineA1RewardWeights = field(default_factory=BaselineA1RewardWeights)
     learning_rate: float = 1e-5
+    # Linear LR warmup: linearly ramps optimizer LR from 0 -> learning_rate
+    # over the first N global_steps, then holds constant. 0 = no warmup
+    # (constant LR from step 0, behavior unchanged).
+    lr_warmup_steps: int = 0
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 4
     num_train_epochs: int = 1
