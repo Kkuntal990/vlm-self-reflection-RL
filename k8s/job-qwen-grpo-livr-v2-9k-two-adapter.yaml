@@ -106,6 +106,7 @@ spec:
             --save_steps ${SAVE_STEPS:-250} \
             --seed ${SEED:-42} \
             --debug \
+            ${RESUME_CHECKPOINT:+--resume_from_checkpoint "$RESUME_CHECKPOINT"} \
             2>&1 | tee -a "${OUTPUT_DIR}/training.log"
 
           echo "=== Training complete ==="
@@ -120,7 +121,8 @@ spec:
           value: "/outputs/grpo_qwen_livr_v2_9k_two_adapter"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
-
+        - name: RESUME_CHECKPOINT
+          value: "/outputs/grpo_qwen_livr_v2_9k_two_adapter/checkpoint-500"
         # Two-adapter setup deltas vs vanilla-tokid:
         #   + --two_adapter_mode: PEFT model has TWO adapters
         #     - a1_expert (FROZEN, loaded from baseline-a1 ckpt-1000)
@@ -138,6 +140,8 @@ spec:
         #     (separate adapter), not a runtime gate on the joint LoRA.
         - name: FROZEN_A1_ADAPTER_PATH
           value: "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"
+
+        
 
         # KL: same as vanilla-tokid. β=0.001 is the DeepSeek-R1 default and
         # was the working setting for the single-turn baseline-a1 run.

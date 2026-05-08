@@ -892,17 +892,29 @@ def main() -> None:
         from peft import set_peft_model_state_dict
         from safetensors.torch import load_file
 
-        adapter_path = ckpt_path / "adapter_model.safetensors"
+        # In two-adapter mode the trainable adapter is saved under a named
+        # subdir (``<ckpt>/f1_a2_expert/adapter_model.safetensors``) by
+        # ``save_pretrained(selected_adapters=["f1_a2_expert"])``. Single-
+        # adapter checkpoints place ``adapter_model.safetensors`` at the
+        # top level. Resolve the right one and inject under the matching
+        # adapter name so ``set_peft_model_state_dict`` writes into the
+        # correct LoRA module.
+        if args.two_adapter_mode:
+            adapter_name = "f1_a2_expert"
+            adapter_path = ckpt_path / adapter_name / "adapter_model.safetensors"
+        else:
+            adapter_name = "default"
+            adapter_path = ckpt_path / "adapter_model.safetensors"
         if not adapter_path.exists():
             raise FileNotFoundError(
                 f"Resume requested from {ckpt_path} but "
-                f"adapter_model.safetensors is missing. Aborting to avoid "
+                f"{adapter_path.relative_to(ckpt_path)} is missing. Aborting to avoid "
                 f"silently running on random LoRA init."
             )
         adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
         unwrapped = accelerator.unwrap_model(model)
-        set_peft_model_state_dict(unwrapped, adapter_state)
-        logger.info(f"Loaded LoRA adapter from {adapter_path}")
+        set_peft_model_state_dict(unwrapped, adapter_state, adapter_name=adapter_name)
+        logger.info(f"Loaded LoRA adapter from {adapter_path} into '{adapter_name}'")
 
         # Load optimizer state if saved
         optim_path = ckpt_path / "optimizer.pt"
