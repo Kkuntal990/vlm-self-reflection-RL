@@ -360,6 +360,33 @@ def parse_args() -> argparse.Namespace:
         "--resume_from_checkpoint.",
     )
 
+    # Two-LoRA-adapter mode (architectural A1 freeze)
+    parser.add_argument(
+        "--two_adapter_mode",
+        action="store_true",
+        help=(
+            "Enable two-LoRA-adapter setup: A1 generation runs on a FROZEN "
+            "adapter (`a1_expert`, loaded from --frozen_a1_adapter_path) and "
+            "F1+A2 generation runs on a separate TRAINABLE adapter "
+            "(`f1_a2_expert`, warm-started by copying the frozen weights). "
+            "A1 policy loss and A1 KL are dropped entirely; only F1+A2 "
+            "log-probs receive gradients. Eliminates the shared-LoRA leakage "
+            "that drove single-shared-LoRA frozen-A1 runs to collapse "
+            "(entropy → 11, garbage tokens). Requires --frozen_a1_adapter_path."
+        ),
+    )
+    parser.add_argument(
+        "--frozen_a1_adapter_path",
+        type=str,
+        default="",
+        help=(
+            "Path to the frozen a1_expert LoRA checkpoint (e.g. "
+            "/outputs/.../baseline_a1/checkpoint-1000). Required when "
+            "--two_adapter_mode is set. Must contain "
+            "adapter_model.safetensors + adapter_config.json."
+        ),
+    )
+
     # Debug
     parser.add_argument(
         "--debug", action="store_true", help="Print generated trajectories and reward breakdowns"
@@ -484,6 +511,8 @@ def main() -> None:
         ssr_alpha=args.ssr_alpha,
         use_dynamic_sampling=args.use_dynamic_sampling,
         use_gdpo_normalization=args.use_gdpo_normalization,
+        two_adapter_mode=args.two_adapter_mode,
+        frozen_a1_adapter_path=args.frozen_a1_adapter_path,
         use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
         freeze_a1_steps=args.freeze_a1_steps,
@@ -668,7 +697,37 @@ def main() -> None:
             target_modules=target_modules,
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(model, lora_config)
+        if args.two_adapter_mode:
+            if not args.frozen_a1_adapter_path:
+                raise ValueError(
+                    "--two_adapter_mode requires --frozen_a1_adapter_path "
+                    "(path to a baseline-a1 LoRA checkpoint)."
+                )
+            from vlm_grpo.two_adapter import (
+                init_two_adapter_model,
+                save_frozen_a1_for_vllm,
+            )
+
+            model = init_two_adapter_model(
+                base_model=model,
+                lora_config=lora_config,
+                frozen_a1_adapter_path=args.frozen_a1_adapter_path,
+            )
+            # Stage the frozen a1_expert at a stable on-disk path so the
+            # rollout loop can hand it off to vLLM (LoRARequest) or merge
+            # it into the engine for the A1 turn.
+            staged_a1_path = save_frozen_a1_for_vllm(
+                peft_model=model,
+                output_dir=args.output_dir,
+            )
+            config.frozen_a1_adapter_path = staged_a1_path
+            logger.info(
+                f"Two-adapter mode ENABLED. Frozen a1_expert staged at: "
+                f"{staged_a1_path}. Trainable adapter: f1_a2_expert "
+                f"(warm-started from a1_expert weights)."
+            )
+        else:
+            model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
         logger.info(f"LoRA applied (r={args.lora_r}, alpha={args.lora_alpha})")
 
@@ -686,10 +745,23 @@ def main() -> None:
             )
             accelerator.wait_for_everyone()
 
-    # Create optimizer and prepare for distributed training
+    # Create optimizer and prepare for distributed training. In two-adapter
+    # mode the a1_expert adapter is frozen — passing ``model.parameters()``
+    # would still work (AdamW only updates params with a non-None grad), but
+    # explicitly filtering avoids storing Adam moments for the frozen LoRA
+    # tensors and surfaces the wrong-adapter-trained bug if anything ever
+    # leaks requires_grad=True onto a1_expert.
     from torch.optim import AdamW
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01, fused=True)
+    if args.two_adapter_mode:
+        optim_params = [p for p in model.parameters() if p.requires_grad]
+        logger.info(
+            f"Two-adapter optimizer: {sum(p.numel() for p in optim_params):,} trainable params "
+            f"(out of {sum(p.numel() for p in model.parameters()):,} total)"
+        )
+    else:
+        optim_params = list(model.parameters())
+    optimizer = AdamW(optim_params, lr=args.learning_rate, weight_decay=0.01, fused=True)
 
     # DeepSpeed requires train_micro_batch_size_per_gpu to be set.
     # Since we use a custom training loop (no DataLoader), set it explicitly.

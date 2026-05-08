@@ -30,7 +30,7 @@ Usage:
 import logging
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from vlm_grpo.config import RolloutConfig
 from vlm_grpo.prompts import (
@@ -374,6 +374,7 @@ def generate_self_reflection_rollout(
     model_type: str = "llava",
     vllm_engine: Any = None,
     baseline_weights: Any = None,
+    adapter_callback: Optional[Callable[[str], None]] = None,
 ) -> list[SelfReflectionRolloutResult]:
     """Generate K full self-reflection trajectories per sample.
 
@@ -397,6 +398,11 @@ def generate_self_reflection_rollout(
         device: Device for generation
         model_type: Model family ("llava" or "qwen2vl")
         vllm_engine: Optional VLLMRolloutEngine for faster generation
+        adapter_callback: Optional hook fired before each generation turn
+            (with one of "a1", "f1", "a2"). Used by two-adapter mode to
+            switch the active LoRA between ``a1_expert`` (frozen) and
+            ``f1_a2_expert`` (trainable) and re-sync vLLM weights to match.
+            No-op when None (default).
 
     Returns:
         List of SelfReflectionRolloutResult, one per sample
@@ -413,6 +419,7 @@ def generate_self_reflection_rollout(
             device=device,
             model_type=model_type,
             vllm_engine=vllm_engine,
+            adapter_callback=adapter_callback,
         )
 
     n = len(samples)
@@ -494,6 +501,8 @@ def generate_self_reflection_rollout(
                     model_type=model_type,
                 )
 
+            if adapter_callback is not None:
+                adapter_callback("a1")
             a1_outs = _gen(
                 a1_prompts,
                 imgs_expanded,
@@ -515,6 +524,8 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
+            if adapter_callback is not None:
+                adapter_callback("f1")
             f1_outs = _gen(
                 f1_prompts,
                 imgs_expanded,
@@ -538,6 +549,8 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
+            if adapter_callback is not None:
+                adapter_callback("a2")
             a2_outs = _gen(
                 a2_prompts,
                 imgs_expanded,
@@ -648,6 +661,7 @@ def generate_baseline_a1_rollout(
     device: str = "cuda",
     model_type: str = "llava",
     vllm_engine: Any = None,
+    adapter_callback: Optional[Callable[[str], None]] = None,
 ) -> list[SelfReflectionRolloutResult]:
     """Generate K A1-only trajectories per sample for the single-turn GRPO baseline.
 
@@ -724,6 +738,8 @@ def generate_baseline_a1_rollout(
             ]
             imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
 
+            if adapter_callback is not None:
+                adapter_callback("a1")
             if vllm_engine is not None:
                 texts = [
                     processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)

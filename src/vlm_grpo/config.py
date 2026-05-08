@@ -360,6 +360,24 @@ class SelfReflectionConfig:
     # gradient contribution. When False, falls back to standard GRPO
     # group-normalize-then-sum behavior (bit-for-bit unchanged).
     use_gdpo_normalization: bool = False
+    # Two-LoRA-adapter mode: A1 generation uses a FROZEN adapter
+    # (``a1_expert``, loaded from ``frozen_a1_adapter_path``) and F1+A2
+    # generation uses a separate TRAINABLE adapter (``f1_a2_expert``,
+    # warm-started from a copy of the frozen weights). Architectural
+    # separation guarantees A1 stays bit-identical to the source checkpoint
+    # — F1+A2 gradients cannot drift the A1 representation, which we
+    # observed collapses single-shared-LoRA frozen-A1 runs (entropy → 11,
+    # garbage tokens). When enabled, the trainer:
+    #   - skips A1 forward + A1 policy loss + A1 KL entirely
+    #   - routes generation per-turn via PEFT ``set_adapter`` (HF) or
+    #     vLLM ``LoRARequest`` (vLLM)
+    #   - saves the trainable f1_a2_expert to disk each step for vLLM sync
+    two_adapter_mode: bool = False
+    # Path to the FROZEN a1_expert LoRA checkpoint (e.g. baseline-a1's
+    # ``checkpoint-1000``). Required when ``two_adapter_mode=True``; ignored
+    # otherwise. Must contain ``adapter_model.safetensors`` and
+    # ``adapter_config.json``.
+    frozen_a1_adapter_path: str = ""
     use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
     freeze_a1_steps: int = 0
