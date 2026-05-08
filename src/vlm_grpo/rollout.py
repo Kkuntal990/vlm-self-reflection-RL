@@ -30,7 +30,7 @@ Usage:
 import logging
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from vlm_grpo.config import RolloutConfig
 from vlm_grpo.prompts import (
@@ -260,6 +260,14 @@ class SelfReflectionRolloutResult:
     feedback_rewards: list[float] = field(default_factory=list)
     response_breakdowns: list[TrajectoryResponseRewardBreakdown] = field(default_factory=list)
     feedback_breakdowns: list[TrajectoryFeedbackRewardBreakdown] = field(default_factory=list)
+    # Actual token ids emitted by the rollout engine for each turn. These let
+    # the trainer's pre-tokenize step reconstruct the EXACT sequence sampled
+    # during rollout — closing the vLLM <-> HF retokenize gap (audit Bug 2).
+    # None entries indicate the underlying engine did not provide token_ids
+    # (legacy / unsupported path); the trainer falls back to retokenize then.
+    answer1_token_ids: list[Optional[list[int]]] = field(default_factory=list)
+    feedback_token_ids: list[Optional[list[int]]] = field(default_factory=list)
+    answer2_token_ids: list[Optional[list[int]]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -276,7 +284,7 @@ def _generate_batch_completions(
     temperature: float,
     top_p: float,
     model_type: str = "llava",
-) -> list[str]:
+) -> list[dict]:
     """Generate one completion per message sequence, batched in one generate call.
 
     Supports different images per sequence, enabling full cross-sample batching
@@ -295,7 +303,9 @@ def _generate_batch_completions(
         model_type: Model family ("llava" or "qwen2vl")
 
     Returns:
-        List of N text completions, one per input sequence
+        List of N dicts, one per input sequence, with keys:
+            "text": completion text (decoded with skip_special_tokens=True)
+            "token_ids": list[int] of actual sampled completion token ids
     """
     n = len(messages_list)
     texts = [
@@ -343,8 +353,12 @@ def _generate_batch_completions(
     finally:
         processor.tokenizer.padding_side = orig_padding_side
 
+    completion_ids_list = [outputs[i][prompt_len:].tolist() for i in range(n)]
     return [
-        processor.decode(outputs[i][prompt_len:], skip_special_tokens=True).strip()
+        {
+            "text": processor.decode(outputs[i][prompt_len:], skip_special_tokens=True),
+            "token_ids": completion_ids_list[i],
+        }
         for i in range(n)
     ]
 
@@ -419,6 +433,9 @@ def generate_self_reflection_rollout(
     all_a1s: list[str] = []
     all_f1s: list[str] = []
     all_a2s: list[str] = []
+    all_a1_ids: list[Optional[list[int]]] = []
+    all_f1_ids: list[Optional[list[int]]] = []
+    all_a2_ids: list[Optional[list[int]]] = []
 
     with torch.no_grad():
         # Process in generation chunks to bound peak VRAM usage.
@@ -447,7 +464,12 @@ def generate_self_reflection_rollout(
             # Route generation through vLLM (if available) or HF generate.
             # vLLM provides 3-5x speedup via PagedAttention and continuous
             # batching. Reference: https://docs.vllm.ai/en/latest/features/sleep_mode/
-            def _gen(msgs: list, imgs: list, max_tok: int, temp: float) -> list[str]:
+            #
+            # Both engines now return a list of dicts {"text", "token_ids"}
+            # so the trainer's pre-tokenize step can reconstruct the EXACT
+            # sampled sequence and skip the lossy retokenize roundtrip
+            # (audit Bug 2).
+            def _gen(msgs: list, imgs: list, max_tok: int, temp: float) -> list[dict]:
                 if vllm_engine is not None:
                     texts = [
                         processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
@@ -472,13 +494,16 @@ def generate_self_reflection_rollout(
                     model_type=model_type,
                 )
 
-            chunk_a1s = _gen(
+            a1_outs = _gen(
                 a1_prompts,
                 imgs_expanded,
                 config.a1_max_completion_length,
                 config.temperature,
             )
+            chunk_a1s = [o["text"] for o in a1_outs]
+            chunk_a1_ids = [o.get("token_ids") for o in a1_outs]
             all_a1s.extend(chunk_a1s)
+            all_a1_ids.extend(chunk_a1_ids)
 
             # Step 2: Generate F1 for each trajectory.
             f1_prompts = [
@@ -490,13 +515,16 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
-            chunk_f1s = _gen(
+            f1_outs = _gen(
                 f1_prompts,
                 imgs_expanded,
                 config.f1_max_completion_length,
                 config.feedback_temperature,
             )
+            chunk_f1s = [o["text"] for o in f1_outs]
+            chunk_f1_ids = [o.get("token_ids") for o in f1_outs]
             all_f1s.extend(chunk_f1s)
+            all_f1_ids.extend(chunk_f1_ids)
 
             # Step 3: Generate A2 for each trajectory.
             a2_prompts = [
@@ -510,13 +538,16 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
-            chunk_a2s = _gen(
+            a2_outs = _gen(
                 a2_prompts,
                 imgs_expanded,
                 config.a2_max_completion_length,
                 config.a2_temperature,
             )
+            chunk_a2s = [o["text"] for o in a2_outs]
+            chunk_a2_ids = [o.get("token_ids") for o in a2_outs]
             all_a2s.extend(chunk_a2s)
+            all_a2_ids.extend(chunk_a2_ids)
 
             logger.info(
                 f"Self-reflection rollout: {chunk_end}/{n} samples (gen_batch={chunk_size}, k={k})"
@@ -544,6 +575,9 @@ def generate_self_reflection_rollout(
         answer1s = all_a1s[traj_slice]
         feedbacks = all_f1s[traj_slice]
         answer2s = all_a2s[traj_slice]
+        answer1_ids = all_a1_ids[traj_slice]
+        feedback_ids = all_f1_ids[traj_slice]
+        answer2_ids = all_a2_ids[traj_slice]
 
         result = SelfReflectionRolloutResult(
             sample_index=sample_indices[i],
@@ -597,6 +631,9 @@ def generate_self_reflection_rollout(
         result.answer1s = list(answer1s)
         result.feedbacks = list(feedbacks)
         result.answer2s = list(answer2s)
+        result.answer1_token_ids = list(answer1_ids)
+        result.feedback_token_ids = list(feedback_ids)
+        result.answer2_token_ids = list(answer2_ids)
         results.append(result)
 
     return results
@@ -666,6 +703,7 @@ def generate_baseline_a1_rollout(
     sample_indices = [s.get("sample_index", i) for i, s in enumerate(samples)]
 
     all_a1s: list[str] = []
+    all_a1_ids: list[Optional[list[int]]] = []
 
     with torch.no_grad():
         for chunk_start in range(0, n, gen_batch):
@@ -691,7 +729,7 @@ def generate_baseline_a1_rollout(
                     processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
                     for m in a1_prompts
                 ]
-                chunk_a1s = vllm_engine.generate_batch(
+                a1_outs = vllm_engine.generate_batch(
                     prompts=texts,
                     images=imgs_expanded,
                     max_new_tokens=config.a1_max_completion_length,
@@ -699,7 +737,7 @@ def generate_baseline_a1_rollout(
                     top_p=config.top_p,
                 )
             else:
-                chunk_a1s = _generate_batch_completions(
+                a1_outs = _generate_batch_completions(
                     model,
                     processor,
                     a1_prompts,
@@ -710,7 +748,10 @@ def generate_baseline_a1_rollout(
                     top_p=config.top_p,
                     model_type=model_type,
                 )
+            chunk_a1s = [o["text"] for o in a1_outs]
+            chunk_a1_ids = [o.get("token_ids") for o in a1_outs]
             all_a1s.extend(chunk_a1s)
+            all_a1_ids.extend(chunk_a1_ids)
 
             logger.info(
                 f"Baseline A1 rollout: {chunk_end}/{n} samples (chunk={len(chunk_qs)}, k={k})"
@@ -729,6 +770,7 @@ def generate_baseline_a1_rollout(
     for i in range(n):
         traj_slice = slice(i * k, (i + 1) * k)
         answer1s = all_a1s[traj_slice]
+        answer1_ids = all_a1_ids[traj_slice]
 
         result = SelfReflectionRolloutResult(
             sample_index=sample_indices[i],
@@ -759,6 +801,9 @@ def generate_baseline_a1_rollout(
         result.answer1s = list(answer1s)
         result.feedbacks = [""] * len(answer1s)
         result.answer2s = [""] * len(answer1s)
+        result.answer1_token_ids = list(answer1_ids)
+        result.feedback_token_ids = [None] * len(answer1s)
+        result.answer2_token_ids = [None] * len(answer1s)
         results.append(result)
 
     return results

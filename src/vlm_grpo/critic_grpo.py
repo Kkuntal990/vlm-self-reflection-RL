@@ -964,7 +964,19 @@ class SelfReflectionGRPOTrainer:
 
             use_tags = self.config.rollout.use_think_answer_tags
             single_turn_a1 = bool(getattr(self.config.rollout, "single_turn_a1", False))
-            for a1, f1, a2 in zip(result.answer1s, result.feedbacks, result.answer2s):
+            # rollout result token-id lists may be empty when rolling back to legacy
+            # rollout paths; default to None per turn so pre-tokenize falls back.
+            a1_id_list = result.answer1_token_ids or [None] * len(result.answer1s)
+            f1_id_list = result.feedback_token_ids or [None] * len(result.answer1s)
+            a2_id_list = result.answer2_token_ids or [None] * len(result.answer1s)
+            for a1, f1, a2, a1_ids, f1_ids, a2_ids in zip(
+                result.answer1s,
+                result.feedbacks,
+                result.answer2s,
+                a1_id_list,
+                f1_id_list,
+                a2_id_list,
+            ):
                 a1_prompt = build_initial_answer_prompt(
                     result.question, use_think_answer_tags=use_tags
                 )
@@ -975,7 +987,15 @@ class SelfReflectionGRPOTrainer:
                     # per-turn forward / KL / loss will short-circuit the F1 and
                     # A2 paths when it sees ``f1_full is None`` / ``a2_full is None``.
                     trajectory_data.append(
-                        {"a1_full": a1_full, "f1_full": None, "a2_full": None, "image": image}
+                        {
+                            "a1_full": a1_full,
+                            "f1_full": None,
+                            "a2_full": None,
+                            "image": image,
+                            "a1_completion_ids": a1_ids,
+                            "f1_completion_ids": None,
+                            "a2_completion_ids": None,
+                        }
                     )
                 else:
                     f1_prompt = build_critic_prompt(
@@ -991,7 +1011,15 @@ class SelfReflectionGRPOTrainer:
                     a2_full = build_prompt_with_completion(a2_prompt, a2)
 
                     trajectory_data.append(
-                        {"a1_full": a1_full, "f1_full": f1_full, "a2_full": a2_full, "image": image}
+                        {
+                            "a1_full": a1_full,
+                            "f1_full": f1_full,
+                            "a2_full": a2_full,
+                            "image": image,
+                            "a1_completion_ids": a1_ids,
+                            "f1_completion_ids": f1_ids,
+                            "a2_completion_ids": a2_ids,
+                        }
                     )
 
             group_slices.append((slice_start, len(all_resp_rewards)))
@@ -1083,7 +1111,17 @@ class SelfReflectionGRPOTrainer:
 
                     image = load_image_safe(entry.sample["image_path"])
 
-                    for a1, f1, a2 in zip(rr.answer1s, rr.feedbacks, rr.answer2s):
+                    rep_a1_ids = rr.answer1_token_ids or [None] * len(rr.answer1s)
+                    rep_f1_ids = rr.feedback_token_ids or [None] * len(rr.answer1s)
+                    rep_a2_ids = rr.answer2_token_ids or [None] * len(rr.answer1s)
+                    for a1, f1, a2, a1_ids, f1_ids, a2_ids in zip(
+                        rr.answer1s,
+                        rr.feedbacks,
+                        rr.answer2s,
+                        rep_a1_ids,
+                        rep_f1_ids,
+                        rep_a2_ids,
+                    ):
                         a1_prompt = build_initial_answer_prompt(
                             rr.question, use_think_answer_tags=use_tags
                         )
@@ -1095,6 +1133,9 @@ class SelfReflectionGRPOTrainer:
                                     "f1_full": None,
                                     "a2_full": None,
                                     "image": image,
+                                    "a1_completion_ids": a1_ids,
+                                    "f1_completion_ids": None,
+                                    "a2_completion_ids": None,
                                 }
                             )
                             continue
@@ -1117,6 +1158,9 @@ class SelfReflectionGRPOTrainer:
                                 "f1_full": f1_full,
                                 "a2_full": a2_full,
                                 "image": image,
+                                "a1_completion_ids": a1_ids,
+                                "f1_completion_ids": f1_ids,
+                                "a2_completion_ids": a2_ids,
                             }
                         )
 
@@ -1274,17 +1318,25 @@ class SelfReflectionGRPOTrainer:
 
         imgs = [t["image"] for t in trajectory_data]
         single_turn_a1 = bool(getattr(self.config.rollout, "single_turn_a1", False))
-        a1_pretok = self._preprocess_trajectory_texts([t["a1_full"] for t in trajectory_data], imgs)
+        a1_pretok = self._preprocess_trajectory_texts(
+            [t["a1_full"] for t in trajectory_data],
+            imgs,
+            completion_token_ids=[t.get("a1_completion_ids") for t in trajectory_data],
+        )
         if single_turn_a1:
             # Skip F1/A2 pretokenization entirely in baseline mode.
             a2_pretok = None
             f1_pretok = None
         else:
             a2_pretok = self._preprocess_trajectory_texts(
-                [t["a2_full"] for t in trajectory_data], imgs
+                [t["a2_full"] for t in trajectory_data],
+                imgs,
+                completion_token_ids=[t.get("a2_completion_ids") for t in trajectory_data],
             )
             f1_pretok = self._preprocess_trajectory_texts(
-                [t["f1_full"] for t in trajectory_data], imgs
+                [t["f1_full"] for t in trajectory_data],
+                imgs,
+                completion_token_ids=[t.get("f1_completion_ids") for t in trajectory_data],
             )
 
         # Completion token lengths from pre-tokenized data (token count, not word count).
@@ -1965,6 +2017,7 @@ class SelfReflectionGRPOTrainer:
         self,
         messages_list: list[list[dict]],
         images: list[Any],
+        completion_token_ids: Optional[list[Optional[list[int]]]] = None,
     ) -> dict:
         """Pre-compute chat-template strings and token lengths for a trajectory batch.
 
@@ -1975,6 +2028,12 @@ class SelfReflectionGRPOTrainer:
         Args:
             messages_list: N full message lists (prompt + assistant completion)
             images: N PIL Images (one per sequence, may be None)
+            completion_token_ids: Optional N-list of actual completion token ids
+                emitted by the rollout engine. When provided, used to
+                cross-check the retokenize boundary and to surface retokenize
+                divergences (audit Bug 2 — vLLM <-> HF tokenization mismatch).
+                Stored on the returned pretok dict so a future forward pass
+                can bypass retokenize entirely.
 
         Returns:
             dict with keys:
@@ -1982,6 +2041,7 @@ class SelfReflectionGRPOTrainer:
                 prompt_lens: list[int] of N prompt token counts
                 full_lens: list[int] of N full sequence token counts
                 images: the same images list (stored for convenience)
+                completion_token_ids: same list as the argument (or None)
         """
         has_image = any(img is not None for img in images)
         full_texts: list[str] = []
@@ -2007,11 +2067,39 @@ class SelfReflectionGRPOTrainer:
         prompt_lens = [len(ids) for ids in prompt_enc["input_ids"]]
         full_enc = self.processor.tokenizer(full_texts, padding=False, return_attention_mask=False)
         full_lens = [len(ids) for ids in full_enc["input_ids"]]
+
+        # Bug 2 diagnostic: when the rollout engine provided actual completion
+        # token ids, compare against the retokenized completion span. A
+        # mismatch means apply_chat_template + tokenize is producing a
+        # different label sequence than what vLLM actually sampled — the
+        # GRPO ratio is then computed against the wrong sequence, silently
+        # corrupting old/ref/new log-prob alignment. Sampling here keeps the
+        # log volume bounded.
+        if completion_token_ids is not None and any(c is not None for c in completion_token_ids):
+            mismatches = 0
+            sampled_examples: list[tuple[int, int, int]] = []
+            for i, comp_ids in enumerate(completion_token_ids):
+                if comp_ids is None:
+                    continue
+                retok_len = full_lens[i] - prompt_lens[i]
+                vllm_len = len(comp_ids)
+                if retok_len != vllm_len:
+                    mismatches += 1
+                    if len(sampled_examples) < 3:
+                        sampled_examples.append((i, retok_len, vllm_len))
+            if mismatches > 0:
+                logger.warning(
+                    "[Bug 2] retokenize/vllm token-id length mismatch on "
+                    f"{mismatches}/{len(completion_token_ids)} trajectories "
+                    f"(examples idx,retok,vllm: {sampled_examples})"
+                )
+
         return {
             "full_texts": full_texts,
             "prompt_lens": prompt_lens,
             "full_lens": full_lens,
             "images": images,
+            "completion_token_ids": completion_token_ids,
         }
 
     def _forward_from_pretokenized_multi(

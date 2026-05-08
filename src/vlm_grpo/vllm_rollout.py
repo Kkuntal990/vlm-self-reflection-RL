@@ -205,8 +205,14 @@ class VLLMRolloutEngine:
         max_new_tokens: int,
         temperature: float,
         top_p: float = 0.9,
-    ) -> list[str]:
+    ) -> list[dict]:
         """Generate completions for a batch of prompts with images.
+
+        Returns both raw text and the actual emitted token_ids per output.
+        Token ids are required by the trainer's pre-tokenize step so the
+        GRPO ratio is computed against the EXACT sequence vLLM sampled —
+        not a re-tokenized approximation, which the audit identified as a
+        silent log-prob corruption source (Bug 2).
 
         Args:
             prompts: List of formatted prompt strings
@@ -216,7 +222,9 @@ class VLLMRolloutEngine:
             top_p: Top-p sampling parameter
 
         Returns:
-            List of completion text strings
+            List of dicts, one per prompt, with keys:
+                "text": completion text as emitted by vLLM (no .strip())
+                "token_ids": list[int] of actual sampled completion token ids
         """
         from vllm import SamplingParams
 
@@ -235,4 +243,10 @@ class VLLMRolloutEngine:
             vllm_inputs.append(inp)
 
         outputs = self.llm.generate(vllm_inputs, sampling_params)
-        return [out.outputs[0].text.strip() for out in outputs]
+        return [
+            {
+                "text": out.outputs[0].text,
+                "token_ids": list(out.outputs[0].token_ids),
+            }
+            for out in outputs
+        ]

@@ -228,11 +228,15 @@ class _StubVLLM:
         max_new_tokens: int,
         temperature: float,
         top_p: float = 0.9,
-    ) -> list[str]:
+    ) -> list[dict]:
         self.calls += 1
-        out = self._queue[: len(prompts)]
+        texts = self._queue[: len(prompts)]
         self._queue = self._queue[len(prompts) :]
-        return out
+        # Match the new VLLMRolloutEngine.generate_batch contract: return
+        # dicts carrying both text and a token_ids placeholder. The stub
+        # has no real tokenizer, so use a deterministic per-character id
+        # sequence — sufficient for downstream length / type assertions.
+        return [{"text": t, "token_ids": list(range(len(t)))} for t in texts]
 
 
 class TestBaselineA1Rollout:
