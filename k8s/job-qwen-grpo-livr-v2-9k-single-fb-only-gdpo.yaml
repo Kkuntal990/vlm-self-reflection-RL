@@ -24,7 +24,7 @@ spec:
           echo ""
           echo "Setup vs the two-adapter line:"
           echo "  - SINGLE LoRA adapter (no two_adapter_mode)."
-          echo "  - Base model = ${MODEL_ID} (no INIT_CHECKPOINT, fresh LoRA)."
+          echo "  - Base model = ${MODEL_ID}, LoRA INIT_CHECKPOINT = ${INIT_CHECKPOINT:-<base>}."
           echo "  - HIGH A1 KL anchor (KL_COEFF * A1_KL_COEFF = ${KL_COEFF:-0.001} *"
           echo "    ${A1_KL_COEFF:-700} = ~1.8e-3 per token after sum/max_len norm)."
           echo "    A1 receives NO policy gradient (W_A1_*=0); only KL pulls A1."
@@ -131,6 +131,7 @@ spec:
             --save_steps ${SAVE_STEPS:-250} \
             --seed ${SEED:-42} \
             --debug \
+            ${INIT_CHECKPOINT:+--init_from_checkpoint "$INIT_CHECKPOINT"} \
             2>&1 | tee -a "${OUTPUT_DIR}/training.log"
 
           echo "=== Training complete ==="
@@ -145,6 +146,13 @@ spec:
           value: "/outputs/grpo_qwen_livr_v2_9k_single_fb_only_gdpo"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
+        # Resume from the pre-crash checkpoint-250 of this same run.
+        # Original GDPO run was at Step ~360 before we proactively killed
+        # it (same vLLM image-pad bug exposure). The fix at commit
+        # bd4d63b filters those tokens. checkpoint-250 contains 250
+        # steps of clean training including the optimizer state.
+        - name: INIT_CHECKPOINT
+          value: "/outputs/grpo_qwen_livr_v2_9k_single_fb_only_gdpo/checkpoint-250"
 
         # KL anchor
         # ---------
