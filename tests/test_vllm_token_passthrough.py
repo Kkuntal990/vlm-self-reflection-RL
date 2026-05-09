@@ -218,6 +218,9 @@ class _FakeTokenizerCallable:
     """Toy tokenizer: tokens-per-character; produces input_ids per text."""
 
     padding_side = "right"
+    pad_token_id = 0
+    eos_token_id = 0
+    unk_token_id = 999
 
     def __call__(
         self,
@@ -233,6 +236,10 @@ class _FakeTokenizerCallable:
         if return_attention_mask:
             out["attention_mask"] = [[1] * len(x) for x in ids]
         return out
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        # No vision-special tokens in this fake tokenizer; return UNK.
+        return self.unk_token_id
 
 
 class _FakeProcessor:
@@ -409,6 +416,207 @@ class TestPretokNativePath:
 
 
 # ---------------------------------------------------------------------------
+# 6. Native path filters vision special tokens vLLM may have sampled.
+# ---------------------------------------------------------------------------
+#
+# Production ``single-fb-only`` crashed after ~12h with
+#     ValueError: Image features and image tokens do not match: tokens: 3193, features 3192
+# inside Qwen2.5-VL's ``get_placeholder_mask``. Root cause: vLLM occasionally
+# samples ``<|image_pad|>`` (151655) mid-completion. The native path
+# concatenated those into ``prompt_ids ++ completion_ids`` directly, giving
+# the assembled input_ids more image-pad tokens than the prompt's
+# ``image_grid_thw`` features could fill.
+#
+# The fix in ``_preprocess_trajectory_texts`` filters the vision-special
+# token set from completion_token_ids and the paired completion_logprobs
+# when native_path is active.
+
+
+class _StubProcessorWithVisionTokens:
+    """Stub processor that resolves the same vision special tokens
+    Qwen2.5-VL has, so we can drive the production code path without
+    loading the real tokenizer."""
+
+    QWEN25_VL_VISION_TOKENS = {
+        "<|image_pad|>": 151655,
+        "<|video_pad|>": 151656,
+        "<|vision_pad|>": 151654,
+        "<|vision_start|>": 151652,
+        "<|vision_end|>": 151653,
+    }
+
+    def __init__(self) -> None:
+        self.tokenizer = SimpleNamespace(
+            padding_side="right",
+            pad_token_id=0,
+            eos_token_id=0,
+            unk_token_id=151643,
+            convert_tokens_to_ids=lambda tok: self.QWEN25_VL_VISION_TOKENS.get(
+                tok, 151643
+            ),
+            __call__=lambda texts, padding=False, return_attention_mask=False: {
+                "input_ids": (
+                    [list(range(len(t))) for t in texts]
+                    if isinstance(texts, list)
+                    else [list(range(len(texts)))]
+                )
+            },
+        )
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+    ) -> str:
+        parts = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    c.get("text", "") if isinstance(c, dict) else str(c) for c in content
+                )
+            parts.append(f"<{m['role']}>{content}")
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        return "".join(parts)
+
+
+def _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss: bool) -> Any:
+    from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
+
+    stub = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
+    stub.processor = _StubProcessorWithVisionTokens()
+    # Make tokenizer callable as both `tokenizer(...)` and `convert_tokens_to_ids`.
+    stub.processor.tokenizer = type(stub.processor.tokenizer)(
+        **{
+            **vars(stub.processor.tokenizer),
+            # Restore __call__-able tokenizer that returns dict on call.
+        }
+    )
+
+    class _CallableTokenizer:
+        padding_side = "right"
+        pad_token_id = 0
+        eos_token_id = 0
+        unk_token_id = 151643
+
+        def convert_tokens_to_ids(self, tok):
+            return _StubProcessorWithVisionTokens.QWEN25_VL_VISION_TOKENS.get(
+                tok, self.unk_token_id
+            )
+
+        def __call__(
+            self,
+            texts,
+            padding: bool = False,
+            return_attention_mask: bool = False,
+            return_tensors: str | None = None,
+        ):
+            if isinstance(texts, str):
+                texts = [texts]
+            ids = [list(range(len(t))) for t in texts]
+            return {"input_ids": ids}
+
+    stub.processor.tokenizer = _CallableTokenizer()
+    stub.config = SimpleNamespace(
+        rollout=SimpleNamespace(use_vllm_native_loss=use_vllm_native_loss)
+    )
+    return stub
+
+
+class TestNativePathFiltersVisionTokens:
+    """Regression test for the production crash where vLLM-sampled
+    ``<|image_pad|>`` tokens in a completion broke Qwen2.5-VL's
+    image-pad count matching."""
+
+    def test_image_pad_in_completion_is_filtered(self) -> None:
+        trainer = _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss=True)
+        msgs = [
+            [{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A"}],
+        ]
+        # Completion contains an image-pad (151655) at position 2 — the
+        # exact token that crashed production.
+        ids = [10, 11, 151655, 12, 13]
+        lps = [-0.1, -0.2, -0.3, -0.4, -0.5]
+        pretok = trainer._preprocess_trajectory_texts(
+            msgs,
+            images=[None],
+            completion_token_ids=[ids],
+            completion_logprobs=[lps],
+        )
+        assert pretok["native_path"] is True
+        # image-pad must be removed from token ids
+        assert 151655 not in pretok["completion_token_ids"][0]
+        assert pretok["completion_token_ids"][0] == [10, 11, 12, 13]
+        # paired logprob entry must be removed (NOT the entry at the same
+        # position from the un-filtered list — the entry that aligned with
+        # the dropped token, namely lp at position 2 = -0.3).
+        assert pretok["completion_logprobs"][0] == [-0.1, -0.2, -0.4, -0.5]
+        # full_lens should reflect the filtered length
+        assert (
+            pretok["full_lens"][0] - pretok["prompt_lens"][0]
+            == len(pretok["completion_token_ids"][0])
+        )
+
+    def test_all_vision_tokens_filtered(self) -> None:
+        """Every vision special token in the Qwen2.5-VL set must be filtered,
+        not just image_pad. The model can theoretically sample any of them."""
+        trainer = _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss=True)
+        msgs = [
+            [{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A"}],
+        ]
+        # All 5 vision specials interleaved with normal tokens.
+        ids = [
+            10,
+            151652,  # vision_start
+            11,
+            151653,  # vision_end
+            12,
+            151654,  # vision_pad
+            13,
+            151655,  # image_pad
+            14,
+            151656,  # video_pad
+            15,
+        ]
+        lps = [float(-i) for i in range(len(ids))]
+        pretok = trainer._preprocess_trajectory_texts(
+            msgs,
+            images=[None],
+            completion_token_ids=[ids],
+            completion_logprobs=[lps],
+        )
+        out_ids = pretok["completion_token_ids"][0]
+        out_lps = pretok["completion_logprobs"][0]
+        assert out_ids == [10, 11, 12, 13, 14, 15]
+        # Logprob entries paired with the kept ids preserved by index.
+        # ids[0]=10 → lp=-0; ids[2]=11 → lp=-2; ids[4]=12 → lp=-4;
+        # ids[6]=13 → lp=-6; ids[8]=14 → lp=-8; ids[10]=15 → lp=-10.
+        assert out_lps == [0.0, -2.0, -4.0, -6.0, -8.0, -10.0]
+
+    def test_legacy_path_does_not_filter(self) -> None:
+        """When native loss is off, completions are used as text via the
+        legacy retokenize path; we must NOT reach into them."""
+        trainer = _make_native_trainer_stub_with_vision_tokens(
+            use_vllm_native_loss=False
+        )
+        msgs = [
+            [{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A"}],
+        ]
+        ids = [10, 151655, 11]
+        pretok = trainer._preprocess_trajectory_texts(
+            msgs,
+            images=[None],
+            completion_token_ids=[ids],
+        )
+        assert pretok["native_path"] is False
+        # Legacy path stores completion_token_ids verbatim (used only for
+        # the Bug 2 length diagnostic, not for assembling input_ids).
+        assert pretok["completion_token_ids"] == [ids]
+
+
+# ---------------------------------------------------------------------------
 # 5. Native forward pass label alignment.
 # ---------------------------------------------------------------------------
 #
@@ -434,6 +642,11 @@ class _StubTorchTokenizer:
         self.padding_side = "right"
         self.pad_token_id = pad_token_id
         self.eos_token_id = pad_token_id
+        self.unk_token_id = 999
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        # Stub tokenizer doesn't carry vision-special tokens.
+        return self.unk_token_id
 
     def __call__(
         self,

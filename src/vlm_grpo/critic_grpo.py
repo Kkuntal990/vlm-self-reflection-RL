@@ -2229,6 +2229,72 @@ class SelfReflectionGRPOTrainer:
         native_path = native_loss and all_have_ids
 
         if native_path:
+            # Defense: vLLM samples from the full vocabulary, including the
+            # vision-pad / vision-marker special tokens that the model uses
+            # to mark image regions in the prompt. Probability is tiny per
+            # step but over thousands of trajectories we eventually see one.
+            #
+            # If a sampled completion contains an extra ``<|image_pad|>``
+            # token (151655 in Qwen2.5-VL), the assembled
+            # ``prompt_ids ++ completion_ids`` then has more image-pad
+            # tokens than the prompt's ``image_grid_thw`` features can fill,
+            # and Qwen2.5-VL's ``get_placeholder_mask`` raises
+            # ``ValueError: Image features and image tokens do not match``
+            # — taking the entire training step and the whole pod down with
+            # it (this surfaced after ~12h on the production
+            # ``single-fb-only`` run; the legacy retokenize path didn't
+            # have this exposure because text → tokens via
+            # ``apply_chat_template`` doesn't preserve image-pad as the
+            # special token).
+            #
+            # Strip vision special tokens from the completion before the
+            # length budget is computed; keep ``completion_logprobs``
+            # paired so the old_lp shortcut tensor stays aligned with the
+            # filtered ids the forward pass will see.
+            vision_special_ids = set()
+            for tok_name in (
+                "<|image_pad|>",
+                "<|video_pad|>",
+                "<|vision_pad|>",
+                "<|vision_start|>",
+                "<|vision_end|>",
+            ):
+                tok_id = self.processor.tokenizer.convert_tokens_to_ids(tok_name)
+                if isinstance(tok_id, int) and tok_id != self.processor.tokenizer.unk_token_id:
+                    vision_special_ids.add(tok_id)
+
+            if vision_special_ids:
+                filtered_ids: list[list[int]] = []
+                filtered_lps: list[Optional[list[float]]] = []
+                total_dropped = 0
+                for i, ids in enumerate(completion_token_ids):
+                    lps_i = completion_logprobs[i] if completion_logprobs else None
+                    if lps_i is not None and len(lps_i) == len(ids):
+                        kept = [
+                            (t, lp)
+                            for t, lp in zip(ids, lps_i)
+                            if t not in vision_special_ids
+                        ]
+                        f_ids = [t for t, _ in kept]
+                        f_lps = [lp for _, lp in kept]
+                    else:
+                        f_ids = [t for t in ids if t not in vision_special_ids]
+                        f_lps = lps_i
+                    total_dropped += len(ids) - len(f_ids)
+                    filtered_ids.append(f_ids)
+                    filtered_lps.append(f_lps)
+                if total_dropped > 0:
+                    logger.warning(
+                        f"[native loss] dropped {total_dropped} vision-special "
+                        "token(s) sampled by vLLM mid-completion across "
+                        f"{len(completion_token_ids)} trajectories — would have "
+                        "caused image_grid_thw / image_pad count mismatch in "
+                        "the HF forward pass."
+                    )
+                completion_token_ids = filtered_ids
+                if completion_logprobs is not None:
+                    completion_logprobs = filtered_lps
+
             # Length budget comes directly from vLLM. We DO NOT retokenize the
             # full text — the assembled input_ids in the forward pass will be
             # ``prompt_ids ++ vllm_completion_ids`` with len == prompt_len +
