@@ -123,7 +123,7 @@ spec:
             --save_steps ${SAVE_STEPS:-250} \
             --seed ${SEED:-42} \
             --debug \
-            ${INIT_CHECKPOINT:+--init_from_checkpoint "$INIT_CHECKPOINT"} \
+            ${INIT_CHECKPOINT:+--resume_from_checkpoint "$INIT_CHECKPOINT"} \
             2>&1 | tee -a "${OUTPUT_DIR}/training.log"
 
           echo "=== Training complete ==="
@@ -138,13 +138,21 @@ spec:
           value: "/outputs/grpo_qwen_livr_v2_9k_single_fb_only"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
-        # Resume from the pre-crash checkpoint-250 of this same run. The
-        # original run was at Step ~460 when it hit the vLLM image-pad bug;
-        # the fix at commit bd4d63b filters those tokens. checkpoint-250
-        # contains 250 steps of clean training (the bug was a hard crash
-        # not silent corruption — completed steps before the crash were
-        # correct). Restoring optimizer.pt also brings back Adam moments,
-        # avoiding the warmup transient.
+        # Resume from the pre-crash checkpoint-250 of this same run.
+        # Wired through --resume_from_checkpoint (NOT --init_from_checkpoint),
+        # so the trainer:
+        #   - loads adapter_model.safetensors (LoRA weights)
+        #   - loads optimizer.pt (Adam moments)
+        #   - INHERITS global_step=250 (next logged step is 260, not 10)
+        #   - skips already-processed samples from the dataset front
+        #   - wandb run resumes (resume="allow") rather than starting a new run
+        # The original run hit the vLLM image-pad bug at Step ~460; commit
+        # bd4d63b filters those tokens and prevents recurrence. The bug was
+        # a hard crash, not silent corruption, so checkpoint-250's weights
+        # are clean.
+        # Env var name retained as INIT_CHECKPOINT for historical continuity
+        # with prior YAMLs; the launch flag below is what selects the
+        # behavior (resume vs init).
         - name: INIT_CHECKPOINT
           value: "/outputs/grpo_qwen_livr_v2_9k_single_fb_only/checkpoint-250"
 
