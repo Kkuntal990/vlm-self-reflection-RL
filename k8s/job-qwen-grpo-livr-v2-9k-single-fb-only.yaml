@@ -167,7 +167,7 @@ spec:
         - name: CLIP_RANGE
           value: "0.2"
         - name: CLIP_HIGH
-          value: "0.0"
+          value: "0.28"
         - name: INNER_EPOCHS
           value: "1"
 
@@ -183,7 +183,7 @@ spec:
         - name: A2_MAX_COMPLETION
           value: "386"
         - name: TEMPERATURE
-          value: "1.0"
+          value: "0.5"
         - name: FEEDBACK_TEMPERATURE
           value: "1.0"
         - name: A2_TEMPERATURE
