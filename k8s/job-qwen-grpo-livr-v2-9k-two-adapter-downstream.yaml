@@ -1,0 +1,375 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-grpo-livr-v2-9k-two-adapter-downstream
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: grpo-trainer
+        model: qwen2-5-vl-7b
+        task: livr-perception-grpo-two-adapter-downstream
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: trainer
+        image: huggingface/trl:0.29.0
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          echo "========================================="
+          echo "Two-Adapter GRPO: Qwen2.5-VL-7B + Pattern A + dual-LoRA freeze"
+          echo "  a1_expert (FROZEN, from baseline-a1 ckpt-1000) → A1 generation"
+          echo "  f1_a2_expert (TRAINABLE, warm-started from a1_expert) → F1 + A2"
+          echo "Model: ${MODEL_ID}"
+          echo "Frozen A1: ${FROZEN_A1_ADAPTER_PATH}"
+          echo "Dataset: ${DATASET_PATH}"
+          echo "Output: ${OUTPUT_DIR}"
+          echo "GPUs: ${NUM_GPUS}"
+          echo "K samples:   ${K_SAMPLES:-12}"
+          echo "Loss:        ${LOSS_TYPE:-grpo} (vanilla GRPO + LR warmup ${LR_WARMUP_STEPS:-100})"
+          echo "Bug 2 fix:   ON (vLLM token-id passthrough — branch grpo-two-adapter)"
+          echo "========================================="
+
+          # GPU check
+          nvidia-smi
+          echo ""
+
+          # Install dependencies — PIN vllm to exact version (see tokid-fix
+          # YAML for context; pip resolves to incompatible 0.20.x without
+          # the pin and breaks Qwen2.5-VL vision encoder forward).
+          pip install "vllm==0.12.0" wandb sentence-transformers 2>&1 | tail -5
+
+          git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
+          cd /workspace/vlm-self-reflection-RL
+          git checkout "${GIT_BRANCH:-grpo-two-adapter}"
+          pip install -e . 2>&1 | tail -3
+
+          mkdir -p "${OUTPUT_DIR}"
+
+          accelerate launch \
+            --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
+            --num_processes=${NUM_GPUS:-4} \
+            train_self_reflection.py \
+            --model_id "${MODEL_ID}" \
+            --model_type qwen2vl \
+            --dataset_path "${DATASET_PATH}" \
+            --output_dir "${OUTPUT_DIR}" \
+            --image_base_dir "${IMAGE_BASE_DIR}" \
+            --use_vllm \
+            --use_think_answer_tags \
+            --use_rescaled_rewards \
+            --two_adapter_mode \
+            --frozen_a1_adapter_path "${FROZEN_A1_ADAPTER_PATH}" \
+            --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.40} \
+            --max_samples ${MAX_SAMPLES:-0} \
+            --k_samples ${K_SAMPLES:-12} \
+            --max_completion_length ${MAX_COMPLETION_LENGTH:-386} \
+            --a1_max_completion_length ${A1_MAX_COMPLETION:-386} \
+            --f1_max_completion_length ${F1_MAX_COMPLETION:-386} \
+            --a2_max_completion_length ${A2_MAX_COMPLETION:-386} \
+            --temperature ${TEMPERATURE:-1.0} \
+            --feedback_temperature ${FEEDBACK_TEMPERATURE:-1.0} \
+            --a2_temperature ${A2_TEMPERATURE:-0.7} \
+            --learning_rate ${LEARNING_RATE:-1e-5} \
+            --lr_warmup_steps ${LR_WARMUP_STEPS:-100} \
+            --per_device_train_batch_size ${BATCH_SIZE:-2} \
+            --gradient_accumulation_steps ${GRAD_ACC:-1} \
+            --num_train_epochs ${EPOCHS:-1} \
+            --num_inner_epochs ${INNER_EPOCHS:-1} \
+            --kl_coeff ${KL_COEFF:-0.001} \
+            --a1_kl_coeff ${A1_KL_COEFF:-1.0} \
+            --a2_kl_coeff ${A2_KL_COEFF:-1.0} \
+            --fb_kl_coeff ${FB_KL_COEFF:-1.0} \
+            --clip_range ${CLIP_RANGE:-0.2} \
+            --clip_high ${CLIP_HIGH:-0.0} \
+            --loss_type ${LOSS_TYPE:-grpo} \
+            --lora_r ${LORA_R:-64} \
+            --lora_alpha ${LORA_ALPHA:-128} \
+            --freeze_vision_tower \
+            --max_pixels ${MAX_PIXELS:-401408} \
+            --min_pixels ${MIN_PIXELS:-200704} \
+            --w_a1_correctness ${W_A1_CORRECTNESS:-0.0} \
+            --w_a1_format ${W_A1_FORMAT:-0.0} \
+            --w_a2_correctness ${W_A2_CORRECTNESS:-0.45} \
+            --w_a2_format ${W_A2_FORMAT:-0.05} \
+            --w_no_regression ${W_NO_REGRESSION:-0.0} \
+            --w_downstream ${W_DOWNSTREAM:-0.0} \
+            --w_verification_accuracy ${W_VERIFICATION_ACCURACY:-0.45} \
+            --w_fb_format ${W_FB_FORMAT:-0.05} \
+            --reward_shaping_alpha ${REWARD_SHAPING_ALPHA:-1.0} \
+            --response_alpha ${RESPONSE_ALPHA:-1.0} \
+            --feedback_alpha ${FEEDBACK_ALPHA:-1.0} \
+            --logging_steps ${LOGGING_STEPS:-10} \
+            --save_steps ${SAVE_STEPS:-250} \
+            --seed ${SEED:-42} \
+            --debug \
+            ${RESUME_CHECKPOINT:+--resume_from_checkpoint "$RESUME_CHECKPOINT"} \
+            2>&1 | tee -a "${OUTPUT_DIR}/training.log"
+
+          echo "=== Training complete ==="
+
+        env:
+        # Model and data
+        - name: MODEL_ID
+          value: "Qwen/Qwen2.5-VL-7B-Instruct"
+        - name: DATASET_PATH
+          value: "/outputs/livr_v2_train_snapshots/snap_20260501_154345_final/data/livr_v2_9task_train.jsonl"
+        - name: OUTPUT_DIR
+          value: "/outputs/grpo_qwen_livr_v2_9k_two_adapter_downstream"
+        - name: IMAGE_BASE_DIR
+          value: "/outputs/image_base"
+        # Two-adapter setup deltas vs vanilla-tokid:
+        #   + --two_adapter_mode: PEFT model has TWO adapters
+        #     - a1_expert (FROZEN, loaded from baseline-a1 ckpt-1000)
+        #     - f1_a2_expert (TRAINABLE, warm-started from a1_expert)
+        #   + Per-turn adapter routing during rollout:
+        #     - A1 generation uses a1_expert (bit-identical to baseline-a1)
+        #     - F1+A2 generation uses f1_a2_expert
+        #   + A1 forward + A1 KL + A1 policy loss are all dropped (no-op
+        #     on the trainable adapter since the trainable adapter never
+        #     participates in A1 generation).
+        #   - Removed: --init_from_checkpoint (replaced by two_adapter_mode
+        #     init path which loads a1_expert via PeftModel.from_pretrained
+        #     and warm-starts f1_a2_expert by tensor copy).
+        #   - Removed: FREEZE_A1_STEPS — A1 freeze is now architectural
+        #     (separate adapter), not a runtime gate on the joint LoRA.
+        - name: FROZEN_A1_ADAPTER_PATH
+          value: "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"
+
+        
+
+        # KL: same as vanilla-tokid. β=0.001 is the DeepSeek-R1 default and
+        # was the working setting for the single-turn baseline-a1 run.
+        - name: KL_COEFF
+          value: "0.001"
+        - name: A1_KL_COEFF
+          value: "1.0"
+        - name: A2_KL_COEFF
+          value: "1.0"
+        - name: FB_KL_COEFF
+          value: "1.0"
+
+        # GRPO core — K=12 (matches vanilla-tokid).
+        - name: K_SAMPLES
+          value: "12"
+        - name: LOSS_TYPE
+          value: "grpo"
+        - name: CLIP_RANGE
+          value: "0.2"
+        - name: CLIP_HIGH
+          value: "0.0"
+        - name: USE_DYNAMIC_SAMPLING
+          value: ""
+        - name: INNER_EPOCHS
+          value: "1"
+
+        # Generation
+        - name: MAX_SAMPLES
+          value: "0"
+        - name: MAX_COMPLETION_LENGTH
+          value: "386"
+        - name: A1_MAX_COMPLETION
+          value: "386"
+        - name: F1_MAX_COMPLETION
+          value: "386"
+        - name: A2_MAX_COMPLETION
+          value: "386"
+        - name: TEMPERATURE
+          value: "1.0"
+        - name: FEEDBACK_TEMPERATURE
+          value: "1.0"
+        - name: A2_TEMPERATURE
+          value: "0.7"
+
+        # Optimization
+        - name: LEARNING_RATE
+          value: "1e-5"
+        - name: LR_WARMUP_STEPS
+          value: "100"
+        - name: BATCH_SIZE
+          value: "2"
+        - name: GRAD_ACC
+          value: "1"
+        - name: EPOCHS
+          value: "1"
+        - name: NUM_GPUS
+          value: "4"
+
+        # LoRA — must match the rank/alpha used to save the frozen
+        # a1_expert checkpoint, otherwise add_adapter+copy will shape-error.
+        - name: LORA_R
+          value: "64"
+        - name: LORA_ALPHA
+          value: "128"
+
+        # vLLM
+        - name: VLLM_GPU_MEM
+          value: "0.40"
+        - name: GIT_BRANCH
+          value: "grpo-two-adapter"
+
+        # Pattern-A user-message instructions
+        - name: THINK_ANSWER_INSTRUCTION
+          value: |
+            The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in <answer> </answer> tags.
+        - name: F1_VERIFIER_INSTRUCTION
+          value: |
+            Re-examine the image and determine whether the candidate answer is correct or incorrect. The reasoning process MUST BE enclosed within <think> </think> tags. The final verdict MUST BE put in \boxed{} as either CORRECT or INCORRECT.
+
+        # Qwen2.5-VL image resolution
+        - name: MAX_PIXELS
+          value: "401408"
+        - name: MIN_PIXELS
+          value: "200704"
+
+        # Reward shaping
+        - name: REWARD_SHAPING_ALPHA
+          value: "1.0"
+        - name: RESPONSE_ALPHA
+          value: "1.0"
+        - name: FEEDBACK_ALPHA
+          value: "1.0"
+
+        # Response weights: A1 components zeroed (frozen, no gradient).
+        # No-regression dropped (compares A1 vs A2; with frozen A1 this
+        # signal is reduced to "did A2 fix A1's mistake" which we already
+        # capture via a2_correctness — keeping it would just add reward
+        # variance with no extra information).
+        - name: W_A1_CORRECTNESS
+          value: "0.0"
+        - name: W_A1_FORMAT
+          value: "0.0"
+        - name: W_A2_CORRECTNESS
+          value: "0.45"
+        - name: W_A2_FORMAT
+          value: "0.05"
+        - name: W_NO_REGRESSION
+          value: "0.0"
+
+        # Feedback weights: downstream RE-ENABLED for this ablation. The
+        # parent two-adapter run trained F1 as a pure verifier (verdict +
+        # format only). Sycophancy creep was visible post-resume even with
+        # verification reward dominant. This run reallocates the F1 head:
+        # verification 0.45 → 0.25, downstream 0.0 → 0.20 (fb_format unchanged
+        # at 0.05). Sum = 0.50 (matches parent run). With α=1 (response and
+        # feedback) the downstream signal yields WR=+3, RW=−3, RR=+1, WW=−1
+        # (rescaled to [0,1] via --use_rescaled_rewards). The asymmetric gate
+        # in composition.py kicks in: when verification > 0 (verdict
+        # calibrated) the full bidirectional downstream signal flows; when
+        # verdict is wrong, downstream is clamped to ≤midpoint so F1 cannot
+        # farm a positive bonus from a sycophantic CORRECT whose A2 happened
+        # to flip right.
+        - name: W_DOWNSTREAM
+          value: "0.20"
+        - name: W_VERIFICATION_ACCURACY
+          value: "0.25"
+        - name: W_FB_FORMAT
+          value: "0.05"
+
+        # Logging
+        - name: LOGGING_STEPS
+          value: "10"
+        - name: SAVE_STEPS
+          value: "250"
+        - name: SEED
+          value: "42"
+
+        # LLM Judge disabled for MCQ
+        - name: VLM_USE_LLM_JUDGE
+          value: "0"
+
+        # HuggingFace
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+        - name: HF_HOME
+          value: "/cache/hf"
+        - name: TRANSFORMERS_CACHE
+          value: "/cache/hf/transformers"
+        - name: TORCH_HOME
+          value: "/cache/torch"
+
+        # Python and CUDA
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: ""
+        - name: NCCL_TIMEOUT
+          value: "1800"
+        - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+          value: "1800"
+        - name: VLLM_NO_USAGE_STATS
+          value: "1"
+        - name: DO_NOT_TRACK
+          value: "1"
+        - name: VLLM_ENABLE_V1_MULTIPROCESSING
+          value: "0"
+        - name: WANDB_PROJECT
+          value: "vlm-self-reflection-grpo"
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-api-key
+              key: key
+        - name: WANDB_RUN_NAME
+          value: "grpo-livr-v2-9k-two-adapter-downstream"
+
+        resources:
+          limits:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+          requests:
+            nvidia.com/a100: "4"
+            memory: "196Gi"
+            cpu: "12"
+
+        volumeMounts:
+        - name: cache
+          mountPath: /cache
+        - name: outputs
+          mountPath: /outputs
+        - name: dev-shm
+          mountPath: /dev/shm
+
+      tolerations:
+      - key: nautilus.io/reservation
+        operator: Exists
+        effect: NoSchedule
+      - key: nautilus.io/hardware
+        operator: Equal
+        value: large-gpu
+      - effect: PreferNoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      - key: nautilus.io/issue
+        operator: Exists
+        effect: NoSchedule
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+
+      volumes:
+      - name: cache
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: outputs
+        persistentVolumeClaim:
+          claimName: ms-swift-outputs-pvc
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
