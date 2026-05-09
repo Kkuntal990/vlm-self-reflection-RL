@@ -268,6 +268,16 @@ class SelfReflectionRolloutResult:
     answer1_token_ids: list[Optional[list[int]]] = field(default_factory=list)
     feedback_token_ids: list[Optional[list[int]]] = field(default_factory=list)
     answer2_token_ids: list[Optional[list[int]]] = field(default_factory=list)
+    # Per-token log-probabilities of the SAMPLED tokens, aligned 1:1 with the
+    # ``*_token_ids`` lists above. Captured at rollout time (vLLM via
+    # ``SamplingParams(logprobs=1)``; HF via ``output_scores`` from
+    # ``generate``). The trainer uses these directly as ``old_lp`` in the
+    # GRPO importance-sampling ratio, eliminating one HF forward pass per
+    # step and absorbing engine-level logit drift into the IS correction.
+    # ``None`` entries fall back to the recompute-by-HF-forward-pass path.
+    answer1_logprobs: list[Optional[list[float]]] = field(default_factory=list)
+    feedback_logprobs: list[Optional[list[float]]] = field(default_factory=list)
+    answer2_logprobs: list[Optional[list[float]]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -306,6 +316,9 @@ def _generate_batch_completions(
         List of N dicts, one per input sequence, with keys:
             "text": completion text (decoded with skip_special_tokens=True)
             "token_ids": list[int] of actual sampled completion token ids
+            "logprobs": list[float] of the sampled-token log-probabilities,
+                aligned 1:1 with token_ids. Computed from
+                ``output.scores`` (per-step logits) via log_softmax.gather.
     """
     n = len(messages_list)
     texts = [
@@ -343,21 +356,56 @@ def _generate_batch_completions(
             f"[generate batch] batch={inputs['input_ids'].shape[0]} "
             f"seq_len={inputs['input_ids'].shape[1]}"
         )
-        outputs = model.generate(
+        gen_outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             temperature=temperature if do_sample else None,
             top_p=top_p if do_sample else None,
             do_sample=do_sample,
+            return_dict_in_generate=True,
+            output_scores=True,
         )
     finally:
         processor.tokenizer.padding_side = orig_padding_side
 
-    completion_ids_list = [outputs[i][prompt_len:].tolist() for i in range(n)]
+    # generate(return_dict_in_generate=True) returns a ModelOutput with:
+    #   sequences: (n, prompt_len + new_len) — full sequences
+    #   scores:    tuple of length new_len, each (n, vocab_size) — per-step
+    #              raw logits BEFORE temperature / top_p sampling postprocess.
+    # We compute the sampled-token log-prob via log_softmax(scores) directly
+    # so the value matches the sampling distribution the model actually
+    # produced (subject to the same caveats as vLLM's logprobs=1 — both are
+    # post-temperature pre-top_p-renorm logits, suitable for IS correction
+    # provided new_lp is computed from the same logits family).
+    import torch as _torch
+    import torch.nn.functional as _F
+
+    sequences = gen_outputs.sequences
+    scores = gen_outputs.scores  # tuple(new_len) of (n, vocab) tensors
+    completion_ids_tensor = sequences[:, prompt_len:]  # (n, new_len_max)
+    new_len = completion_ids_tensor.shape[1]
+    # scores has length new_len (one per generated step). Stack to
+    # (new_len, n, vocab) then transpose to (n, new_len, vocab).
+    if new_len > 0 and len(scores) > 0:
+        scores_stack = _torch.stack(list(scores), dim=0).transpose(0, 1)  # (n, new_len, vocab)
+        log_probs = _F.log_softmax(scores_stack.float(), dim=-1)
+        # Gather log-prob of each sampled token. Pad tokens (eos repeats past
+        # end-of-sequence) still get a real logprob — the trainer masks them
+        # out via prompt_len/full_len bookkeeping, so emitting them here is
+        # harmless.
+        token_log_probs = log_probs.gather(
+            -1, completion_ids_tensor.unsqueeze(-1)
+        ).squeeze(-1)  # (n, new_len)
+    else:
+        token_log_probs = _torch.zeros(n, 0)
+
+    completion_ids_list = [completion_ids_tensor[i].tolist() for i in range(n)]
+    completion_lp_list = [token_log_probs[i].tolist() for i in range(n)]
     return [
         {
-            "text": processor.decode(outputs[i][prompt_len:], skip_special_tokens=True),
+            "text": processor.decode(completion_ids_tensor[i], skip_special_tokens=True),
             "token_ids": completion_ids_list[i],
+            "logprobs": completion_lp_list[i],
         }
         for i in range(n)
     ]
@@ -436,6 +484,9 @@ def generate_self_reflection_rollout(
     all_a1_ids: list[Optional[list[int]]] = []
     all_f1_ids: list[Optional[list[int]]] = []
     all_a2_ids: list[Optional[list[int]]] = []
+    all_a1_lps: list[Optional[list[float]]] = []
+    all_f1_lps: list[Optional[list[float]]] = []
+    all_a2_lps: list[Optional[list[float]]] = []
 
     with torch.no_grad():
         # Process in generation chunks to bound peak VRAM usage.
@@ -502,8 +553,10 @@ def generate_self_reflection_rollout(
             )
             chunk_a1s = [o["text"] for o in a1_outs]
             chunk_a1_ids = [o.get("token_ids") for o in a1_outs]
+            chunk_a1_lps = [o.get("logprobs") for o in a1_outs]
             all_a1s.extend(chunk_a1s)
             all_a1_ids.extend(chunk_a1_ids)
+            all_a1_lps.extend(chunk_a1_lps)
 
             # Step 2: Generate F1 for each trajectory.
             f1_prompts = [
@@ -523,8 +576,10 @@ def generate_self_reflection_rollout(
             )
             chunk_f1s = [o["text"] for o in f1_outs]
             chunk_f1_ids = [o.get("token_ids") for o in f1_outs]
+            chunk_f1_lps = [o.get("logprobs") for o in f1_outs]
             all_f1s.extend(chunk_f1s)
             all_f1_ids.extend(chunk_f1_ids)
+            all_f1_lps.extend(chunk_f1_lps)
 
             # Step 3: Generate A2 for each trajectory.
             a2_prompts = [
@@ -546,8 +601,10 @@ def generate_self_reflection_rollout(
             )
             chunk_a2s = [o["text"] for o in a2_outs]
             chunk_a2_ids = [o.get("token_ids") for o in a2_outs]
+            chunk_a2_lps = [o.get("logprobs") for o in a2_outs]
             all_a2s.extend(chunk_a2s)
             all_a2_ids.extend(chunk_a2_ids)
+            all_a2_lps.extend(chunk_a2_lps)
 
             logger.info(
                 f"Self-reflection rollout: {chunk_end}/{n} samples (gen_batch={chunk_size}, k={k})"
@@ -578,6 +635,9 @@ def generate_self_reflection_rollout(
         answer1_ids = all_a1_ids[traj_slice]
         feedback_ids = all_f1_ids[traj_slice]
         answer2_ids = all_a2_ids[traj_slice]
+        answer1_lps = all_a1_lps[traj_slice]
+        feedback_lps = all_f1_lps[traj_slice]
+        answer2_lps = all_a2_lps[traj_slice]
 
         result = SelfReflectionRolloutResult(
             sample_index=sample_indices[i],
@@ -634,6 +694,9 @@ def generate_self_reflection_rollout(
         result.answer1_token_ids = list(answer1_ids)
         result.feedback_token_ids = list(feedback_ids)
         result.answer2_token_ids = list(answer2_ids)
+        result.answer1_logprobs = list(answer1_lps)
+        result.feedback_logprobs = list(feedback_lps)
+        result.answer2_logprobs = list(answer2_lps)
         results.append(result)
 
     return results
@@ -704,6 +767,7 @@ def generate_baseline_a1_rollout(
 
     all_a1s: list[str] = []
     all_a1_ids: list[Optional[list[int]]] = []
+    all_a1_lps: list[Optional[list[float]]] = []
 
     with torch.no_grad():
         for chunk_start in range(0, n, gen_batch):
@@ -750,8 +814,10 @@ def generate_baseline_a1_rollout(
                 )
             chunk_a1s = [o["text"] for o in a1_outs]
             chunk_a1_ids = [o.get("token_ids") for o in a1_outs]
+            chunk_a1_lps = [o.get("logprobs") for o in a1_outs]
             all_a1s.extend(chunk_a1s)
             all_a1_ids.extend(chunk_a1_ids)
+            all_a1_lps.extend(chunk_a1_lps)
 
             logger.info(
                 f"Baseline A1 rollout: {chunk_end}/{n} samples (chunk={len(chunk_qs)}, k={k})"
@@ -771,6 +837,7 @@ def generate_baseline_a1_rollout(
         traj_slice = slice(i * k, (i + 1) * k)
         answer1s = all_a1s[traj_slice]
         answer1_ids = all_a1_ids[traj_slice]
+        answer1_lps = all_a1_lps[traj_slice]
 
         result = SelfReflectionRolloutResult(
             sample_index=sample_indices[i],
@@ -804,6 +871,9 @@ def generate_baseline_a1_rollout(
         result.answer1_token_ids = list(answer1_ids)
         result.feedback_token_ids = [None] * len(answer1s)
         result.answer2_token_ids = [None] * len(answer1s)
+        result.answer1_logprobs = list(answer1_lps)
+        result.feedback_logprobs = [None] * len(answer1s)
+        result.answer2_logprobs = [None] * len(answer1s)
         results.append(result)
 
     return results

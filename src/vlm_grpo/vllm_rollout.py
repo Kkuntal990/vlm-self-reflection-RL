@@ -208,11 +208,12 @@ class VLLMRolloutEngine:
     ) -> list[dict]:
         """Generate completions for a batch of prompts with images.
 
-        Returns both raw text and the actual emitted token_ids per output.
-        Token ids are required by the trainer's pre-tokenize step so the
-        GRPO ratio is computed against the EXACT sequence vLLM sampled —
-        not a re-tokenized approximation, which the audit identified as a
-        silent log-prob corruption source (Bug 2).
+        Returns the raw completion text, the exact emitted token_ids, and the
+        per-token log-probability of each sampled token. The trainer uses
+        token_ids to bypass the HF retokenize seam (Bug 2) and uses the
+        sample-time logprobs as ``old_lp`` in the GRPO ratio, which both
+        eliminates an HF forward pass per step and absorbs the vLLM↔HF
+        kernel-level logit drift into an importance-sampling correction.
 
         Args:
             prompts: List of formatted prompt strings
@@ -225,6 +226,9 @@ class VLLMRolloutEngine:
             List of dicts, one per prompt, with keys:
                 "text": completion text as emitted by vLLM (no .strip())
                 "token_ids": list[int] of actual sampled completion token ids
+                "logprobs": list[float] of sampled-token logprobs, aligned
+                    1:1 with ``token_ids``. Captured at sample time via
+                    ``SamplingParams(logprobs=1)``.
         """
         from vllm import SamplingParams
 
@@ -233,6 +237,11 @@ class VLLMRolloutEngine:
             temperature=temperature if do_sample else 0.0,
             top_p=top_p if do_sample else 1.0,
             max_tokens=max_new_tokens,
+            # Capture the sampled-token logprob at each step. logprobs=1 asks
+            # vLLM for the top-1 logprob distribution AND always includes the
+            # actually-sampled token, so the per-step dict is guaranteed to
+            # contain ``token_ids[i]`` as a key.
+            logprobs=1,
         )
 
         vllm_inputs = []
@@ -243,10 +252,29 @@ class VLLMRolloutEngine:
             vllm_inputs.append(inp)
 
         outputs = self.llm.generate(vllm_inputs, sampling_params)
-        return [
-            {
-                "text": out.outputs[0].text,
-                "token_ids": list(out.outputs[0].token_ids),
-            }
-            for out in outputs
-        ]
+        results: list[dict] = []
+        for out in outputs:
+            comp = out.outputs[0]
+            token_ids = list(comp.token_ids)
+            # comp.logprobs is list[dict[int, Logprob] | None] aligned with
+            # token_ids. Each dict maps a candidate token id to a Logprob
+            # object with a ``.logprob`` attribute. The sampled token is
+            # guaranteed to be a key (vLLM always includes it). ``None``
+            # entries should not occur with logprobs>=1, but we defend
+            # against them by emitting 0.0 (treated as no-op IS weight by
+            # the trainer's exp(new_lp - old_lp) ratio).
+            sampled_logprobs: list[float] = []
+            for i, tok_id in enumerate(token_ids):
+                step_lp = comp.logprobs[i] if comp.logprobs is not None else None
+                if step_lp is None or tok_id not in step_lp:
+                    sampled_logprobs.append(0.0)
+                else:
+                    sampled_logprobs.append(float(step_lp[tok_id].logprob))
+            results.append(
+                {
+                    "text": comp.text,
+                    "token_ids": token_ids,
+                    "logprobs": sampled_logprobs,
+                }
+            )
+        return results

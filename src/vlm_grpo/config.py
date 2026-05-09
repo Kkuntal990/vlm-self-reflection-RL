@@ -132,6 +132,20 @@ class RolloutConfig:
     # ``compute_feedback_reward_breakdown_01`` in
     # ``src/vlm_grpo/rewards/composition.py``.
     use_rescaled_rewards: bool = False
+    # vLLM-native loss path (closes audit Bug 2 — vLLM <-> HF retokenize
+    # mismatch). When True AND the rollout engine emits per-token logprobs
+    # alongside token_ids:
+    #   1. The HF forward pass scores the EXACT tokens vLLM sampled
+    #      (manual assembly of input_ids = prompt_ids ++ vllm_completion_ids,
+    #      bypassing apply_chat_template + tokenize on completion text).
+    #   2. ``old_lp`` for the GRPO importance ratio is taken directly from
+    #      vLLM's sample-time logprobs, eliminating one HF forward pass per
+    #      step (~12% wall-clock speedup) and absorbing engine-level logit
+    #      drift into the IS correction.
+    # When False (default during migration): legacy retokenize-based path,
+    # bit-for-bit unchanged. Set to True after validating with the
+    # equivalence test in ``tests/test_vllm_token_passthrough.py``.
+    use_vllm_native_loss: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

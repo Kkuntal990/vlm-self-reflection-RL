@@ -964,18 +964,26 @@ class SelfReflectionGRPOTrainer:
 
             use_tags = self.config.rollout.use_think_answer_tags
             single_turn_a1 = bool(getattr(self.config.rollout, "single_turn_a1", False))
-            # rollout result token-id lists may be empty when rolling back to legacy
-            # rollout paths; default to None per turn so pre-tokenize falls back.
+            # rollout result token-id / logprob lists may be empty when
+            # rolling back to legacy rollout paths; default to None per turn
+            # so pre-tokenize falls back to the retokenize path and old_lp
+            # is recomputed by the HF forward pass.
             a1_id_list = result.answer1_token_ids or [None] * len(result.answer1s)
             f1_id_list = result.feedback_token_ids or [None] * len(result.answer1s)
             a2_id_list = result.answer2_token_ids or [None] * len(result.answer1s)
-            for a1, f1, a2, a1_ids, f1_ids, a2_ids in zip(
+            a1_lp_list = result.answer1_logprobs or [None] * len(result.answer1s)
+            f1_lp_list = result.feedback_logprobs or [None] * len(result.answer1s)
+            a2_lp_list = result.answer2_logprobs or [None] * len(result.answer1s)
+            for a1, f1, a2, a1_ids, f1_ids, a2_ids, a1_lps, f1_lps, a2_lps in zip(
                 result.answer1s,
                 result.feedbacks,
                 result.answer2s,
                 a1_id_list,
                 f1_id_list,
                 a2_id_list,
+                a1_lp_list,
+                f1_lp_list,
+                a2_lp_list,
             ):
                 a1_prompt = build_initial_answer_prompt(
                     result.question, use_think_answer_tags=use_tags
@@ -995,6 +1003,9 @@ class SelfReflectionGRPOTrainer:
                             "a1_completion_ids": a1_ids,
                             "f1_completion_ids": None,
                             "a2_completion_ids": None,
+                            "a1_completion_logprobs": a1_lps,
+                            "f1_completion_logprobs": None,
+                            "a2_completion_logprobs": None,
                         }
                     )
                 else:
@@ -1019,6 +1030,9 @@ class SelfReflectionGRPOTrainer:
                             "a1_completion_ids": a1_ids,
                             "f1_completion_ids": f1_ids,
                             "a2_completion_ids": a2_ids,
+                            "a1_completion_logprobs": a1_lps,
+                            "f1_completion_logprobs": f1_lps,
+                            "a2_completion_logprobs": a2_lps,
                         }
                     )
 
@@ -1114,13 +1128,29 @@ class SelfReflectionGRPOTrainer:
                     rep_a1_ids = rr.answer1_token_ids or [None] * len(rr.answer1s)
                     rep_f1_ids = rr.feedback_token_ids or [None] * len(rr.answer1s)
                     rep_a2_ids = rr.answer2_token_ids or [None] * len(rr.answer1s)
-                    for a1, f1, a2, a1_ids, f1_ids, a2_ids in zip(
+                    rep_a1_lps = rr.answer1_logprobs or [None] * len(rr.answer1s)
+                    rep_f1_lps = rr.feedback_logprobs or [None] * len(rr.answer1s)
+                    rep_a2_lps = rr.answer2_logprobs or [None] * len(rr.answer1s)
+                    for (
+                        a1,
+                        f1,
+                        a2,
+                        a1_ids,
+                        f1_ids,
+                        a2_ids,
+                        a1_lps,
+                        f1_lps,
+                        a2_lps,
+                    ) in zip(
                         rr.answer1s,
                         rr.feedbacks,
                         rr.answer2s,
                         rep_a1_ids,
                         rep_f1_ids,
                         rep_a2_ids,
+                        rep_a1_lps,
+                        rep_f1_lps,
+                        rep_a2_lps,
                     ):
                         a1_prompt = build_initial_answer_prompt(
                             rr.question, use_think_answer_tags=use_tags
@@ -1136,6 +1166,9 @@ class SelfReflectionGRPOTrainer:
                                     "a1_completion_ids": a1_ids,
                                     "f1_completion_ids": None,
                                     "a2_completion_ids": None,
+                                    "a1_completion_logprobs": a1_lps,
+                                    "f1_completion_logprobs": None,
+                                    "a2_completion_logprobs": None,
                                 }
                             )
                             continue
@@ -1161,6 +1194,9 @@ class SelfReflectionGRPOTrainer:
                                 "a1_completion_ids": a1_ids,
                                 "f1_completion_ids": f1_ids,
                                 "a2_completion_ids": a2_ids,
+                                "a1_completion_logprobs": a1_lps,
+                                "f1_completion_logprobs": f1_lps,
+                                "a2_completion_logprobs": a2_lps,
                             }
                         )
 
@@ -1322,6 +1358,7 @@ class SelfReflectionGRPOTrainer:
             [t["a1_full"] for t in trajectory_data],
             imgs,
             completion_token_ids=[t.get("a1_completion_ids") for t in trajectory_data],
+            completion_logprobs=[t.get("a1_completion_logprobs") for t in trajectory_data],
         )
         if single_turn_a1:
             # Skip F1/A2 pretokenization entirely in baseline mode.
@@ -1332,24 +1369,37 @@ class SelfReflectionGRPOTrainer:
                 [t["a2_full"] for t in trajectory_data],
                 imgs,
                 completion_token_ids=[t.get("a2_completion_ids") for t in trajectory_data],
+                completion_logprobs=[t.get("a2_completion_logprobs") for t in trajectory_data],
             )
             f1_pretok = self._preprocess_trajectory_texts(
                 [t["f1_full"] for t in trajectory_data],
                 imgs,
                 completion_token_ids=[t.get("f1_completion_ids") for t in trajectory_data],
+                completion_logprobs=[t.get("f1_completion_logprobs") for t in trajectory_data],
             )
 
         # Completion token lengths from pre-tokenized data (token count, not word count).
-        # full_lens - prompt_lens = number of completion tokens per trajectory.
         # Tracks length hacking where wrong answers grow longer (Dr. GRPO key finding).
-        a1_toks = [f - p for f, p in zip(a1_pretok["full_lens"], a1_pretok["prompt_lens"])]
+        #
+        # In legacy mode: full_lens - prompt_lens (both from text-only tokenizer).
+        # In native mode: full_lens stores text_only_prompt_len + len(completion_ids),
+        #   so subtracting the SAME text_only prompt_lens recovers the completion
+        #   length verbatim. Equivalently, len(completion_token_ids[i]) is always
+        #   the true completion length regardless of path — preferred for clarity.
+        def _completion_lens(pretok: dict) -> list[int]:
+            comp_ids = pretok.get("completion_token_ids")
+            if pretok.get("native_path", False) and comp_ids is not None:
+                return [len(c) if c is not None else 0 for c in comp_ids]
+            return [f - p for f, p in zip(pretok["full_lens"], pretok["prompt_lens"])]
+
+        a1_toks = _completion_lens(a1_pretok)
         avg_a1_toks = sum(a1_toks) / max(len(a1_toks), 1)
         if single_turn_a1:
             avg_f1_toks = 0.0
             avg_a2_toks = 0.0
         else:
-            f1_toks = [f - p for f, p in zip(f1_pretok["full_lens"], f1_pretok["prompt_lens"])]
-            a2_toks = [f - p for f, p in zip(a2_pretok["full_lens"], a2_pretok["prompt_lens"])]
+            f1_toks = _completion_lens(f1_pretok)
+            a2_toks = _completion_lens(a2_pretok)
             avg_f1_toks = sum(f1_toks) / max(len(f1_toks), 1)
             avg_a2_toks = sum(a2_toks) / max(len(a2_toks), 1)
 
@@ -1362,22 +1412,102 @@ class SelfReflectionGRPOTrainer:
         ref_a2_lps_list: list[Any] = []
         ref_fb_lps_list: list[Any] = []
 
-        with torch.no_grad():
-            # Combine a1/a2/f1 into one forward pass per mini-batch (3x fewer GPU ops)
-            for mb_s in range(0, n_traj, inner_mini_bs):
-                mb_e = min(mb_s + inner_mini_bs, n_traj)
-                if single_turn_a1:
-                    (a1_lps,) = self._forward_from_pretokenized_multi(
-                        [a1_pretok], unwrapped_model, mb_s, mb_e
+        # Native path lets us skip the HF old-lp forward pass entirely:
+        # vLLM emitted the per-token sampled logprob at rollout time, so we
+        # take old_lp directly from those cached values. The remaining HF
+        # work in this block is just the ref-lp pass (still required —
+        # vLLM doesn't know about the reference adapter / base model).
+        # Each pretok carries a ``native_path`` flag set in
+        # ``_preprocess_trajectory_texts``; when all participating pretoks
+        # are native AND ``completion_logprobs`` is fully populated, we use
+        # the shortcut. Otherwise we fall back to the HF forward pass.
+        def _logprobs_to_tensors(pretok: dict) -> Optional[list[Any]]:
+            """Convert per-trajectory completion_logprobs lists to tensors,
+            or return None when the shortcut is unsafe.
+
+            Returns None (forcing the HF forward-pass fallback) when:
+              - the pretok is not in native mode
+              - completion_logprobs is missing entirely
+              - any per-trajectory logprob list is None
+              - any per-trajectory logprob list length disagrees with the
+                paired completion_token_ids length (defensive: a future
+                vLLM/HF mismatch here would otherwise produce mismatched
+                tensors inside the per-token IS loss loop and crash later)
+            """
+            lp_lists = pretok.get("completion_logprobs")
+            if not pretok.get("native_path", False) or lp_lists is None:
+                return None
+            if not all(lp is not None for lp in lp_lists):
+                return None
+            id_lists = pretok.get("completion_token_ids")
+            if id_lists is None or len(id_lists) != len(lp_lists):
+                logger.warning(
+                    "[old_lp shortcut] completion_token_ids / completion_logprobs "
+                    "list-of-lists length mismatch — falling back to HF forward."
+                )
+                return None
+            for i, (lp, ids) in enumerate(zip(lp_lists, id_lists)):
+                if ids is None or len(lp) != len(ids):
+                    logger.warning(
+                        "[old_lp shortcut] per-trajectory logprob/token-id length "
+                        f"mismatch at i={i} (lp={len(lp) if lp is not None else None}, "
+                        f"ids={len(ids) if ids is not None else None}) — falling "
+                        "back to HF forward."
                     )
-                    old_a1_lps_list += a1_lps
+                    return None
+            tensors: list[Any] = []
+            for lp in lp_lists:
+                if len(lp) == 0:
+                    tensors.append(torch.tensor([0.0], device=self.device))
                 else:
-                    a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
-                        [a1_pretok, a2_pretok, f1_pretok], unwrapped_model, mb_s, mb_e
-                    )
-                    old_a1_lps_list += a1_lps
-                    old_a2_lps_list += a2_lps
-                    old_fb_lps_list += fb_lps
+                    tensors.append(torch.tensor(lp, dtype=torch.float32, device=self.device))
+            return tensors
+
+        a1_old_from_vllm = _logprobs_to_tensors(a1_pretok)
+        a2_old_from_vllm = (
+            _logprobs_to_tensors(a2_pretok) if a2_pretok is not None else None
+        )
+        fb_old_from_vllm = (
+            _logprobs_to_tensors(f1_pretok) if f1_pretok is not None else None
+        )
+
+        # Determine whether we can take the vLLM-logprob shortcut for old_lp.
+        if single_turn_a1:
+            can_skip_old_pass = a1_old_from_vllm is not None
+        else:
+            can_skip_old_pass = (
+                a1_old_from_vllm is not None
+                and a2_old_from_vllm is not None
+                and fb_old_from_vllm is not None
+            )
+
+        with torch.no_grad():
+            if can_skip_old_pass:
+                old_a1_lps_list = list(a1_old_from_vllm)
+                if not single_turn_a1:
+                    old_a2_lps_list = list(a2_old_from_vllm)
+                    old_fb_lps_list = list(fb_old_from_vllm)
+                logger.info(
+                    "  old_lp shortcut: using vLLM sample-time logprobs "
+                    f"({n_traj} trajectories, skipped HF old-pass)"
+                )
+            else:
+                # Combine a1/a2/f1 into one forward pass per mini-batch
+                # (3x fewer GPU ops vs separate passes)
+                for mb_s in range(0, n_traj, inner_mini_bs):
+                    mb_e = min(mb_s + inner_mini_bs, n_traj)
+                    if single_turn_a1:
+                        (a1_lps,) = self._forward_from_pretokenized_multi(
+                            [a1_pretok], unwrapped_model, mb_s, mb_e
+                        )
+                        old_a1_lps_list += a1_lps
+                    else:
+                        a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
+                            [a1_pretok, a2_pretok, f1_pretok], unwrapped_model, mb_s, mb_e
+                        )
+                        old_a1_lps_list += a1_lps
+                        old_a2_lps_list += a2_lps
+                        old_fb_lps_list += fb_lps
 
             # Ref log-probs: only needed when kl_coeff > 0.
             # Three cases:
@@ -2018,6 +2148,7 @@ class SelfReflectionGRPOTrainer:
         messages_list: list[list[dict]],
         images: list[Any],
         completion_token_ids: Optional[list[Optional[list[int]]]] = None,
+        completion_logprobs: Optional[list[Optional[list[float]]]] = None,
     ) -> dict:
         """Pre-compute chat-template strings and token lengths for a trajectory batch.
 
@@ -2025,23 +2156,41 @@ class SelfReflectionGRPOTrainer:
         apply_chat_template + per-sequence tokenizer calls are not repeated on
         every inner epoch mini-batch forward pass.
 
+        When ``self.config.rollout.use_vllm_native_loss`` is True AND the
+        rollout engine provided ``completion_token_ids``, the pretok dict is
+        configured for the **native-token** path: ``full_lens`` is computed
+        from ``prompt_lens + len(vllm_completion_ids)`` rather than from
+        retokenizing the full text, and the forward pass assembles
+        ``input_ids = prompt_ids ++ vllm_completion_ids`` directly — bypassing
+        the lossy ``apply_chat_template + tokenize`` round-trip on the
+        completion text (audit Bug 2). Otherwise the legacy retokenize path
+        is used and the Bug 2 length-mismatch warning is logged for telemetry.
+
         Args:
             messages_list: N full message lists (prompt + assistant completion)
             images: N PIL Images (one per sequence, may be None)
-            completion_token_ids: Optional N-list of actual completion token ids
-                emitted by the rollout engine. When provided, used to
-                cross-check the retokenize boundary and to surface retokenize
-                divergences (audit Bug 2 — vLLM <-> HF tokenization mismatch).
-                Stored on the returned pretok dict so a future forward pass
-                can bypass retokenize entirely.
+            completion_token_ids: Optional N-list of actual completion token
+                ids emitted by the rollout engine. Required for the native
+                path; used for the Bug 2 diagnostic in legacy mode.
+            completion_logprobs: Optional N-list of per-token sampled logprobs
+                aligned with ``completion_token_ids``. Stored on the pretok
+                dict so the trainer can use them as ``old_lp`` directly,
+                skipping one HF forward pass per step.
 
         Returns:
             dict with keys:
                 full_texts: list[str] of N full chat-template strings
-                prompt_lens: list[int] of N prompt token counts
+                prompt_texts: list[str] of N prompt-only chat-template strings
+                prompt_lens: list[int] of N prompt token counts (text-only
+                    tokenization, used to locate the prompt/completion seam
+                    in input_ids during the forward pass)
                 full_lens: list[int] of N full sequence token counts
                 images: the same images list (stored for convenience)
                 completion_token_ids: same list as the argument (or None)
+                completion_logprobs: same list as the argument (or None)
+                native_path: bool — True iff every trajectory has a non-None
+                    completion_token_ids AND ``use_vllm_native_loss`` is on.
+                    The forward pass uses this flag to pick the assembly mode.
         """
         has_image = any(img is not None for img in images)
         full_texts: list[str] = []
@@ -2065,41 +2214,76 @@ class SelfReflectionGRPOTrainer:
             prompt_texts, padding=False, return_attention_mask=False
         )
         prompt_lens = [len(ids) for ids in prompt_enc["input_ids"]]
-        full_enc = self.processor.tokenizer(full_texts, padding=False, return_attention_mask=False)
-        full_lens = [len(ids) for ids in full_enc["input_ids"]]
 
-        # Bug 2 diagnostic: when the rollout engine provided actual completion
-        # token ids, compare against the retokenized completion span. A
-        # mismatch means apply_chat_template + tokenize is producing a
-        # different label sequence than what vLLM actually sampled — the
-        # GRPO ratio is then computed against the wrong sequence, silently
-        # corrupting old/ref/new log-prob alignment. Sampling here keeps the
-        # log volume bounded.
-        if completion_token_ids is not None and any(c is not None for c in completion_token_ids):
-            mismatches = 0
-            sampled_examples: list[tuple[int, int, int]] = []
-            for i, comp_ids in enumerate(completion_token_ids):
-                if comp_ids is None:
-                    continue
-                retok_len = full_lens[i] - prompt_lens[i]
-                vllm_len = len(comp_ids)
-                if retok_len != vllm_len:
-                    mismatches += 1
-                    if len(sampled_examples) < 3:
-                        sampled_examples.append((i, retok_len, vllm_len))
-            if mismatches > 0:
-                logger.warning(
-                    "[Bug 2] retokenize/vllm token-id length mismatch on "
-                    f"{mismatches}/{len(completion_token_ids)} trajectories "
-                    f"(examples idx,retok,vllm: {sampled_examples})"
-                )
+        # Decide path. Native path requires (a) the feature flag and (b) every
+        # trajectory carrying a non-None completion_token_ids. Tolerate
+        # ``self.config`` being absent on minimal stubs used in tests by
+        # walking the attribute chain defensively.
+        rollout_cfg = getattr(getattr(self, "config", None), "rollout", None)
+        native_loss = bool(getattr(rollout_cfg, "use_vllm_native_loss", False))
+        all_have_ids = (
+            completion_token_ids is not None
+            and len(completion_token_ids) == len(prompt_lens)
+            and all(c is not None for c in completion_token_ids)
+        )
+        native_path = native_loss and all_have_ids
+
+        if native_path:
+            # Length budget comes directly from vLLM. We DO NOT retokenize the
+            # full text — the assembled input_ids in the forward pass will be
+            # ``prompt_ids ++ vllm_completion_ids`` with len == prompt_len +
+            # len(completion_ids).
+            full_lens = [pl + len(c) for pl, c in zip(prompt_lens, completion_token_ids)]
+        else:
+            # Legacy retokenize path: full_lens reflect what
+            # ``apply_chat_template + tokenize`` actually produces for the
+            # full text (which may differ from len(prompt) + len(completion)
+            # due to non-bijective BPE round-trips on the completion text).
+            full_enc = self.processor.tokenizer(
+                full_texts, padding=False, return_attention_mask=False
+            )
+            full_lens = [len(ids) for ids in full_enc["input_ids"]]
+
+            # Bug 2 diagnostic: when the rollout engine provided actual
+            # completion token ids, compare against the retokenized completion
+            # span. A mismatch means apply_chat_template + tokenize is producing
+            # a different label sequence than what vLLM actually sampled — the
+            # GRPO ratio is then computed against the wrong sequence, silently
+            # corrupting old/ref/new log-prob alignment. Setting
+            # ``use_vllm_native_loss=True`` makes the mismatch impossible by
+            # construction (which is why the warning only fires in the legacy
+            # path).
+            if completion_token_ids is not None and any(
+                c is not None for c in completion_token_ids
+            ):
+                mismatches = 0
+                sampled_examples: list[tuple[int, int, int]] = []
+                for i, comp_ids in enumerate(completion_token_ids):
+                    if comp_ids is None:
+                        continue
+                    retok_len = full_lens[i] - prompt_lens[i]
+                    vllm_len = len(comp_ids)
+                    if retok_len != vllm_len:
+                        mismatches += 1
+                        if len(sampled_examples) < 3:
+                            sampled_examples.append((i, retok_len, vllm_len))
+                if mismatches > 0:
+                    logger.warning(
+                        "[Bug 2] retokenize/vllm token-id length mismatch on "
+                        f"{mismatches}/{len(completion_token_ids)} trajectories "
+                        f"(examples idx,retok,vllm: {sampled_examples}). "
+                        "Set --use_vllm_native_loss to fix structurally."
+                    )
 
         return {
             "full_texts": full_texts,
+            "prompt_texts": prompt_texts,
             "prompt_lens": prompt_lens,
             "full_lens": full_lens,
             "images": images,
             "completion_token_ids": completion_token_ids,
+            "completion_logprobs": completion_logprobs,
+            "native_path": native_path,
         }
 
     def _forward_from_pretokenized_multi(
@@ -2135,20 +2319,32 @@ class SelfReflectionGRPOTrainer:
         import torch.nn.functional as F
 
         all_full_texts: list[str] = []
+        all_prompt_texts: list[str] = []
         all_prompt_lens: list[int] = []
         all_full_lens: list[int] = []
         all_imgs: list[Any] = []
+        all_completion_ids: list[Optional[list[int]]] = []
         set_sizes: list[int] = []
+        # Native path requires every input pretok to be flagged native_path.
+        # If any pretok is legacy, we fall back to the legacy retokenize
+        # forward for the whole batch (avoids mixing assembly modes inside
+        # one forward pass).
+        native_path = all(bool(pt.get("native_path", False)) for pt in pretok_list)
 
         for pretok in pretok_list:
             _end = mb_end if mb_end is not None else len(pretok["full_texts"])
             sl = slice(mb_start, _end)
-            texts = pretok["full_texts"][sl]
-            set_sizes.append(len(texts))
-            all_full_texts.extend(texts)
+            set_sizes.append(_end - mb_start)
+            all_full_texts.extend(pretok["full_texts"][sl])
+            all_prompt_texts.extend(pretok.get("prompt_texts", pretok["full_texts"])[sl])
             all_prompt_lens.extend(pretok["prompt_lens"][sl])
             all_full_lens.extend(pretok["full_lens"][sl])
             all_imgs.extend(pretok["images"][sl])
+            comp_ids_list = pretok.get("completion_token_ids")
+            if comp_ids_list is None:
+                all_completion_ids.extend([None] * (_end - mb_start))
+            else:
+                all_completion_ids.extend(comp_ids_list[sl])
 
         n = len(all_full_texts)
         has_image = any(img is not None for img in all_imgs)
@@ -2156,33 +2352,136 @@ class SelfReflectionGRPOTrainer:
         orig_side = self.processor.tokenizer.padding_side
         self.processor.tokenizer.padding_side = "left"
         try:
+            if native_path:
+                # Native path: feed the processor PROMPT text only (so
+                # ``input_ids`` covers the prompt with image tokens correctly
+                # placed and ``pixel_values`` / ``image_grid_thw`` are aligned
+                # with those positions). We then concatenate vLLM's actual
+                # sampled completion ids — bypassing the lossy retokenize on
+                # completion text (Bug 2 fix).
+                proc_text = all_prompt_texts
+            else:
+                proc_text = all_full_texts
             if has_image:
                 batch_inputs = self.processor(
-                    text=all_full_texts,
+                    text=proc_text,
                     images=all_imgs,
                     return_tensors="pt",
                     padding=True,
                 ).to(self.device)
             else:
                 batch_inputs = self.processor(
-                    text=all_full_texts,
+                    text=proc_text,
                     return_tensors="pt",
                     padding=True,
                 ).to(self.device)
         finally:
             self.processor.tokenizer.padding_side = orig_side
 
-        outputs = model(**batch_inputs, use_cache=False)
-        logits = outputs.logits  # (n, padded_seq_len, vocab_size)
-        del outputs  # free non-logit activations early
+        if native_path:
+            # The processor returned (n, max_prompt_len) input_ids, left-padded.
+            # We need to attach vLLM completion tokens to each row and re-pad.
+            #
+            # Procedure per trajectory i:
+            #   - take the unpadded prompt slice from input_ids[i]
+            #     (left-pad means real tokens sit at the right edge of the
+            #     padded row; the unpadded length equals
+            #     attention_mask[i].sum())
+            #   - append completion_token_ids[i]
+            #   - the resulting full sequence length is
+            #     unpadded_prompt_len + len(completion_ids)
+            # We then left-pad the batch back to the new max sequence length.
+            # ``pixel_values`` and ``image_grid_thw`` are unchanged — they
+            # depend on images, not on the text suffix.
+            prompt_input_ids = batch_inputs["input_ids"]
+            prompt_attn = batch_inputs["attention_mask"]
+            # Use the tokenizer's pad token, falling back to EOS only when
+            # the tokenizer explicitly aliases them (Qwen2.5-VL does:
+            # pad_token_id == eos_token_id == 151645). We never silently fall
+            # back to 0 — for Qwen that is the UNK token, and using it as
+            # padding would corrupt the embedding lookup at attention-masked
+            # positions that downstream layers may still touch (e.g., layernorm
+            # statistics over the unmasked-but-padded slots in some kernels).
+            pad_token_id = self.processor.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self.processor.tokenizer.eos_token_id
+            assert pad_token_id is not None, (
+                "Tokenizer has neither pad_token_id nor eos_token_id set — "
+                "cannot construct the native-path padded batch safely. "
+                "Either disable --use_vllm_native_loss or configure the "
+                "tokenizer with an explicit pad token."
+            )
 
-        total_len = batch_inputs["input_ids"].shape[1]
+            unpadded_prompt_lens = prompt_attn.sum(dim=1).tolist()
+            full_unpad_lens = [
+                int(unpadded_prompt_lens[i]) + len(all_completion_ids[i])
+                for i in range(n)
+            ]
+            max_full = max(full_unpad_lens) if full_unpad_lens else 0
+            batched_ids = torch.full(
+                (n, max_full),
+                fill_value=pad_token_id,
+                dtype=prompt_input_ids.dtype,
+                device=self.device,
+            )
+            batched_attn = torch.zeros(
+                (n, max_full), dtype=prompt_attn.dtype, device=self.device
+            )
+            for i in range(n):
+                pl = int(unpadded_prompt_lens[i])
+                cl = len(all_completion_ids[i])
+                seq_len = pl + cl
+                # Slice the unpadded prompt out of the left-padded row.
+                padded_prompt_width = prompt_input_ids.shape[1]
+                prompt_unpad = prompt_input_ids[i, padded_prompt_width - pl : padded_prompt_width]
+                completion_t = torch.tensor(
+                    all_completion_ids[i],
+                    dtype=prompt_input_ids.dtype,
+                    device=self.device,
+                )
+                seq = torch.cat([prompt_unpad, completion_t], dim=0)
+                # Left-pad the assembled sequence into the batch row.
+                batched_ids[i, max_full - seq_len :] = seq
+                batched_attn[i, max_full - seq_len :] = 1
+
+            forward_kwargs: dict[str, Any] = {
+                "input_ids": batched_ids,
+                "attention_mask": batched_attn,
+                "use_cache": False,
+            }
+            # Forward Qwen2.5-VL specific image tensors when present.
+            if "pixel_values" in batch_inputs:
+                forward_kwargs["pixel_values"] = batch_inputs["pixel_values"]
+            if "image_grid_thw" in batch_inputs:
+                forward_kwargs["image_grid_thw"] = batch_inputs["image_grid_thw"]
+            outputs = model(**forward_kwargs)
+            logits = outputs.logits  # (n, max_full, vocab_size)
+            del outputs
+
+            total_len = max_full
+            # Per-trajectory full_len is unpadded_prompt_len + completion_len.
+            effective_full_lens = full_unpad_lens
+            # Per-trajectory prompt_len is unpadded_prompt_len (image-token-
+            # expanded, NOT the text-only prompt_lens recorded in pretok —
+            # those are used only by the legacy path).
+            effective_prompt_lens = [int(x) for x in unpadded_prompt_lens]
+            # Use the assembled batch as the source of shift_labels.
+            label_source = batched_ids
+        else:
+            outputs = model(**batch_inputs, use_cache=False)
+            logits = outputs.logits  # (n, padded_seq_len, vocab_size)
+            del outputs  # free non-logit activations early
+            total_len = batch_inputs["input_ids"].shape[1]
+            effective_full_lens = all_full_lens
+            effective_prompt_lens = all_prompt_lens
+            label_source = batch_inputs["input_ids"]
+
         all_lps: list[Any] = []
         for i in range(n):
-            pad_len = total_len - all_full_lens[i]
-            real_prompt_start = pad_len + all_prompt_lens[i]
+            pad_len = total_len - effective_full_lens[i]
+            real_prompt_start = pad_len + effective_prompt_lens[i]
             shift_logits = logits[i, real_prompt_start - 1 : -1, :]
-            shift_labels = batch_inputs["input_ids"][i, real_prompt_start:]
+            shift_labels = label_source[i, real_prompt_start:]
             shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
             lp = F.log_softmax(shift_logits, dim=-1)
             token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)

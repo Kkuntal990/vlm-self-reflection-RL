@@ -290,6 +290,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--use_vllm_native_loss",
+        action="store_true",
+        help=(
+            "Close audit Bug 2 (vLLM ↔ HF retokenize mismatch). When set, "
+            "the HF forward pass that computes new_lp / ref_lp grades the "
+            "EXACT tokens vLLM sampled (manually assembles input_ids = "
+            "prompt_ids ++ vllm_completion_ids), and old_lp comes directly "
+            "from vLLM's sample-time logprobs (eliminates one HF forward "
+            "pass per step — ~12%% wall-clock speedup). Requires the rollout "
+            "engine to emit per-token logprobs (vLLM ≥ 0.12 with "
+            "SamplingParams(logprobs=1) — supplied automatically by the "
+            "VLLMRolloutEngine in this repo). When unset (default during "
+            "migration), the legacy retokenize-based path is used; the "
+            "[Bug 2] warning will continue to fire."
+        ),
+    )
+    parser.add_argument(
         "--single_turn_a1",
         action="store_true",
         help=(
@@ -453,6 +470,7 @@ def main() -> None:
         feedback_alpha=args.feedback_alpha,
         single_turn_a1=args.single_turn_a1,
         use_rescaled_rewards=args.use_rescaled_rewards,
+        use_vllm_native_loss=getattr(args, "use_vllm_native_loss", False),
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
