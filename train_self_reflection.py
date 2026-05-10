@@ -410,14 +410,19 @@ def main() -> None:
         w_verification_accuracy=args.w_verification_accuracy,
         w_format=args.w_fb_format,
     )
-    # Baseline weights reuse --w_a1_correctness / --w_a1_format. The
-    # multi-turn defaults (0.27 / 0.03) sum to 0.30, so a baseline run must
-    # override them via the YAML (e.g. 0.9 / 0.1) for the convex-combination
-    # warning to stay quiet.
-    baseline_weights = BaselineA1RewardWeights(
-        w_a1_correctness=args.w_a1_correctness,
-        w_a1_format=args.w_a1_format,
-    )
+    # Baseline weights reuse --w_a1_correctness / --w_a1_format only when
+    # actually running the single-turn-A1 baseline. For multi-turn runs the
+    # baseline-weights field is constructed but never consumed; in that case
+    # keep the dataclass defaults (0.9 / 0.1) so the convex-combination
+    # validator stays quiet rather than firing a misleading warning every
+    # multi-turn launch.
+    if args.single_turn_a1:
+        baseline_weights = BaselineA1RewardWeights(
+            w_a1_correctness=args.w_a1_correctness,
+            w_a1_format=args.w_a1_format,
+        )
+    else:
+        baseline_weights = BaselineA1RewardWeights()
     rollout_config = RolloutConfig(
         k_samples=args.k_samples,
         max_completion_length=args.max_completion_length,

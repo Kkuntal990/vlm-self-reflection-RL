@@ -224,7 +224,10 @@ def _compute_tag_format_reward(
 def _is_clean_atomic_answer(inner: str, answer_type: str) -> bool:
     """Whether `inner` is exactly an atomic answer with no extra content."""
     if answer_type == "mcq":
-        return bool(re.match(r"^\([A-Da-d]\)$", inner) or re.match(r"^[A-Da-d]\.?$", inner))
+        # Accept A-F (uppercase + lowercase). trajectory.py and the rest of
+        # the MCQ matching code already accept A-F; restricting the format
+        # reward to A-D zeroed format credit on E/F options.
+        return bool(re.match(r"^\([A-Fa-f]\)$", inner) or re.match(r"^[A-Fa-f]\.?$", inner))
     if answer_type == "yesno":
         return inner.lower().rstrip(".,;:") in ("yes", "no")
     if answer_type == "counting":

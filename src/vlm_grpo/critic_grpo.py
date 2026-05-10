@@ -844,6 +844,7 @@ class SelfReflectionGRPOTrainer:
                     break
 
             use_tags = self.config.rollout.use_think_answer_tags
+            use_answer_only = bool(getattr(self.config.rollout, "use_answer_tag_only", False))
             single_turn_a1 = bool(getattr(self.config.rollout, "single_turn_a1", False))
             # rollout result token-id / logprob lists may be empty when
             # rolling back to legacy rollout paths; default to None per turn
@@ -867,7 +868,9 @@ class SelfReflectionGRPOTrainer:
                 a2_lp_list,
             ):
                 a1_prompt = build_initial_answer_prompt(
-                    result.question, use_think_answer_tags=use_tags
+                    result.question,
+                    use_think_answer_tags=use_tags,
+                    use_answer_tag_only=use_answer_only,
                 )
                 a1_full = build_prompt_with_completion(a1_prompt, a1)
 
@@ -898,7 +901,11 @@ class SelfReflectionGRPOTrainer:
                     f1_full = build_prompt_with_completion(f1_prompt, f1)
 
                     a2_prompt = build_refiner_prompt(
-                        result.question, a1, f1, use_think_answer_tags=use_tags
+                        result.question,
+                        a1,
+                        f1,
+                        use_think_answer_tags=use_tags,
+                        use_answer_tag_only=use_answer_only,
                     )
                     a2_full = build_prompt_with_completion(a2_prompt, a2)
 
@@ -1217,8 +1224,14 @@ class SelfReflectionGRPOTrainer:
                     return None
             tensors: list[Any] = []
             for lp in lp_lists:
+                # Empty completion (immediate EOS / 0 tokens) → empty tensor.
+                # The trainer's per-token loss aggregation (sum / max_len)
+                # contributes exactly 0 for empty tensors, which is the
+                # correct no-op behaviour. Earlier code used a [0.0] sentinel,
+                # but that adds a fake "token" whose IS ratio = exp(new−0) is
+                # NOT a no-op and leaks A/max_len into the surrogate loss.
                 if len(lp) == 0:
-                    tensors.append(torch.tensor([0.0], device=self.device))
+                    tensors.append(torch.empty(0, dtype=torch.float32, device=self.device))
                 else:
                     tensors.append(torch.tensor(lp, dtype=torch.float32, device=self.device))
             return tensors
@@ -2286,8 +2299,16 @@ class SelfReflectionGRPOTrainer:
             shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
             lp = F.log_softmax(shift_logits, dim=-1)
             token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            # Empty completion → empty tensor (NOT a fake [0.0] token). The
+            # per-token loss / KL aggregations are `sum / max_len` which
+            # cleanly evaluates to 0 for an empty tensor. Earlier code used
+            # a [0.0] sentinel here, which paired with the matching sentinel
+            # in `_logprobs_to_tensors` to inject an `A/max_len` loss
+            # contribution for every empty trajectory. See bug audit Bug-2-b.
             all_lps.append(
-                token_lp if token_lp.numel() > 0 else torch.tensor([0.0], device=self.device)
+                token_lp
+                if token_lp.numel() > 0
+                else torch.empty(0, dtype=torch.float32, device=self.device)
             )
             # Accumulate per-token entropy only during training forward passes.
             # Token-weighted: each token contributes equally (matches TRL's
