@@ -109,16 +109,16 @@ When F1's verdict is calibrated, the full downstream signal flows. When the verd
 #### Optional reward modes
 
 - **Single-turn A1 baseline** (`--single_turn_a1`): F1+A2 are skipped entirely. Reward = `w_a1_correctness · R_a1_correct_01 + w_a1_format · R_a1_format_01`, both binary {0, 1}. Default 0.9 / 0.1 → total in [0, 1]. See `compute_baseline_a1_reward_breakdown`.
-- **Rescaled rewards** (`--use_rescaled_rewards`): each raw component above is rescaled to [0, 1] by `_to_unit(raw, lo, hi)` before weighting, so per-unit-weight gradient magnitude is equalised across components and `total_reward ∈ [0, 1]` for convex weights. The asymmetric downstream gate becomes `min(value, midpoint)`. Used by all recent `frozen-a1-mt-*` runs except `frozen-a1-mt-full-raw`. See `compute_response_reward_breakdown_01` / `compute_feedback_reward_breakdown_01`.
-- **Per-turn alpha override** (`--response_alpha`, `--feedback_alpha`): each defaults to `−1` meaning "use `--reward_shaping_alpha`". Set them independently to vary shaping strength on the response head vs feedback head.
-- **Improvement-only feedback** (`--use_improvement_reward`): `R_downstream = R(A2) − R(A1)` ∈ {−2, 0, +2}. Mutually exclusive with shaped α; α takes precedence when both are set.
+- **Rescaled rewards** (`--use_rescaled_rewards`): each raw component above is rescaled to [0, 1] by `_to_unit(raw, lo, hi)` before weighting, so per-unit-weight gradient magnitude is equalised across components and `total_reward ∈ [0, 1]` for convex weights. The asymmetric downstream gate becomes `min(value, midpoint)`. Used by all recent `frozen-a1-mt-*` runs except `frozen-a1-mt-full-raw`. See `compute_response_reward_breakdown_01` / `compute_feedback_reward_breakdown_01`. **Asymmetric α behaviour (footgun):** in the rescaled path the **response head ignores `--reward_shaping_alpha`** — `R_no_regression` uses the discrete `α=0` RR/RW/WR/WW table even when `α>0` is set. The **feedback head's `R_downstream` still uses the shaped formula**. This split is documented in the `compute_response_reward_breakdown_01` docstring but easy to miss when reading the YAML.
+- **Per-turn alpha override** (`--response_alpha`, `--feedback_alpha`): each defaults to `−1` meaning "use `--reward_shaping_alpha`". Set them independently to vary shaping strength on the response head vs feedback head. Same caveat as above: in rescaled mode the response head ignores its α.
 
 #### Implementation Details
 
 - **Loss**: Dr. GRPO⁷ (`--loss_type dr_grpo`) — removes std normalization to avoid low-variance reward bias. Vanilla GRPO (`--loss_type grpo`) is used by the recent `vanilla-warmup` / `vanilla-tokid` runs.
 - **KL estimator**: Schulman k3⁸ unbiased estimator `exp(Δ) − Δ − 1`, aggregated as `sum / max_completion_length` (Dr. GRPO–consistent), applied per-turn with independent `a1_kl_coeff`, `a2_kl_coeff`, `fb_kl_coeff`¹
+- **Empty-completion handling**: trajectories with 0 completion tokens (immediate EOS) emit empty tensors for both `old_lp` and `new_lp`, so the `sum / max_len` policy / KL aggregations cleanly evaluate to 0. Earlier code used a `[0.0]` sentinel that injected a spurious `A/max_len` term — fixed in commit `95f091b`.
 - **GDPO normalization** (`--use_gdpo_normalization`): per-component K-group advantage normalization (Liu 2026, arXiv:2601.05242), then weighted sum, then batch-renormalize. Equalises per-component gradient contribution. Off by default.
-- **DAPO** (`--use_dynamic_sampling`, `--clip_high`): drops zero-variance K-groups and uses asymmetric PPO clipping (paper: 0.28 upper, 0.2 lower). Independent of SSR.
+- **DAPO** (`--use_dynamic_sampling`, `--clip_high`): drops zero-variance K-groups and uses asymmetric PPO clipping (paper: 0.28 upper, 0.2 lower).
 
 #### References
 
@@ -153,7 +153,8 @@ baseline and the original DAPO/no-DAPO runs are kept around as references.
 
 | Job | YAML | Train mode | Notes |
 |---|---|---|---|
-| `frozen-a1-mt-vanilla-tokid` | `job-...-frozen-a1-mt-vanilla-tokid.yaml` | Vanilla GRPO + LR warmup + rescaled rewards, K=12, no DAPO | Latest. Plumbs vLLM completion `token_ids` end-to-end (audit Bug 2 fix). Reward = A2 corr/fmt + verification + fb_fmt only (no_regression and downstream zeroed). Branch `grpo-tokid-fix`. |
+| `single-fb-only` / `single-fb-only-gdpo` | `job-...-single-fb-only[-gdpo].yaml` | vLLM-native-loss, DAPO clip-higher 0.28, K=12, simplified rewards (A2 corr/fmt + F1 verification/fmt; A1, no_reg, downstream all zero) | Latest line. Single LoRA (no two-adapter), high A1-KL anchor (`a1_kl_coeff=700`, effective per-token KL ≈1.8e-3), resumed from pre-crash `checkpoint-250` via `--resume_from_checkpoint`. First runs to exercise the new vLLM-native-loss path end-to-end. **Caveat (metric audit):** with `w_no_reg=w_downstream=0`, A2's advantage depends only on K-group siblings — effectively a single-turn A2 trainer with a noisy F1 channel. |
+| `frozen-a1-mt-vanilla-tokid` | `job-...-frozen-a1-mt-vanilla-tokid.yaml` | Vanilla GRPO + LR warmup + rescaled rewards, K=12, no DAPO | Plumbs vLLM completion `token_ids` end-to-end (audit Bug 2 fix). Reward = A2 corr/fmt + verification + fb_fmt only (no_regression and downstream zeroed). Branch `grpo-tokid-fix`. |
 | `frozen-a1-mt-vanilla-warmup` | `job-...-frozen-a1-mt-vanilla-warmup.yaml` | Vanilla GRPO + LR warmup + rescaled rewards | Sanity baseline for `vanilla-tokid` before the token-id fix. Same simplified weights. |
 | `frozen-a1-mt-gdpo` / `gdpo-warmup` | `job-...-frozen-a1-mt-gdpo[-warmup].yaml` | GDPO per-component K-group advantage normalization (Liu 2026) + rescaled rewards | Tests whether per-component normalization fixes the response-vs-feedback gradient-magnitude imbalance. `gdpo-warmup` adds linear LR ramp to stabilise. |
 | `frozen-a1-mt-full-simple` | `job-...-frozen-a1-mt-full-simple.yaml` | Rescaled rewards, simplified weights (drop no_reg + downstream) | Isolates verification/correctness signals only. |
@@ -166,18 +167,26 @@ baseline and the original DAPO/no-DAPO runs are kept around as references.
 | `curriculum-no-dapo-k8` | `job-...-curriculum-no-dapo-k8.yaml` | Vanilla GRPO, K=8, full 9-task dataset | DAPO ablation reference. |
 
 **Active reward-weight regimes** (all multi-turn frozen-a1-mt runs share
-`α=1` for response and feedback shaping, `W_A1_*=0` since A1 is frozen,
-`W_A2_correctness=0.45`, `W_A2_format=0.05`):
+`α=1` shaping on the **feedback head**, `W_A1_*=0` since A1 is frozen,
+`W_A2_correctness=0.45`, `W_A2_format=0.05`. Note the rescaled response
+head ignores α — see "Optional reward modes" above):
 
 | Regime | YAMLs | W_no_reg | W_downstream | W_verification | W_fb_format | Sums |
 |---|---|---:|---:|---:|---:|---|
 | Full multi-turn | `frozen-a1-mt`, `r01`, `full`, `full-raw` | 0.50 | 0.45 | 0.45 | 0.10 | 1.00 / 1.00 |
-| Simplified (no shaping) | `full-simple`, `gdpo`, `gdpo-warmup`, `vanilla-warmup`, `vanilla-tokid` | 0.00 | 0.00 | 0.45 | 0.05 | 0.50 / 0.50 |
+| Simplified (no shaping) | `full-simple`, `gdpo`, `gdpo-warmup`, `vanilla-warmup`, `vanilla-tokid`, `single-fb-only`, `single-fb-only-gdpo` | 0.00 | 0.00 | 0.45 | 0.05 | 0.50 / 0.50 |
 
 The simplified regime intentionally lets the convex-combination warning fire
 (`_validate_weight_sum` logs at startup) — dropping `no_regression` and
 `downstream` keeps only the per-turn correctness/format signals plus F1
 verification.
+
+**Caveat (metric-audit finding):** the simplified regime makes A2's
+advantage depend only on A2 vs its K-group siblings; A1 enters only as
+a fixed prompt prefix that the K-group mean absorbs. Effectively a
+single-turn A2 trainer with a noisy F1 channel. The recent
+`single-fb-only*` distribution (`RR=61.6%, RW=3.5%, WR=3.9%, WW=31.0%`)
+shows A1/A2 are nearly independent — A2 adds ~zero lift over A1.
 
 ### Dataset: LIVR-v2 9K
 - **Build pipeline**: `k8s/job-build-livr-v2-sources.yaml` → `k8s/job-build-livr-v2.yaml`
@@ -227,6 +236,64 @@ for the literature precedent (LLaVA-Critic-R1, Critique-GRPO, CriticGPT).
   (Correspondence) that diverges from LIVR's Source/Target layout.
 - BLINK IQ_Test under `vlmevalkit` exact-matching is unscorable for verbose base
   predictions; needs the GPT judge enabled to extract a letter from prose.
+
+## Conceptual concerns and pivots (literature audit, 2026-05)
+
+A multi-agent audit reviewed whether **same-model in-loop self-critique
+under RL** has positive precedent at our scale for visual reasoning.
+The headline finding from the literature review:
+
+> The conceptual frame — a single 7B VLM, no external verifier, in-loop
+> critique-then-refine trained jointly with RL — is **not supported by
+> the 2024-2026 literature for visual reasoning**.
+
+Every comparable paper that ostensibly does "self-critique" has an
+asymmetry we do not have:
+
+- **SCoRe** (Kumar 2024, arXiv:2409.12917) — no critique step at all.
+  A2 conditions on A1 plus a fixed "try again" prompt; our F1 turn is
+  an **addition** not validated by SCoRe.
+- **Critique-GRPO** (Zhang 2025, arXiv:2506.03106) — critiques generated
+  by **GPT-4o (external teacher)**, not by the policy itself.
+- **CriticGPT** (McAleese 2024) — separate trained critic on
+  human-labeled inserted-bug data.
+- **LLaVA-Critic-R1** (Yu 2025, arXiv:2509.00676) — same model, but
+  self-critique applied only at **test time**, not in-loop during RL.
+- **CRITIC** (Gou 2023) — external tool grounding.
+- **Reflexion** (Shinn 2023) — external environmental success signal.
+
+The "honest F1 hurts A2" pattern we measure (v3 trajectory analysis:
+P(A2 right | A1 wrong, F1 honest) = 8.1% vs P(A2 right | A1 wrong,
+F1 sycophantic) = 15.2%, a **−7.1pp lift** from honest critique) is
+exactly the canonical **generation–verification-gap** failure mode
+predicted by:
+
+- Huang 2023, *LLMs Cannot Self-Correct Reasoning Yet* (arXiv:2310.01798)
+- Tyen 2023, *LLMs find errors but need location* (arXiv:2311.08516)
+- Stechly & Kambhampati 2024, *Self-Verification Limitations*
+  (arXiv:2402.08115)
+- Kambhampati et al. survey (arXiv:2406.01297)
+
+**Recommended pivots with positive published evidence at our scale:**
+
+1. **Critic-V** (Zhang CVPR 2025, arXiv:2411.18203) — separate
+   DPO-trained VLM critic + vanilla GRPO reasoner. Beats GPT-4V on
+   5/8 multimodal reasoning benchmarks. Most directly applicable.
+2. **DPO over (A1_wrong, A2_corrected) pairs** — drop F1 entirely,
+   mine self-correction pairs, train with DPO. Removes the
+   verdict-calibration problem (LLaVA-SCo, ISR-DPO, 2025).
+3. **Process Reward Models for visual reasoning** (PROPA
+   arXiv:2511.10279, VRPRM arXiv:2508.03556) — step-level supervision
+   instead of outcome + critique.
+4. **External LLM judge as F1** — use a stronger model (GPT-4o /
+   Claude-class) as the critic; matches Critique-GRPO's setting.
+5. **Two-stage SFT critic → RL** — supervise F1 on gold critique
+   pairs first, then RL only A1+A2. Industrial pattern from CriticGPT
+   and the original LLaVA-Critic.
+
+The literature consensus is that the **fix is architectural, not in
+the reward weights**. No amount of α / weight tuning closes the
+−7.1pp gap our 7B same-model setup produces.
 
 ## How to Run
 
@@ -325,11 +392,9 @@ Do NOT exec into training job pods for log analysis — use the helper pod which
 │   ├── utils.py                  # Seeding, env setup, normalized edit distance
 │   └── rewards/
 │       ├── composition.py        # Response + Feedback breakdowns; raw and [0,1]-rescaled paths; baseline A1
-│       ├── correctness.py        # A1 / A2 correctness rewards (binary / continuous), improvement reward
+│       ├── correctness.py        # A1 / A2 correctness rewards (binary / continuous)
 │       ├── deterministic.py      # MCQ / YesNo / numeric answer matching
-│       ├── feedback.py           # Downstream-aware reward (legacy entry; current path lives in composition.py)
 │       ├── judge_llm.py          # Optional LLM judge (enabled via VLM_USE_LLM_JUDGE=1)
-│       ├── stability.py          # No-regression reward (legacy entry; current values inlined in composition.py)
 │       └── verifier.py           # Top-level verify_answer dispatcher (deterministic + judge); DETERMINISTIC_TYPES set
 │
 ├── tests/                        # pytest suite
@@ -339,16 +404,12 @@ Do NOT exec into training job pods for log analysis — use the helper pod which
 │   ├── test_deterministic.py          # MCQ / YesNo / numeric matchers
 │   ├── test_difficulty_buckets.py     # Curriculum difficulty bucketing
 │   ├── test_dynamic_sampling.py       # DAPO dynamic-sampling K-group filter
-│   ├── test_feedback.py               # Downstream-aware reward
 │   ├── test_gdpo.py                   # Per-component K-group advantage normalization
 │   ├── test_init_from_checkpoint.py   # LoRA init without inheriting global_step + optimizer state restore
 │   ├── test_kl_term.py                # Per-turn Schulman k3 KL (sum/max_len aggregation)
 │   ├── test_lr_warmup.py              # Linear LR ramp 0 → peak over N steps
 │   ├── test_rescaled_rewards.py       # [0,1]-rescaled reward path
-│   ├── test_rollout.py                # RolloutConfig + batch rollout
-│   ├── test_stability.py              # No-regression reward
 │   ├── test_trajectory.py             # Tag parsing + answer/boxed extraction
-│   ├── test_two_traj_composition.py   # End-to-end response + feedback composition
 │   ├── test_verification.py           # F1 verdict accuracy reward
 │   ├── test_verifier.py               # Top-level verify_answer
 │   └── test_vllm_token_passthrough.py # vLLM completion token_ids audit
@@ -356,23 +417,27 @@ Do NOT exec into training job pods for log analysis — use the helper pod which
 ├── scripts/
 │   ├── analysis/
 │   │   └── difficulty_buckets.py        # Bucket samples by A1 pass-rate
-│   └── data/
-│       ├── blink_composite_rebuild.py   # Composite BLINK images to match training format
-│       ├── filter_by_difficulty.py      # Drop trivial / brick-wall buckets for curriculum
-│       ├── profile_difficulty_a1.py     # Run A1 over training data, log per-sample correctness
-│       └── livr_v2/                     # LIVR-v2 dataset builders
-│           ├── build_*.py               #   9 per-task builders
-│           ├── livr_common.py           #   shared composite/grid layout helpers
-│           ├── download_sources.py      #   pull source datasets (COCO, NIGHTS, ...)
-│           ├── dedup.py                 #   per-task dedup + cross-split overlap removal
-│           ├── merge.py                 #   merge 9 tasks into one JSONL
-│           ├── repair_counting_labels.py
-│           └── rerun_after_pipeline.sh
+│   ├── data/
+│   │   ├── blink_composite_rebuild.py   # Composite BLINK images to match training format
+│   │   ├── filter_by_difficulty.py      # Drop trivial / brick-wall buckets for curriculum
+│   │   ├── profile_difficulty_a1.py     # Run A1 over training data, log per-sample correctness
+│   │   └── livr_v2/                     # LIVR-v2 dataset builders
+│   │       ├── build_*.py               #   9 per-task builders
+│   │       ├── livr_common.py           #   shared composite/grid layout helpers
+│   │       ├── download_sources.py      #   pull source datasets (COCO, NIGHTS, ...)
+│   │       ├── dedup.py                 #   per-task dedup + cross-split overlap removal
+│   │       ├── merge.py                 #   merge 9 tasks into one JSONL
+│   │       ├── repair_counting_labels.py
+│   │       └── rerun_after_pipeline.sh
+│   └── verify/
+│       └── verify_vllm_native_loss.py   # Standalone vLLM⇄HF equivalence harness for the native-loss path
 │
 └── k8s/                                 # Kubernetes configs
     │
     ├── ─── Training (most recent first) ───
-    ├── job-qwen-grpo-livr-v2-9k-frozen-a1-mt-vanilla-tokid.yaml   # Latest: vanilla GRPO + token-id audit fix
+    ├── job-qwen-grpo-livr-v2-9k-single-fb-only.yaml               # Latest: vLLM-native-loss + high A1-KL anchor, single LoRA, simplified rewards
+    ├── job-qwen-grpo-livr-v2-9k-single-fb-only-gdpo.yaml          # GDPO arm of the single-fb-only A/B
+    ├── job-qwen-grpo-livr-v2-9k-frozen-a1-mt-vanilla-tokid.yaml   # Vanilla GRPO + token-id audit fix
     ├── job-qwen-grpo-livr-v2-9k-frozen-a1-mt-vanilla-warmup.yaml  # Vanilla GRPO + LR warmup
     ├── job-qwen-grpo-livr-v2-9k-frozen-a1-mt-gdpo.yaml            # GDPO per-component normalization
     ├── job-qwen-grpo-livr-v2-9k-frozen-a1-mt-gdpo-warmup.yaml     # GDPO + LR warmup
@@ -402,6 +467,7 @@ Do NOT exec into training job pods for log analysis — use the helper pod which
     │
     └── ─── Infrastructure ───
         ├── jupyter-1gpu-dev.yaml         # Helper pod for PVC reads + scratch scripts
+        ├── pod-vllm-native-verify.yaml   # A100 pod for running scripts/verify/verify_vllm_native_loss.py
         ├── multi_gpu.yaml                # Accelerate multi-GPU launch config
         ├── deepspeed_zero3.yaml          # Accelerate + DeepSpeed ZeRO-3 launch config
         └── ds_zero3_config.json          # DeepSpeed ZeRO-3 engine config
