@@ -2416,13 +2416,19 @@ class SelfReflectionGRPOTrainer:
 
         # Step 1+2: per-component K-group normalize, then weighted sum.
         # We compute per-group means/stds across the K dimension.
+        # NOTE: ``correction=0`` selects the population (ML) std rather than
+        # torch's default Bessel-corrected sample std (ddof=1). At our
+        # batch_size*K = 24, ddof=1 inflates the denominator ~2-4% vs ddof=0,
+        # which slightly dampens advantages. The GDPO paper (Liu 2026,
+        # arXiv:2601.05242) writes the per-group normalisation in standard
+        # population-variance form, so we match that.
         a_sum = torch.zeros(n_total, dtype=components.dtype, device=components.device)
         for gi in range(n_groups):
             start = gi * k
             end = start + k
             group = components[start:end]  # [k, n_components]
             mean = group.mean(dim=0, keepdim=True)  # [1, n_components]
-            std = group.std(dim=0, keepdim=True)  # [1, n_components]
+            std = group.std(dim=0, keepdim=True, correction=0)  # [1, n_components]
             # std=0 components: divide by eps would blow up; instead
             # zero out their normalized advantage cleanly.
             std_safe = torch.where(std > eps, std, torch.full_like(std, float("inf")))
@@ -2436,14 +2442,14 @@ class SelfReflectionGRPOTrainer:
             start = n_groups * k
             group = components[start:]
             mean = group.mean(dim=0, keepdim=True)
-            std = group.std(dim=0, keepdim=True)
+            std = group.std(dim=0, keepdim=True, correction=0)
             std_safe = torch.where(std > eps, std, torch.full_like(std, float("inf")))
             normalized = (group - mean) / (std_safe + eps)
             a_sum[start:] = (normalized * weights.unsqueeze(0)).sum(dim=1)
 
-        # Step 3: batch-wide renormalization
+        # Step 3: batch-wide renormalization. Same population-std convention.
         batch_mean = a_sum.mean()
-        batch_std = a_sum.std()
+        batch_std = a_sum.std(correction=0)
         if batch_std > eps:
             return (a_sum - batch_mean) / (batch_std + eps)
         return a_sum - batch_mean

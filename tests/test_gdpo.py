@@ -33,17 +33,20 @@ def _stub_trainer() -> SelfReflectionGRPOTrainer:
 def test_gdpo_hand_computed_example_k4_two_components():
     """Hand-computed Eq.4-7 for K=4, 2 components, equal weights.
 
-    Inputs:
-      a2_correct: [0, 1, 0, 1]   mean=0.5, std(unbiased ddof=1)=0.5774
-      a2_format:  [0, 0, 1, 1]   mean=0.5, std(unbiased ddof=1)=0.5774
+    Uses the GDPO paper convention: population std (ddof=0) at every level.
 
-    With torch.std default (Bessel correction, ddof=1):
-      A1 (a2_correct) ≈ [-0.866, +0.866, -0.866, +0.866]
-      A2 (a2_format)  ≈ [-0.866, -0.866, +0.866, +0.866]
-      A_sum (w=1,1)   ≈ [-1.732, 0, 0, +1.732]
+    Inputs:
+      a2_correct: [0, 1, 0, 1]   mean=0.5, std_pop=0.5
+      a2_format:  [0, 0, 1, 1]   mean=0.5, std_pop=0.5
+
+    Per-component normalize:
+      A1 (a2_correct) = (x - 0.5)/0.5 = [-1, +1, -1, +1]
+      A2 (a2_format)  = (x - 0.5)/0.5 = [-1, -1, +1, +1]
+      A_sum (w=1,1)   = [-2, 0, 0, +2]
+    Batch renormalize (ddof=0):
       batch_mean = 0
-      batch_std  ≈ 1.4142
-      Â           ≈ [-1.225, 0, 0, +1.225]
+      batch_std  = sqrt((4+0+0+4)/4) = sqrt(2) ≈ 1.4142
+      Â           = [-1.4142, 0, 0, +1.4142]
     """
     trainer = _stub_trainer()
     components = torch.tensor(
@@ -57,15 +60,7 @@ def test_gdpo_hand_computed_example_k4_two_components():
     weights = torch.tensor([1.0, 1.0])
 
     out = trainer._compute_gdpo_advantages(components, weights, k=4)
-
-    # Each per-component A_j has values approx ±1/std_unbiased ≈ ±√3 ≈ ±1.732
-    # Sum: [-2/std, 0, 0, +2/std] = [-3.464, 0, 0, +3.464] / 1 = ...
-    # Actually: per-component normalize A1 = (x - 0.5)/0.5774 with values
-    #   x=0 -> -0.866, x=1 -> +0.866. Sum gives ±1.732 / 0.
-    # Then batch_std of [-1.732, 0, 0, +1.732] = sqrt(2.0) * unbiased ddof=1
-    #   = sqrt(sum_of_squared_deviations / (N-1)) = sqrt(6/3) = sqrt(2) ≈ 1.4142
-    # final = [-1.732, 0, 0, +1.732] / 1.4142 ≈ [-1.225, 0, 0, +1.225]
-    expected = torch.tensor([-1.2247, 0.0, 0.0, 1.2247])
+    expected = torch.tensor([-1.4142, 0.0, 0.0, 1.4142])
     assert out.shape == expected.shape
     assert torch.allclose(out, expected, atol=1e-3), f"got {out}"
 
