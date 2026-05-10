@@ -1464,12 +1464,8 @@ class SelfReflectionGRPOTrainer:
             return tensors
 
         a1_old_from_vllm = _logprobs_to_tensors(a1_pretok)
-        a2_old_from_vllm = (
-            _logprobs_to_tensors(a2_pretok) if a2_pretok is not None else None
-        )
-        fb_old_from_vllm = (
-            _logprobs_to_tensors(f1_pretok) if f1_pretok is not None else None
-        )
+        a2_old_from_vllm = _logprobs_to_tensors(a2_pretok) if a2_pretok is not None else None
+        fb_old_from_vllm = _logprobs_to_tensors(f1_pretok) if f1_pretok is not None else None
 
         # Determine whether we can take the vLLM-logprob shortcut for old_lp.
         if single_turn_a1:
@@ -2270,11 +2266,7 @@ class SelfReflectionGRPOTrainer:
                 for i, ids in enumerate(completion_token_ids):
                     lps_i = completion_logprobs[i] if completion_logprobs else None
                     if lps_i is not None and len(lps_i) == len(ids):
-                        kept = [
-                            (t, lp)
-                            for t, lp in zip(ids, lps_i)
-                            if t not in vision_special_ids
-                        ]
+                        kept = [(t, lp) for t, lp in zip(ids, lps_i) if t not in vision_special_ids]
                         f_ids = [t for t, _ in kept]
                         f_lps = [lp for _, lp in kept]
                     else:
@@ -2480,8 +2472,7 @@ class SelfReflectionGRPOTrainer:
 
             unpadded_prompt_lens = prompt_attn.sum(dim=1).tolist()
             full_unpad_lens = [
-                int(unpadded_prompt_lens[i]) + len(all_completion_ids[i])
-                for i in range(n)
+                int(unpadded_prompt_lens[i]) + len(all_completion_ids[i]) for i in range(n)
             ]
             max_full = max(full_unpad_lens) if full_unpad_lens else 0
             batched_ids = torch.full(
@@ -2490,9 +2481,7 @@ class SelfReflectionGRPOTrainer:
                 dtype=prompt_input_ids.dtype,
                 device=self.device,
             )
-            batched_attn = torch.zeros(
-                (n, max_full), dtype=prompt_attn.dtype, device=self.device
-            )
+            batched_attn = torch.zeros((n, max_full), dtype=prompt_attn.dtype, device=self.device)
             for i in range(n):
                 pl = int(unpadded_prompt_lens[i])
                 cl = len(all_completion_ids[i])

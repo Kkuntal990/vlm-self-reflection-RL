@@ -84,9 +84,7 @@ class _FakeVLLMOutputInner:
             self.logprobs = None
         else:
             assert len(logprobs) == len(token_ids), "logprobs must align with token_ids"
-            self.logprobs = [
-                {tok: _FakeLogprob(lp)} for tok, lp in zip(token_ids, logprobs)
-            ]
+            self.logprobs = [{tok: _FakeLogprob(lp)} for tok, lp in zip(token_ids, logprobs)]
 
 
 class _FakeVLLMOutput:
@@ -202,9 +200,7 @@ class TestVLLMGenerateBatchReturnShape:
                 return [_FakeVLLMOutput("x", [7, 8], logprobs=None)]
 
         engine.llm = _NoLogprobsLLM()
-        out = engine.generate_batch(
-            prompts=["p"], images=[None], max_new_tokens=4, temperature=0.0
-        )
+        out = engine.generate_batch(prompts=["p"], images=[None], max_new_tokens=4, temperature=0.0)
         assert out[0]["logprobs"] == [0.0, 0.0]
 
 
@@ -451,9 +447,7 @@ class _StubProcessorWithVisionTokens:
             pad_token_id=0,
             eos_token_id=0,
             unk_token_id=151643,
-            convert_tokens_to_ids=lambda tok: self.QWEN25_VL_VISION_TOKENS.get(
-                tok, 151643
-            ),
+            convert_tokens_to_ids=lambda tok: self.QWEN25_VL_VISION_TOKENS.get(tok, 151643),
             __call__=lambda texts, padding=False, return_attention_mask=False: {
                 "input_ids": (
                     [list(range(len(t))) for t in texts]
@@ -554,9 +548,8 @@ class TestNativePathFiltersVisionTokens:
         # the dropped token, namely lp at position 2 = -0.3).
         assert pretok["completion_logprobs"][0] == [-0.1, -0.2, -0.4, -0.5]
         # full_lens should reflect the filtered length
-        assert (
-            pretok["full_lens"][0] - pretok["prompt_lens"][0]
-            == len(pretok["completion_token_ids"][0])
+        assert pretok["full_lens"][0] - pretok["prompt_lens"][0] == len(
+            pretok["completion_token_ids"][0]
         )
 
     def test_all_vision_tokens_filtered(self) -> None:
@@ -598,9 +591,7 @@ class TestNativePathFiltersVisionTokens:
     def test_legacy_path_does_not_filter(self) -> None:
         """When native loss is off, completions are used as text via the
         legacy retokenize path; we must NOT reach into them."""
-        trainer = _make_native_trainer_stub_with_vision_tokens(
-            use_vllm_native_loss=False
-        )
+        trainer = _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss=False)
         msgs = [
             [{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A"}],
         ]
@@ -729,9 +720,7 @@ def _make_native_trainer_stub():
 
     stub = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
     stub.processor = _StubProcessor()
-    stub.config = SimpleNamespace(
-        rollout=SimpleNamespace(use_vllm_native_loss=True)
-    )
+    stub.config = SimpleNamespace(rollout=SimpleNamespace(use_vllm_native_loss=True))
     # _forward_from_pretokenized_multi reads self.device for tensor placement.
     import torch
 
@@ -785,9 +774,7 @@ class TestNativeForwardLabelAlignment:
         assert pretok["native_path"] is True
 
         model = _IdentityLogitsModel(vocab_size=1024)
-        (lps_a1,) = trainer._forward_from_pretokenized_multi(
-            [pretok], model, mb_start=0, mb_end=2
-        )
+        (lps_a1,) = trainer._forward_from_pretokenized_multi([pretok], model, mb_start=0, mb_end=2)
         # One tensor per trajectory; tensor length equals completion length.
         assert len(lps_a1) == 2
         assert lps_a1[0].shape[0] == len(completion_ids[0])
@@ -836,9 +823,7 @@ class TestNativeForwardLabelAlignment:
 
         vocab = 1024
         model = _IdentityLogitsModel(vocab_size=vocab)
-        (lps_set,) = trainer._forward_from_pretokenized_multi(
-            [pretok], model, mb_start=0, mb_end=1
-        )
+        (lps_set,) = trainer._forward_from_pretokenized_multi([pretok], model, mb_start=0, mb_end=1)
         token_lp = lps_set[0]
 
         # Correct alignment: gathered logit = 0.0

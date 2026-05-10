@@ -39,7 +39,6 @@ from vlm_grpo.prompts import (
     build_refiner_prompt,
 )
 from vlm_grpo.rewards.composition import (
-    CriticRewardBreakdown,
     TrajectoryFeedbackRewardBreakdown,
     TrajectoryResponseRewardBreakdown,
     compute_baseline_a1_reward_breakdown,
@@ -71,150 +70,6 @@ def _get_feedback_alpha(config: Any) -> float:
     if a >= 0:
         return a
     return getattr(config, "reward_shaping_alpha", 0.0)
-
-
-# =============================================================================
-# Rollout Data Structures
-# =============================================================================
-
-
-@dataclass
-class CriticRolloutResult:
-    """Result of a full critic rollout for one sample.
-
-    Contains K feedback completions and their corresponding A2 completions,
-    along with pre-computed rewards for each (F1, A2) pair.
-
-    Attributes:
-        sample_index: Index in the original dataset
-        question: Visual question text
-        image_path: Path to the image
-        ground_truth: Ground truth answer
-        answer1: Initial answer (A1)
-        answer_type: Answer type ("mcq", "yesno", "numeric", "open")
-        choices: MCQ choices string
-        dataset_name: Source dataset name
-        a1_is_correct: Whether A1 was correct
-        feedbacks: K feedback texts from the critic
-        answer2s: K A2 texts (one per feedback)
-        rewards: K composite rewards
-        reward_breakdowns: K full reward breakdowns
-    """
-
-    sample_index: int
-    question: str
-    image_path: str
-    ground_truth: str
-    answer1: str
-    answer_type: str
-    choices: str
-    dataset_name: str
-    a1_is_correct: bool
-    feedbacks: list[str] = field(default_factory=list)
-    answer2s: list[str] = field(default_factory=list)
-    rewards: list[float] = field(default_factory=list)
-    reward_breakdowns: list[CriticRewardBreakdown] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
-
-
-@dataclass
-class RefinerRolloutResult:
-    """Result of a refiner rollout for one (sample, feedback) pair.
-
-    Contains K A2 completions for a fixed feedback.
-
-    Attributes:
-        sample_index: Index in the original dataset
-        question: Visual question text
-        image_path: Path to the image
-        ground_truth: Ground truth answer
-        answer1: Initial answer (A1)
-        feedback1: The fixed feedback used
-        answer_type: Answer type
-        choices: MCQ choices string
-        dataset_name: Source dataset name
-        a1_is_correct: Whether A1 was correct
-        answer2s: K A2 texts
-    """
-
-    sample_index: int
-    question: str
-    image_path: str
-    ground_truth: str
-    answer1: str
-    feedback1: str
-    answer_type: str
-    choices: str
-    dataset_name: str
-    a1_is_correct: bool
-    answer2s: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
-
-
-# =============================================================================
-# Rollout Metrics Computation
-# =============================================================================
-
-
-def compute_rollout_metrics(
-    results: list[CriticRolloutResult],
-) -> dict[str, float]:
-    """Compute aggregate metrics from rollout results.
-
-    Args:
-        results: List of CriticRolloutResult from generate_critic_rollout
-
-    Returns:
-        Dict of metric name -> value
-    """
-    if not results:
-        return {}
-
-    total_pairs = 0
-    rr_count = 0
-    rw_count = 0
-    wr_count = 0
-    ww_count = 0
-    reward_sum = 0.0
-    feedback_lengths = []
-
-    for r in results:
-        for bd in r.reward_breakdowns:
-            total_pairs += 1
-            reward_sum += bd.total_reward
-            feedback_lengths.append(len(bd.feedback_text.split()))
-
-            if r.a1_is_correct:
-                if bd.a2_correct is True:
-                    rr_count += 1
-                elif bd.a2_correct is False:
-                    rw_count += 1
-            else:
-                if bd.a2_correct is True:
-                    wr_count += 1
-                elif bd.a2_correct is False:
-                    ww_count += 1
-
-    n = max(total_pairs, 1)
-    metrics = {
-        "rollout/total_pairs": float(total_pairs),
-        "rollout/reward_mean": reward_sum / n,
-        "rollout/rr_rate": rr_count / n,
-        "rollout/rw_rate": rw_count / n,
-        "rollout/wr_rate": wr_count / n,
-        "rollout/ww_rate": ww_count / n,
-        "rollout/feedback_length_mean": (
-            sum(feedback_lengths) / len(feedback_lengths) if feedback_lengths else 0.0
-        ),
-    }
-
-    return metrics
 
 
 # =============================================================================
@@ -393,9 +248,9 @@ def _generate_batch_completions(
         # end-of-sequence) still get a real logprob — the trainer masks them
         # out via prompt_len/full_len bookkeeping, so emitting them here is
         # harmless.
-        token_log_probs = log_probs.gather(
-            -1, completion_ids_tensor.unsqueeze(-1)
-        ).squeeze(-1)  # (n, new_len)
+        token_log_probs = log_probs.gather(-1, completion_ids_tensor.unsqueeze(-1)).squeeze(
+            -1
+        )  # (n, new_len)
     else:
         token_log_probs = _torch.zeros(n, 0)
 
