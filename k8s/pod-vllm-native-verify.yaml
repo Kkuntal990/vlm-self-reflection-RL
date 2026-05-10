@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vlm-native-verify
+  labels:
+    app: vlm-native-verify
+    task: native-loss-equivalence-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: verifier
+    image: ghcr.io/kkuntal990/ms-swift-qwen:latest
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--no-browser", "--allow-root", "--NotebookApp.token=selfimprove"]
+
+    resources:
+      limits:
+        nvidia.com/a100: "2"
+        memory: "32Gi"
+        cpu: "4"
+        ephemeral-storage: "200Gi"
+      requests:
+        nvidia.com/a100: "2"
+        memory: "32Gi"
+        cpu: "4"
+        ephemeral-storage: "100Gi"
+
+    volumeMounts:
+    - name: outputs
+      mountPath: /outputs
+    - name: cache
+      mountPath: /cache
+    - name: dev-shm
+      mountPath: /dev/shm
+
+    env:
+    - name: HF_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: hf-token
+          key: token
+          optional: true
+    # HF cache on the PVC so the model persists across pod restarts. The
+    # eval pod gets evicted easily when both vLLM (modelscope) and HF
+    # caches go on ephemeral storage; pinning HF_HOME to /outputs/hf_cache
+    # makes the 17GB Qwen2.5-VL-7B download a one-time cost across the
+    # whole cluster lifetime.
+    - name: HF_HOME
+      value: "/outputs/hf_cache"
+    - name: TRANSFORMERS_CACHE
+      value: "/outputs/hf_cache/transformers"
+    - name: HF_DATASETS_CACHE
+      value: "/outputs/hf_cache/datasets"
+    # Force vLLM to use HuggingFace Hub instead of modelscope.cn (vLLM
+    # 0.11+ defaults to modelscope for Qwen models, which is very slow
+    # from US-side connectivity and was the immediate cause of the
+    # previous eval running 2+ hours then OOMing on storage).
+    - name: VLLM_USE_MODELSCOPE
+      value: "False"
+    - name: HF_HUB_ENABLE_HF_TRANSFER
+      value: "1"
+    - name: TORCH_HOME
+      value: "/cache/torch"
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: "expandable_segments:True"
+    - name: VLLM_NO_USAGE_STATS
+      value: "1"
+    - name: DO_NOT_TRACK
+      value: "1"
+
+  tolerations:
+    - key: nautilus.io/reservation
+      operator: Exists
+      effect: NoSchedule
+    - effect: NoSchedule
+      key: nautilus.io/hardware
+      operator: Equal
+      value: large-gpu
+    - effect: PreferNoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: nvidia.com/gpu.product
+            operator: In
+            values:
+            - NVIDIA-A100-SXM4-80GB
+
+  volumes:
+    - name: outputs
+      persistentVolumeClaim:
+        claimName: ms-swift-outputs-pvc
+    - name: cache
+      emptyDir:
+        sizeLimit: 50Gi
+    - name: dev-shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
