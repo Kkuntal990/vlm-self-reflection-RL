@@ -32,9 +32,7 @@ Usage:
 import json
 import logging
 import math
-import random
 import sys
-from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -170,17 +168,15 @@ class SelfReflectionTrainStepResult:
 
 
 # =============================================================================
-# Zero-variance group filtering (DAPO Dynamic Sampling + SSR shared helpers)
+# Zero-variance group filtering (DAPO Dynamic Sampling helper)
 # =============================================================================
 
 
 def _mean_abs_advantage(rewards: list[float]) -> float:
     """Compute mean(|(r - mean) / std|) over a K-group.
 
-    This is the per-trajectory aggregate of GRPO-normalized advantages |Â_j|
-    (VL-Rethinker Eq. 1) used as both:
-      - SSR buffer priority for active sampling, AND
-      - DAPO Dynamic Sampling drop predicate (==0 → degenerate group).
+    Used as the DAPO Dynamic Sampling drop predicate: ==0 ⇒ degenerate group
+    (advantage and gradient are exactly zero for every trajectory in the group).
 
     Returns 0.0 when std is below 1e-6 (all-equal rewards: gradient is
     mathematically zero, no point keeping or training on the group).
@@ -329,77 +325,6 @@ def _filter_kept_groups(
     return kept_results, kept_resp, kept_fb, kept_traj
 
 
-@dataclass
-class SSREntry:
-    """A stored K-group for Selective Sample Replay (VL-Rethinker).
-
-    Stores a complete rollout result for one sample (all K trajectories)
-    along with the sample dict needed to rebuild prompts and images.
-
-    Attributes:
-        sample: Original sample dict (question, image_path, etc.)
-        rollout_result: Full SelfReflectionRolloutResult with K trajectories
-        priority: Combined reward variance proxy for |Â| (response_std + feedback_std)
-    """
-
-    sample: dict
-    rollout_result: Any
-    priority: float
-
-
-class SSRBuffer:
-    """Selective Sample Replay buffer (VL-Rethinker, arXiv:2504.08837).
-
-    Stores K-groups with non-zero reward variance (on response OR feedback)
-    and replays them to replace zero-variance groups dropped from the current
-    batch, so the policy update only sees samples with non-zero advantage
-    (matching Alg. 1 L16 of the paper: D_train = D_effective ∪ D_from_buffer
-    with zero-advantage groups excluded from D_train).
-
-    Args:
-        max_size: Maximum K-groups in the buffer (FIFO eviction). Paper uses
-            ~len(batch)/2; our default 256 matches for typical 512-query batches.
-        alpha: Exponent for priority sampling (|priority|^alpha). Paper/repo
-            uses linear weighting (α=1).
-    """
-
-    def __init__(self, max_size: int = 256, alpha: float = 1.0) -> None:
-        self._buffer: deque[SSREntry] = deque(maxlen=max_size)
-        self.alpha = alpha
-
-    def store(self, entries: list[SSREntry]) -> None:
-        """Add non-zero-variance K-groups to the buffer.
-
-        Args:
-            entries: SSREntry objects to store
-        """
-        for entry in entries:
-            self._buffer.append(entry)
-
-    def sample(self, n: int) -> list[SSREntry]:
-        """Sample n entries WITH replacement, weighted by |priority|^alpha.
-
-        Matches the official VL-Rethinker replay_buffer.active_sampling
-        (np.random.choice with p=sel_p, with replacement).
-
-        Args:
-            n: Number of entries to sample
-
-        Returns:
-            List of sampled SSREntry objects (may contain duplicates)
-        """
-        if not self._buffer or n <= 0:
-            return []
-
-        buf_list = list(self._buffer)
-        weights = [abs(e.priority) ** self.alpha + 1e-6 for e in buf_list]
-        # random.choices is with-replacement weighted sampling
-        return random.choices(buf_list, weights=weights, k=n)
-
-    def __len__(self) -> int:
-        return len(self._buffer)
-
-
 class SelfReflectionGRPOTrainer:
     """GRPO trainer for full self-reflection with two separate reward signals.
 
@@ -470,38 +395,6 @@ class SelfReflectionGRPOTrainer:
         self.best_metric = float("inf") if config.early_stopping.mode == "min" else float("-inf")
         self.patience_counter = 0
 
-        # Stage II: load frozen LoRA adapter as a sibling on the same base
-        # model. Used as the KL reference distribution so that A1/F1 are
-        # anchored to their Stage-I shapes (not to the bare base model).
-        # Overhead: one extra LoRA weight set (~150 MB for r=64 on 7B).
-        # ref adapter has requires_grad=False and is never active during
-        # backward, so DDP/Accelerate do not need to know about it.
-        self._use_ref_adapter = False
-        ref_adapter_path = getattr(config, "ref_adapter_path", "")
-        if ref_adapter_path:
-            unwrapped = (
-                self.accelerator.unwrap_model(self.model)
-                if self.accelerator is not None
-                else self.model
-            )
-            unwrapped.load_adapter(ref_adapter_path, adapter_name="ref")
-            unwrapped.set_adapter("default")  # training adapter stays active
-            # Defensive freeze: guard against Stage-1 adapter_config.json
-            # having modules_to_save populated, which could leak
-            # requires_grad=True into ref adapter params. Ref adapter must
-            # never receive gradients.
-            n_frozen = 0
-            for name, p in unwrapped.named_parameters():
-                if ".ref." in name or name.endswith(".ref"):
-                    if p.requires_grad:
-                        p.requires_grad = False
-                        n_frozen += 1
-            self._use_ref_adapter = True
-            logger.info(
-                f"Loaded frozen ref adapter from {ref_adapter_path} "
-                f"(defensively froze {n_frozen} ref params)"
-            )
-
         # EMA tracking for wandb metrics (per-step values are too noisy with
         # only batch_size * K = 16 trajectories per step).
         self._ema: dict[str, float] = {}
@@ -510,18 +403,6 @@ class SelfReflectionGRPOTrainer:
         # Per-rank trajectory log for feedback preference data extraction.
         # Written by ALL ranks (not just rank 0), so all 9K questions are saved.
         self._trajectory_log = None
-
-        # Selective Sample Replay buffer (VL-Rethinker, arXiv:2504.08837).
-        # Default 256 matches SelfReflectionConfig.ssr_buffer_size — fallback
-        # bumped from 64 to keep the trainer behavior consistent when invoked
-        # with a config object that lacks the attribute (e.g., older callers).
-        if getattr(config, "use_ssr", False):
-            self.ssr_buffer: Optional[SSRBuffer] = SSRBuffer(
-                max_size=getattr(config, "ssr_buffer_size", 256),
-                alpha=getattr(config, "ssr_alpha", 1.0),
-            )
-        else:
-            self.ssr_buffer = None
 
     def _update_ema(self, key: str, value: float) -> float:
         """Update exponential moving average and return smoothed value."""
@@ -1060,37 +941,14 @@ class SelfReflectionGRPOTrainer:
         # reward variance on BOTH response and feedback heads has |Â|==0 on
         # both updates and contributes zero gradient — it is identified and
         # removed here so the policy update only sees groups with real signal.
-        # When SSR is on, dropped slots are refilled from the buffer (paper:
-        # D_train = D_effective ∪ D_from_buffer). When SSR is off but Dynamic
-        # Sampling is on, we simply train on the smaller effective batch
-        # (every gradient step is still non-degenerate; we just pay the
-        # rollout cost for some groups that don't contribute).
+        # We train on the smaller effective batch (every gradient step is
+        # still non-degenerate; we pay the rollout cost for some groups that
+        # don't contribute).
         use_ds = bool(getattr(self.config, "use_dynamic_sampling", False))
-        use_ssr = self.ssr_buffer is not None
-        if use_ds or use_ssr:
+        if use_ds:
             n_groups = len(rollout_results)
 
             kept_mask, n_dropped = _identify_zero_var_groups(rollout_results, k=k)
-
-            # SSR-only: store the non-degenerate groups (with their
-            # per-trajectory |Â| sum as priority) into the replay buffer
-            # before we discard the dropped ones.
-            if use_ssr:
-                new_entries: list[SSREntry] = []
-                for keep, result in zip(kept_mask, rollout_results):
-                    if not keep:
-                        continue
-                    resp_priority = _mean_abs_advantage(result.response_rewards)
-                    fb_priority = _mean_abs_advantage(result.feedback_rewards)
-                    sample_copy = {"image_path": result.image_path, "question": result.question}
-                    new_entries.append(
-                        SSREntry(
-                            sample=sample_copy,
-                            rollout_result=result,
-                            priority=resp_priority + fb_priority,
-                        )
-                    )
-                self.ssr_buffer.store(new_entries)
 
             # Filter all parallel arrays in lock-step.
             if n_dropped > 0:
@@ -1104,107 +962,9 @@ class SelfReflectionGRPOTrainer:
                         kept_mask=kept_mask,
                     )
                 )
-
-            # SSR refill: fill the dropped slots with buffer replays.
-            if use_ssr and n_dropped > 0 and len(self.ssr_buffer) > 0:
-                replayed = self.ssr_buffer.sample(n_dropped)
                 logger.info(
-                    f"  SSR: dropped {n_dropped}/{n_groups} zero-var groups, "
-                    f"replayed {len(replayed)} from buffer "
-                    f"(size={len(self.ssr_buffer)})"
+                    f"  DS: dropped {n_dropped}/{n_groups} zero-var groups, training on kept subset"
                 )
-                use_tags = self.config.rollout.use_think_answer_tags
-                single_turn_a1 = bool(getattr(self.config.rollout, "single_turn_a1", False))
-                for entry in replayed:
-                    rr = entry.rollout_result
-                    all_resp_rewards.extend(rr.response_rewards)
-                    all_fb_rewards.extend(rr.feedback_rewards)
-
-                    # Reload image from path (not stored PIL reference)
-                    from vlm_grpo.data import load_image_safe
-
-                    image = load_image_safe(entry.sample["image_path"])
-
-                    rep_a1_ids = rr.answer1_token_ids or [None] * len(rr.answer1s)
-                    rep_f1_ids = rr.feedback_token_ids or [None] * len(rr.answer1s)
-                    rep_a2_ids = rr.answer2_token_ids or [None] * len(rr.answer1s)
-                    rep_a1_lps = rr.answer1_logprobs or [None] * len(rr.answer1s)
-                    rep_f1_lps = rr.feedback_logprobs or [None] * len(rr.answer1s)
-                    rep_a2_lps = rr.answer2_logprobs or [None] * len(rr.answer1s)
-                    for (
-                        a1,
-                        f1,
-                        a2,
-                        a1_ids,
-                        f1_ids,
-                        a2_ids,
-                        a1_lps,
-                        f1_lps,
-                        a2_lps,
-                    ) in zip(
-                        rr.answer1s,
-                        rr.feedbacks,
-                        rr.answer2s,
-                        rep_a1_ids,
-                        rep_f1_ids,
-                        rep_a2_ids,
-                        rep_a1_lps,
-                        rep_f1_lps,
-                        rep_a2_lps,
-                    ):
-                        a1_prompt = build_initial_answer_prompt(
-                            rr.question, use_think_answer_tags=use_tags
-                        )
-                        a1_full = build_prompt_with_completion(a1_prompt, a1)
-                        if single_turn_a1:
-                            trajectory_data.append(
-                                {
-                                    "a1_full": a1_full,
-                                    "f1_full": None,
-                                    "a2_full": None,
-                                    "image": image,
-                                    "a1_completion_ids": a1_ids,
-                                    "f1_completion_ids": None,
-                                    "a2_completion_ids": None,
-                                    "a1_completion_logprobs": a1_lps,
-                                    "f1_completion_logprobs": None,
-                                    "a2_completion_logprobs": None,
-                                }
-                            )
-                            continue
-                        f1_prompt = build_critic_prompt(
-                            rr.question,
-                            a1,
-                            model_type=model_type,
-                        )
-                        f1_full = build_prompt_with_completion(f1_prompt, f1)
-                        a2_prompt = build_refiner_prompt(
-                            rr.question,
-                            a1,
-                            f1,
-                            use_think_answer_tags=use_tags,
-                        )
-                        a2_full = build_prompt_with_completion(a2_prompt, a2)
-                        trajectory_data.append(
-                            {
-                                "a1_full": a1_full,
-                                "f1_full": f1_full,
-                                "a2_full": a2_full,
-                                "image": image,
-                                "a1_completion_ids": a1_ids,
-                                "f1_completion_ids": f1_ids,
-                                "a2_completion_ids": a2_ids,
-                                "a1_completion_logprobs": a1_lps,
-                                "f1_completion_logprobs": f1_lps,
-                                "a2_completion_logprobs": a2_lps,
-                            }
-                        )
-
-                    rollout_results.append(rr)
-            elif n_dropped > 0:
-                tag = "DS+SSR" if use_ssr else "DS"
-                detail = "buffer empty — no replay yet" if use_ssr else "training on kept subset"
-                logger.info(f"  {tag}: dropped {n_dropped}/{n_groups} zero-var groups, {detail}")
 
             # If everything got dropped (no buffer to refill from), short-circuit
             # the policy update — there is no signal to learn from this batch.
@@ -1507,18 +1267,13 @@ class SelfReflectionGRPOTrainer:
 
             # Ref log-probs: only needed when kl_coeff > 0.
             # Three cases:
-            #   1. ref adapter loaded (Stage II): switch to "ref" adapter on the
-            #      same model; KL anchors against Stage-I distribution.
-            #   2. separate ref_model provided: use it directly (non-PEFT path).
-            #   3. neither: disable adapter layers; KL anchors against base model.
-            # The adapter state MUST be restored to "default" / enabled before
-            # leaving this block — downstream code (training forward, vLLM sync,
-            # checkpoint save) assumes "default" is active.
+            #   1. separate ref_model provided: use it directly (non-PEFT path).
+            #   2. otherwise: disable adapter layers; KL anchors against base model.
+            # The adapter state MUST be restored to enabled before leaving this
+            # block — downstream code (training forward, vLLM sync, checkpoint
+            # save) assumes "default" is active.
             if self.config.kl_coeff > 0:
-                if self._use_ref_adapter:
-                    unwrapped_model.set_adapter("ref")
-                    ref_m = unwrapped_model
-                elif self.ref_model is None:
+                if self.ref_model is None:
                     unwrapped_model.disable_adapter_layers()
                     ref_m = unwrapped_model
                 else:
@@ -1540,9 +1295,7 @@ class SelfReflectionGRPOTrainer:
                             ref_a2_lps_list += a2_lps
                             ref_fb_lps_list += fb_lps
                 finally:
-                    if self._use_ref_adapter:
-                        unwrapped_model.set_adapter("default")
-                    elif self.ref_model is None:
+                    if self.ref_model is None:
                         unwrapped_model.enable_adapter_layers()
 
             # Per-token log-probs: keep as lists of variable-length tensors.
@@ -1751,13 +1504,6 @@ class SelfReflectionGRPOTrainer:
                         freeze_a1 = getattr(self.config, "freeze_a1_steps", 0)
                         if freeze_a1 > 0 and self.global_step < freeze_a1:
                             a1_loss = torch.zeros_like(a1_loss)
-
-                        # Critic-first Stage I: freeze A2 policy loss so the
-                        # refiner stays put while F1 (+ optionally A1) learns.
-                        # A2 KL still flows against the reference distribution.
-                        freeze_a2 = getattr(self.config, "freeze_a2_steps", 0)
-                        if freeze_a2 > 0 and self.global_step < freeze_a2:
-                            a2_loss = torch.zeros_like(a2_loss)
 
                         traj_resp_loss = a1_loss + a2_loss
 
@@ -2726,16 +2472,7 @@ class SelfReflectionGRPOTrainer:
             if self.accelerator is not None
             else self.model
         )
-        # Defensive: ensure training adapter is active before save so that
-        # any active_adapter-sensitive code paths see "default".
-        # Critical: pass selected_adapters=["default"] so save_pretrained
-        # does NOT also write the frozen ref adapter. Default behavior
-        # iterates all adapters in peft_config, which would include "ref".
-        if self._use_ref_adapter:
-            unwrapped.set_adapter("default")
-            unwrapped.save_pretrained(path, selected_adapters=["default"])
-        else:
-            unwrapped.save_pretrained(path)
+        unwrapped.save_pretrained(path)
         self.processor.save_pretrained(path)
 
         # Save optimizer state for resume

@@ -132,12 +132,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
-    parser.add_argument(
-        "--rollout_batch_size",
-        type=int,
-        default=None,
-        help="Samples per rollout step. Defaults to per_device_train_batch_size if not set.",
-    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--kl_coeff", type=float, default=0.05)
@@ -146,19 +140,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fb_kl_coeff", type=float, default=1.0)
     parser.add_argument("--separate_turn_loss", action="store_true")
     parser.add_argument(
-        "--use_ssr", action="store_true", help="Enable Selective Sample Replay (VL-Rethinker)"
-    )
-    parser.add_argument("--ssr_buffer_size", type=int, default=256)
-    parser.add_argument("--ssr_alpha", type=float, default=1.0)
-    parser.add_argument(
         "--use_dynamic_sampling",
         action="store_true",
         help=(
             "Enable DAPO Dynamic Sampling (arXiv:2503.14476): drop K-groups with "
             "zero reward variance (advantage=0, gradient=0) before the policy "
-            "update. Independent of --use_ssr; when SSR is also on, dropped slots "
-            "are refilled from the SSR buffer, otherwise the update runs on the "
-            "smaller effective batch."
+            "update. The policy update then runs on the smaller effective batch."
         ),
     )
     parser.add_argument(
@@ -176,16 +163,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--use_improvement_reward",
-        action="store_true",
-        help="Use R(A2)-R(A1) improvement reward for F1 (Critique-GRPO)",
-    )
-    parser.add_argument(
         "--reward_shaping_alpha",
         type=float,
         default=0.0,
-        help="SCoRe-style shaped reward alpha: R(A2)+α*(R(A2)-R(A1)). "
-        "Overrides --use_improvement_reward when > 0.",
+        help="SCoRe-style shaped reward alpha: R(A2)+α*(R(A2)-R(A1)).",
     )
     parser.add_argument(
         "--response_alpha",
@@ -216,21 +197,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Freeze A1 policy loss for N steps (SCoRe Stage I)",
-    )
-    parser.add_argument(
-        "--freeze_a2_steps",
-        type=int,
-        default=0,
-        help="Freeze A2 policy loss for N steps (critic-first Stage I)",
-    )
-    parser.add_argument(
-        "--ref_adapter_path",
-        type=str,
-        default="",
-        help=(
-            "Path to a LoRA checkpoint to load as frozen KL reference "
-            "(critic-first Stage II). Empty = KL against base model."
-        ),
     )
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument(
@@ -461,10 +427,9 @@ def main() -> None:
         temperature=args.temperature,
         feedback_temperature=args.feedback_temperature,
         a2_temperature=args.a2_temperature,
-        batch_size=args.rollout_batch_size or args.per_device_train_batch_size,
+        batch_size=args.per_device_train_batch_size,
         use_think_answer_tags=args.use_think_answer_tags,
         use_answer_tag_only=getattr(args, "use_answer_tag_only", False),
-        use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
         response_alpha=args.response_alpha,
         feedback_alpha=args.feedback_alpha,
@@ -497,16 +462,10 @@ def main() -> None:
         a2_kl_coeff=args.a2_kl_coeff,
         fb_kl_coeff=args.fb_kl_coeff,
         separate_turn_loss=args.separate_turn_loss,
-        use_ssr=args.use_ssr,
-        ssr_buffer_size=args.ssr_buffer_size,
-        ssr_alpha=args.ssr_alpha,
         use_dynamic_sampling=args.use_dynamic_sampling,
         use_gdpo_normalization=args.use_gdpo_normalization,
-        use_improvement_reward=args.use_improvement_reward,
         reward_shaping_alpha=args.reward_shaping_alpha,
         freeze_a1_steps=args.freeze_a1_steps,
-        freeze_a2_steps=args.freeze_a2_steps,
-        ref_adapter_path=args.ref_adapter_path,
         clip_range=args.clip_range,
         clip_high=args.clip_high,
         loss_type=args.loss_type,

@@ -611,7 +611,6 @@ def compute_feedback_reward_breakdown(
     answer_type: str,
     choices: str,
     weights: Any,
-    use_improvement_reward: bool = False,
     reward_shaping_alpha: float = 0.0,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """Compute feedback reward for a single trajectory.
@@ -629,7 +628,6 @@ def compute_feedback_reward_breakdown(
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         choices: MCQ choices string (unused, kept for API compat)
         weights: FeedbackRewardWeights instance
-        use_improvement_reward: If True, use R(A2)-R(A1) instead of shaped downstream
         reward_shaping_alpha: SCoRe-style shaped reward alpha
 
     Returns:
@@ -662,12 +660,6 @@ def compute_feedback_reward_breakdown(
         r_a1 = 1.0 if a1_correct else -1.0
         r_a2 = 1.0 if a2_correct else -1.0
         r_downstream = r_a2 + reward_shaping_alpha * (r_a2 - r_a1)
-    elif use_improvement_reward:
-        # Improvement-based: R(A2) - R(A1) ∈ {-2, 0, +2}
-        # RR=0, WW=0, WR=+2, RW=-2. Group mean → 0, WR/RW dominate advantage.
-        r_a1 = 1.0 if a1_correct else -1.0
-        r_a2 = 1.0 if a2_correct else -1.0
-        r_downstream = r_a2 - r_a1
     elif answer_type in DETERMINISTIC_TYPES:
         if a1_correct:
             r_downstream = 1.0 if a2_correct else -1.5
@@ -922,7 +914,6 @@ def compute_downstream_01(
     a2_text: str,
     ground_truth: str,
     answer_type: str,
-    use_improvement_reward: bool = False,
     reward_shaping_alpha: float = 0.0,
     tolerance: float = 0.01,
 ) -> float:
@@ -933,14 +924,8 @@ def compute_downstream_01(
         Open-ended:    RR=+1, RW=-2,   WR=+2, WW=-1  (range [-2, +2])
 
     Empty F1 → 0.0 raw → rescaled to the lower-bound mid-value (treated as
-    "no contribution"). Then the same asymmetric gate (``min(raw, 0)`` when
-    verification fails) is applied BEFORE rescaling so the [0, 1] mapping
-    captures the gated value.
-
-    Improvement-mode and shaped-alpha modes are NOT supported by this
-    rescaler (their raw range varies with α). When either is set, falls
-    back to scaling the raw value with the open-ended bounds for safety
-    (the user's frozen-a1-mt-r01 run uses neither).
+    "no contribution"). The asymmetric gate (``min(raw, midpoint)`` when
+    verification fails) is applied by the caller after this rescaling.
 
     Args:
         feedback_text: F1 text (used for the empty-check short-circuit).
@@ -948,8 +933,6 @@ def compute_downstream_01(
         a2_text: Refined answer text.
         ground_truth: Ground truth answer.
         answer_type: Answer type.
-        use_improvement_reward: If True, returns ``(raw + 2) / 4`` to put
-            ``r_a2 - r_a1`` ∈ {-2, 0, +2} into [0, 1].
         reward_shaping_alpha: SCoRe-style alpha. If > 0, scales raw with the
             theoretical envelope ``[-1 - 2α, 1 + 2α]``.
         tolerance: Numeric tolerance for comparison.
@@ -978,12 +961,6 @@ def compute_downstream_01(
         lo = -1.0 - 2.0 * reward_shaping_alpha
         hi = 1.0 + 2.0 * reward_shaping_alpha
         return _to_unit(raw, lo, hi)
-
-    if use_improvement_reward:
-        r_a1 = 1.0 if a1_correct else -1.0
-        r_a2 = 1.0 if a2_correct else -1.0
-        raw = r_a2 - r_a1
-        return _to_unit(raw, -2.0, 2.0)
 
     if answer_type in DETERMINISTIC_TYPES:
         if a1_correct:
@@ -1156,7 +1133,6 @@ def compute_feedback_reward_breakdown_01(
     answer_type: str,
     choices: str,
     weights: Any,
-    use_improvement_reward: bool = False,
     reward_shaping_alpha: float = 0.0,
 ) -> TrajectoryFeedbackRewardBreakdown:
     """[0, 1]-rescaled feedback reward (parallel to
@@ -1179,7 +1155,6 @@ def compute_feedback_reward_breakdown_01(
         answer_type: Answer type.
         choices: MCQ choices string (unused, kept for API compat).
         weights: FeedbackRewardWeights instance.
-        use_improvement_reward: If True, use R(A2)-R(A1)-style downstream.
         reward_shaping_alpha: SCoRe-style shaped reward alpha.
 
     Returns:
@@ -1198,7 +1173,6 @@ def compute_feedback_reward_breakdown_01(
         a2_text=a2_text,
         ground_truth=ground_truth,
         answer_type=answer_type,
-        use_improvement_reward=use_improvement_reward,
         reward_shaping_alpha=reward_shaping_alpha,
     )
 

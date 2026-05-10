@@ -218,12 +218,3 @@ class TestConfigFlag:
 
         cfg = SelfReflectionConfig(use_dynamic_sampling=True)
         assert cfg.use_dynamic_sampling is True
-
-    def test_independent_of_use_ssr(self) -> None:
-        # Enabling DS must NOT enable SSR, and vice-versa.
-        from vlm_grpo.config import SelfReflectionConfig
-
-        cfg_ds = SelfReflectionConfig(use_dynamic_sampling=True)
-        assert cfg_ds.use_ssr is False
-        cfg_ssr = SelfReflectionConfig(use_ssr=True)
-        assert cfg_ssr.use_dynamic_sampling is False

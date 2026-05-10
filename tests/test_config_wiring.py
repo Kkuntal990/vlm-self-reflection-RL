@@ -169,11 +169,8 @@ def test_top_level_trainer_fields() -> None:
         loss_type="dr_grpo",
         num_inner_epochs=1,
         freeze_a1_steps=280,
-        freeze_a2_steps=0,
         separate_turn_loss=True,
         use_dynamic_sampling=True,
-        use_ssr=False,
-        ref_adapter_path="",
     )
     assert config.learning_rate == 2e-5
     assert config.clip_range == 0.2
@@ -181,11 +178,8 @@ def test_top_level_trainer_fields() -> None:
     assert config.loss_type == "dr_grpo"
     assert config.num_inner_epochs == 1
     assert config.freeze_a1_steps == 280
-    assert config.freeze_a2_steps == 0
     assert config.separate_turn_loss is True
     assert config.use_dynamic_sampling is True
-    assert config.use_ssr is False
-    assert config.ref_adapter_path == ""
 
 
 # =============================================================================
@@ -204,7 +198,6 @@ def test_rollout_dataclass_fields_for_rollout_engine() -> None:
         batch_size=2,
         use_think_answer_tags=True,
         use_answer_tag_only=False,
-        use_improvement_reward=False,
         reward_shaping_alpha=1.0,
         response_alpha=1.0,
         feedback_alpha=1.0,
@@ -215,7 +208,6 @@ def test_rollout_dataclass_fields_for_rollout_engine() -> None:
     assert rollout.feedback_temperature == 1.0
     assert rollout.a2_temperature == 0.7
     assert rollout.use_think_answer_tags is True
-    assert rollout.use_improvement_reward is False
     assert rollout.reward_shaping_alpha == 1.0
     assert rollout.response_alpha == 1.0
     assert rollout.feedback_alpha == 1.0

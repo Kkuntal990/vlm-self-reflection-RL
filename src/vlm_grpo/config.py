@@ -43,55 +43,6 @@ def _validate_weight_sum(name: str, weights: dict[str, float]) -> None:
 
 
 @dataclass
-class RewardWeights:
-    """Weights for reward composition.
-
-    reward = w_final * R_final_correct
-           + w_format * R_format
-           + w_rw * R_no_regression
-           + w_fb * R_feedback_calibration
-
-    Attributes:
-        w_final: Weight for final answer correctness
-        w_format: Weight for format compliance
-        w_rw: Weight for no-regression penalty (highest by default)
-        w_fb: Weight for feedback calibration
-    """
-
-    w_final: float = 1.0
-    w_format: float = 0.15
-    w_rw: float = 2.0
-    w_fb: float = 0.5
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
-
-    def to_list(self) -> list[float]:
-        """Return weights as ordered list for TRL reward_weights param."""
-        return [self.w_format, self.w_final, self.w_rw, self.w_fb]
-
-
-@dataclass
-class AnswerTypeConfig:
-    """Configuration for answer type detection and extraction.
-
-    Attributes:
-        mcq_pattern: Regex for MCQ answer extraction (single letter A-F)
-        yesno_pattern: Regex for yes/no answer extraction
-        numeric_tolerance: Relative tolerance for numeric comparison
-    """
-
-    mcq_pattern: str = r"\(?([A-F])\)?"
-    yesno_pattern: str = r"\b(yes|no)\b"
-    numeric_tolerance: float = 0.01
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
-
-
-@dataclass
 class RolloutConfig:
     """Configuration for K-sample rollout.
 
@@ -116,7 +67,6 @@ class RolloutConfig:
     batch_size: int = 8
     use_think_answer_tags: bool = False
     use_answer_tag_only: bool = False
-    use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
     response_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
     feedback_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
@@ -358,14 +308,10 @@ class SelfReflectionConfig:
     a2_kl_coeff: float = 1.0
     fb_kl_coeff: float = 1.0
     separate_turn_loss: bool = False
-    use_ssr: bool = False
-    ssr_buffer_size: int = 256
-    ssr_alpha: float = 1.0
     # DAPO Dynamic Sampling (arXiv:2503.14476 §3.2): drop K-groups whose
-    # rewards are zero-variance (advantage=0, gradient=0). Independent of
-    # use_ssr — when use_ssr=True the dropped slots are refilled from the
-    # SSR buffer; when SSR is off the policy update simply runs on the
-    # smaller effective batch (every gradient step is still non-degenerate).
+    # rewards are zero-variance (advantage=0, gradient=0). The policy update
+    # then runs on the smaller effective batch so every gradient step is
+    # non-degenerate.
     use_dynamic_sampling: bool = False
     # GDPO per-component K-group advantage normalization (Liu 2026,
     # arXiv:2601.05242). When True, _compute_group_advantages normalizes
@@ -374,14 +320,8 @@ class SelfReflectionConfig:
     # gradient contribution. When False, falls back to standard GRPO
     # group-normalize-then-sum behavior (bit-for-bit unchanged).
     use_gdpo_normalization: bool = False
-    use_improvement_reward: bool = False
     reward_shaping_alpha: float = 0.0
     freeze_a1_steps: int = 0
-    freeze_a2_steps: int = 0
-    # Path to a LoRA checkpoint to load as frozen reference adapter (Stage II).
-    # When set, KL is computed against that checkpoint's distribution instead of
-    # the base model. Empty string = use base model as ref (current behavior).
-    ref_adapter_path: str = ""
     clip_range: float = 0.2
     # DAPO Clip-Higher (arXiv:2503.14476 §3.1): asymmetric PPO clipping.
     # When > 0, upper clip becomes (1 + clip_high) instead of (1 + clip_range),
