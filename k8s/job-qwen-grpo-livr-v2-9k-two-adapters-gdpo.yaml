@@ -18,7 +18,7 @@ spec:
         command: ["bash", "-c"]
         args:
         - |
-          set -e
+          set -eo pipefail
           echo "========================================="
           echo "two-adapters-gdpo: Qwen2.5-VL-7B + Pattern A + per-turn LoRA routing"
           echo ""

@@ -160,3 +160,96 @@ def test_routing_is_optional_on_self_reflection_config() -> None:
     cfg = SelfReflectionConfig()
     assert cfg.adapter_routing.enabled is False
     assert cfg.adapter_routing.adapter_for_turn("a1") == "default"
+
+
+def test_apply_trainable_flags_sets_both_directions() -> None:
+    """``_apply_trainable_flags`` must FORCE requires_grad to match each spec.
+
+    Regression test for the first deploy of two-adapters: PEFT's
+    ``set_adapter("response")`` froze the "feedback" adapter's params at
+    ``requires_grad=False`` (it isn't the active adapter), and the original
+    ``_apply_trainable_flags`` only re-enforced the ``False`` side — it
+    never lifted ``requires_grad`` back to ``True`` for trainable specs.
+    The multi-adapter init then raised ``Adapter 'feedback' has 0
+    trainable params`` because every feedback leaf was still frozen.
+    """
+    import torch
+
+    from vlm_grpo.multi_adapter import _apply_trainable_flags
+
+    class _FakePeftModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.response_A = torch.nn.Parameter(torch.zeros(2))
+            self.response_B = torch.nn.Parameter(torch.zeros(2))
+            self.feedback_A = torch.nn.Parameter(torch.zeros(2))
+            self.feedback_B = torch.nn.Parameter(torch.zeros(2))
+
+        def named_parameters(self, prefix: str = "", recurse: bool = True):  # type: ignore[override]
+            yield "base.lora_A.response.weight", self.response_A
+            yield "base.lora_B.response.weight", self.response_B
+            yield "base.lora_A.feedback.weight", self.feedback_A
+            yield "base.lora_B.feedback.weight", self.feedback_B
+
+    model = _FakePeftModel()
+    # Simulate post-set_adapter("response"): response is True, feedback frozen.
+    model.response_A.requires_grad = True
+    model.response_B.requires_grad = True
+    model.feedback_A.requires_grad = False
+    model.feedback_B.requires_grad = False
+
+    routing = AdapterRoutingConfig(
+        turns={"a1": "response", "f1": "feedback", "a2": "response"},
+        adapters=[
+            AdapterSpec(name="response", trainable=True),
+            AdapterSpec(name="feedback", trainable=True),
+        ],
+    )
+
+    _apply_trainable_flags(model, routing)
+
+    assert model.response_A.requires_grad is True
+    assert model.response_B.requires_grad is True
+    assert model.feedback_A.requires_grad is True
+    assert model.feedback_B.requires_grad is True
+
+
+def test_apply_trainable_flags_freezes_non_trainable_specs() -> None:
+    """Frozen specs must end up with requires_grad=False even after PEFT toggles."""
+    import torch
+
+    from vlm_grpo.multi_adapter import _apply_trainable_flags
+
+    class _FakePeftModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.a1_A = torch.nn.Parameter(torch.zeros(2))
+            self.a1_B = torch.nn.Parameter(torch.zeros(2))
+            self.f1_A = torch.nn.Parameter(torch.zeros(2))
+            self.f1_B = torch.nn.Parameter(torch.zeros(2))
+
+        def named_parameters(self, prefix: str = "", recurse: bool = True):  # type: ignore[override]
+            yield "base.lora_A.a1_expert.weight", self.a1_A
+            yield "base.lora_B.a1_expert.weight", self.a1_B
+            yield "base.lora_A.f1_a2_expert.weight", self.f1_A
+            yield "base.lora_B.f1_a2_expert.weight", self.f1_B
+
+    model = _FakePeftModel()
+    # Simulate PEFT freshly setting all to True (e.g. add_adapter result).
+    for p in (model.a1_A, model.a1_B, model.f1_A, model.f1_B):
+        p.requires_grad = True
+
+    routing = AdapterRoutingConfig(
+        turns={"a1": "a1_expert", "f1": "f1_a2_expert", "a2": "f1_a2_expert"},
+        adapters=[
+            AdapterSpec(name="a1_expert", trainable=False),
+            AdapterSpec(name="f1_a2_expert", trainable=True),
+        ],
+    )
+
+    _apply_trainable_flags(model, routing)
+
+    assert model.a1_A.requires_grad is False
+    assert model.a1_B.requires_grad is False
+    assert model.f1_A.requires_grad is True
+    assert model.f1_B.requires_grad is True

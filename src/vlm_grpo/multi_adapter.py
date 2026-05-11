@@ -117,8 +117,6 @@ def init_multi_adapter_model(
                 f"({n_copied} LoRA tensors copied)"
             )
 
-    _apply_trainable_flags(model, routing)
-
     trainable = routing.trainable_adapter_names()
     if trainable:
         # First trainable adapter becomes the training default. The
@@ -126,6 +124,18 @@ def init_multi_adapter_model(
         # different turns route to different adapters.
         model.set_adapter(trainable[0])
         logger.info(f"Active adapter set to: {trainable[0]}")
+
+    # MUST run AFTER set_adapter — PEFT's set_adapter side-effects flip
+    # requires_grad=False on every adapter that isn't currently active,
+    # which would silently freeze trainable adapters that route to
+    # non-default turns (e.g. the "feedback" adapter in the
+    # response/feedback split). _apply_trainable_flags re-establishes
+    # requires_grad per spec so all spec.trainable=True adapters have
+    # grad-flowing leaves, even though only one is in active_adapters.
+    # Inactive adapters do not contribute to forward (PEFT's LoRA forward
+    # only mixes in active_adapters), so requires_grad=True on them is
+    # safe and necessary for per-turn routing to work.
+    _apply_trainable_flags(model, routing)
 
     _log_adapter_param_split(model, routing)
     return model
@@ -203,22 +213,34 @@ def _copy_adapter_weights(model: Any, src: str, dst: str) -> int:
 
 
 def _apply_trainable_flags(model: Any, routing: AdapterRoutingConfig) -> None:
-    """Enforce requires_grad per spec.
+    """Force ``requires_grad`` on every adapter LoRA param to match its spec.
 
-    PEFT's ``set_adapter`` already activates the matching adapter's params,
-    but a frozen spec must have ``requires_grad=False`` on its tensors
-    regardless of which adapter is currently active — otherwise a
-    spuriously-trainable frozen adapter could be picked up by the
-    optimizer.
+    Sets BOTH directions:
+      * ``spec.trainable=True``  → ``requires_grad=True``
+      * ``spec.trainable=False`` → ``requires_grad=False``
+
+    PEFT's ``add_adapter`` + ``set_adapter`` side-effects flip
+    ``requires_grad=False`` on every adapter that isn't the currently
+    active one. In single-trainable setups that is the right thing, but
+    multi-trainable setups (e.g. response + feedback both training) need
+    every trainable adapter's LoRA leaves to keep ``requires_grad=True``
+    so the per-turn routed forward + single backward can accumulate
+    gradients on whichever adapter contributed to a given turn's loss.
+    Inactive adapters do not contribute to forward — PEFT's LoRA forward
+    only mixes in ``active_adapters`` — so ``requires_grad=True`` on them
+    is safe; the leaves stay un-updated until they participate in a
+    routed forward.
     """
     name_to_trainable = {a.name: a.trainable for a in routing.adapters}
     for name, param in model.named_parameters():
+        if ".lora_A." not in name and ".lora_B." not in name:
+            continue
         for adapter_name, trainable in name_to_trainable.items():
             marker = f".{adapter_name}."
             if marker not in name:
                 continue
-            if not trainable and param.requires_grad:
-                param.requires_grad = False
+            if param.requires_grad != trainable:
+                param.requires_grad = trainable
             break  # one adapter match per param
 
 
