@@ -234,6 +234,174 @@ class BaselineA1RewardWeights:
 
 
 @dataclass
+class AdapterSpec:
+    """Specification for one LoRA adapter in the multi-adapter routing config.
+
+    Attributes:
+        name: Adapter handle used by PEFT's set_adapter / save_pretrained.
+            Must be unique within the routing config.
+        trainable: Whether this adapter receives gradients during training.
+            When False, it is loaded with requires_grad=False — used for a
+            frozen reference adapter (e.g. a frozen-A1 expert).
+        init_from_checkpoint: Filesystem path to a saved PEFT checkpoint
+            directory whose adapter_model.safetensors should be loaded as
+            this adapter's initial weights. When None, the adapter is added
+            from scratch using the run's LoraConfig (random LoRA init).
+        warm_start_from_adapter: Name of another adapter (already loaded)
+            whose weights should be copied into this one at init. Use when
+            you want two adapters to share a starting point but diverge
+            during training. Mutually exclusive with init_from_checkpoint.
+    """
+
+    name: str
+    trainable: bool = True
+    init_from_checkpoint: str | None = None
+    warm_start_from_adapter: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class AdapterRoutingConfig:
+    """Multi-adapter routing for per-turn LoRA selection.
+
+    The default empty-adapters list means single-adapter mode — the trainer
+    uses one adapter named "default" for all turns, matching the existing
+    behavior. To enable multi-adapter mode, supply at least one adapter spec
+    and a turn→adapter mapping.
+
+    Examples:
+        Single adapter (default):
+            AdapterRoutingConfig()
+        Response/feedback split (this config's primary use case):
+            AdapterRoutingConfig(
+                turns={"a1": "response", "f1": "feedback", "a2": "response"},
+                adapters=[
+                    AdapterSpec(name="response", trainable=True),
+                    AdapterSpec(name="feedback", trainable=True),
+                ],
+            )
+        Frozen-A1 + trainable F1+A2 (legacy two-adapter pattern):
+            AdapterRoutingConfig(
+                turns={"a1": "a1_expert", "f1": "f1_a2_expert", "a2": "f1_a2_expert"},
+                adapters=[
+                    AdapterSpec(name="a1_expert", trainable=False,
+                                init_from_checkpoint="/path/to/a1/ckpt"),
+                    AdapterSpec(name="f1_a2_expert", trainable=True,
+                                warm_start_from_adapter="a1_expert"),
+                ],
+            )
+
+    Attributes:
+        turns: Mapping of turn name ("a1" / "f1" / "a2") to adapter name.
+            Every turn must map to an adapter listed in ``adapters``. If
+            the dict is empty (single-adapter default), all turns implicitly
+            route to "default".
+        adapters: Ordered list of adapter specs. The first adapter is the
+            one PEFT wraps the base model with; subsequent adapters are
+            added via add_adapter. Empty list = single-adapter mode.
+    """
+
+    turns: dict[str, str] = field(default_factory=dict)
+    adapters: list[AdapterSpec] = field(default_factory=list)
+
+    @property
+    def enabled(self) -> bool:
+        """True when multi-adapter routing is active (>=1 spec provided)."""
+        return len(self.adapters) > 0
+
+    def adapter_for_turn(self, turn: str) -> str:
+        """Resolve the adapter name for a given turn.
+
+        Falls back to "default" when routing is disabled.
+        """
+        if not self.enabled:
+            return "default"
+        if turn not in self.turns:
+            raise KeyError(
+                f"Turn {turn!r} not in adapter_routing.turns (have: {sorted(self.turns)})"
+            )
+        return self.turns[turn]
+
+    def trainable_adapter_names(self) -> list[str]:
+        """List adapter names where trainable=True."""
+        return [a.name for a in self.adapters if a.trainable]
+
+    def validate(self) -> None:
+        """Sanity-check routing wiring; raises ValueError on misconfiguration.
+
+        Catches:
+          - duplicate adapter names
+          - turn→adapter references to unknown adapters
+          - missing routing for any of the three turns when routing is enabled
+          - mutually exclusive init_from_checkpoint + warm_start_from_adapter
+          - warm_start_from_adapter referencing an adapter that appears
+            after this one (must be loaded first)
+        """
+        if not self.enabled:
+            return
+        seen: set[str] = set()
+        for spec in self.adapters:
+            if spec.name in seen:
+                raise ValueError(f"Duplicate adapter name in routing: {spec.name}")
+            seen.add(spec.name)
+            if spec.init_from_checkpoint and spec.warm_start_from_adapter:
+                raise ValueError(
+                    f"Adapter {spec.name}: init_from_checkpoint and "
+                    "warm_start_from_adapter are mutually exclusive"
+                )
+            if spec.warm_start_from_adapter and spec.warm_start_from_adapter not in seen - {
+                spec.name
+            }:
+                raise ValueError(
+                    f"Adapter {spec.name} warm-starts from "
+                    f"{spec.warm_start_from_adapter!r}, which is not loaded "
+                    "before it. Reorder ``adapters`` so the source comes first."
+                )
+        required_turns = {"a1", "f1", "a2"}
+        missing = required_turns - set(self.turns)
+        if missing:
+            raise ValueError(f"adapter_routing.turns missing entries for: {sorted(missing)}")
+        unknown_targets = set(self.turns.values()) - seen
+        if unknown_targets:
+            raise ValueError(
+                f"adapter_routing.turns references unknown adapters: "
+                f"{sorted(unknown_targets)}. Defined adapters: {sorted(seen)}"
+            )
+        if not self.trainable_adapter_names():
+            raise ValueError(
+                "adapter_routing has no trainable adapter — at least one "
+                "spec must set trainable=True."
+            )
+
+    def to_dict(self) -> dict:
+        return {
+            "turns": dict(self.turns),
+            "adapters": [a.to_dict() for a in self.adapters],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AdapterRoutingConfig":
+        """Build from a plain dict (typically parsed from JSON).
+
+        Args:
+            data: ``{"turns": {...}, "adapters": [{"name": ..., ...}, ...]}``.
+
+        Returns:
+            Validated AdapterRoutingConfig. Empty / missing data → disabled.
+        """
+        if not data:
+            return cls()
+        adapters_raw = data.get("adapters", []) or []
+        adapters = [AdapterSpec(**spec) for spec in adapters_raw]
+        turns = dict(data.get("turns", {}) or {})
+        cfg = cls(turns=turns, adapters=adapters)
+        cfg.validate()
+        return cfg
+
+
+@dataclass
 class SelfReflectionConfig:
     """Top-level configuration for full self-reflection GRPO training.
 
@@ -288,6 +456,10 @@ class SelfReflectionConfig:
     response_weights: ResponseRewardWeights = field(default_factory=ResponseRewardWeights)
     feedback_weights: FeedbackRewardWeights = field(default_factory=FeedbackRewardWeights)
     baseline_weights: BaselineA1RewardWeights = field(default_factory=BaselineA1RewardWeights)
+    # Multi-adapter routing. Default (empty) = single-adapter mode using the
+    # PEFT "default" adapter for all turns. Populate adapters + turns to
+    # enable per-turn LoRA selection (e.g. separate response/feedback adapters).
+    adapter_routing: AdapterRoutingConfig = field(default_factory=AdapterRoutingConfig)
     learning_rate: float = 1e-5
     # Linear LR warmup: linearly ramps optimizer LR from 0 -> learning_rate
     # over the first N global_steps, then holds constant. 0 = no warmup

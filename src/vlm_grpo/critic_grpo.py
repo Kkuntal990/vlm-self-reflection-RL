@@ -404,6 +404,22 @@ class SelfReflectionGRPOTrainer:
         # Written by ALL ranks (not just rank 0), so all 9K questions are saved.
         self._trajectory_log = None
 
+        # Multi-adapter routing. Default = single-adapter mode using PEFT's
+        # "default" adapter for all turns (matches pre-routing behavior).
+        # When enabled, each turn (a1 / f1 / a2) is routed to a named
+        # adapter; the trainer switches adapters before generation and
+        # before each per-turn training forward pass.
+        from vlm_grpo.config import AdapterRoutingConfig
+
+        self._routing: AdapterRoutingConfig = getattr(
+            config, "adapter_routing", AdapterRoutingConfig()
+        )
+        if self._routing.enabled:
+            logger.info(
+                f"  Multi-adapter routing: turns={self._routing.turns}, "
+                f"trainable={self._routing.trainable_adapter_names()}"
+            )
+
     def _update_ema(self, key: str, value: float) -> float:
         """Update exponential moving average and return smoothed value."""
         if key not in self._ema:
@@ -734,7 +750,13 @@ class SelfReflectionGRPOTrainer:
         # wake for generation, generate, then sleep. The selective
         # wake_up(tags=...) pattern avoids the refcount crash that affects
         # wake_up() without tags (vLLM issues #20431, #16993, #24879).
-        if self.vllm_engine is not None:
+        #
+        # In multi-adapter mode, the per-turn ``adapter_callback`` (built
+        # below) performs the same wake/sync/wake cycle every time the
+        # active adapter changes, so the prelim sync here would just be
+        # overwritten by the callback's first invocation. Skip it.
+        adapter_callback = self._build_adapter_callback(gen_model)
+        if self.vllm_engine is not None and adapter_callback is None:
             self.vllm_engine.wake_up_for_weights()
             self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
             self.vllm_engine.wake_up_for_generation()
@@ -750,6 +772,7 @@ class SelfReflectionGRPOTrainer:
             model_type=model_type,
             vllm_engine=self.vllm_engine,
             baseline_weights=getattr(self.config, "baseline_weights", None),
+            adapter_callback=adapter_callback,
         )
         rollout_metrics = compute_self_reflection_metrics(rollout_results)
 
@@ -1261,18 +1284,23 @@ class SelfReflectionGRPOTrainer:
                     f"({n_traj} trajectories, skipped HF old-pass)"
                 )
             else:
-                # Combine a1/a2/f1 into one forward pass per mini-batch
-                # (3x fewer GPU ops vs separate passes)
+                # Single-adapter: combine a1/a2/f1 into one forward pass
+                # per mini-batch (3x fewer GPU ops). Multi-adapter mode
+                # groups by adapter inside _routed_forward_multi — turns
+                # that share an adapter still fuse into one forward.
                 for mb_s in range(0, n_traj, inner_mini_bs):
                     mb_e = min(mb_s + inner_mini_bs, n_traj)
                     if single_turn_a1:
-                        (a1_lps,) = self._forward_from_pretokenized_multi(
-                            [a1_pretok], unwrapped_model, mb_s, mb_e
+                        (a1_lps,) = self._routed_forward_multi(
+                            [("a1", a1_pretok)], unwrapped_model, mb_s, mb_e
                         )
                         old_a1_lps_list += a1_lps
                     else:
-                        a1_lps, a2_lps, fb_lps = self._forward_from_pretokenized_multi(
-                            [a1_pretok, a2_pretok, f1_pretok], unwrapped_model, mb_s, mb_e
+                        a1_lps, a2_lps, fb_lps = self._routed_forward_multi(
+                            [("a1", a1_pretok), ("a2", a2_pretok), ("f1", f1_pretok)],
+                            unwrapped_model,
+                            mb_s,
+                            mb_e,
                         )
                         old_a1_lps_list += a1_lps
                         old_a2_lps_list += a2_lps
@@ -1398,8 +1426,8 @@ class SelfReflectionGRPOTrainer:
                 mb_end = min(mb_start + inner_mini_bs, n_traj_inner)
 
                 if single_turn_a1:
-                    (mb_a1_lps,) = self._forward_from_pretokenized_multi(
-                        [a1_pretok],
+                    (mb_a1_lps,) = self._routed_forward_multi(
+                        [("a1", a1_pretok)],
                         inner_model,
                         mb_start,
                         mb_end,
@@ -1408,8 +1436,8 @@ class SelfReflectionGRPOTrainer:
                     mb_a2_lps = [None] * len(mb_a1_lps)
                     mb_fb_lps = [None] * len(mb_a1_lps)
                 else:
-                    mb_a1_lps, mb_a2_lps, mb_fb_lps = self._forward_from_pretokenized_multi(
-                        [a1_pretok, a2_pretok, f1_pretok],
+                    mb_a1_lps, mb_a2_lps, mb_fb_lps = self._routed_forward_multi(
+                        [("a1", a1_pretok), ("a2", a2_pretok), ("f1", f1_pretok)],
                         inner_model,
                         mb_start,
                         mb_end,
@@ -1805,6 +1833,7 @@ class SelfReflectionGRPOTrainer:
                 feedback_weights=self.config.feedback_weights,
                 device=str(self.device),
                 model_type=model_type,
+                adapter_callback=self._build_adapter_callback(gen_model),
             )
 
         if had_grad_ckpt:
@@ -2102,6 +2131,86 @@ class SelfReflectionGRPOTrainer:
             "completion_logprobs": completion_logprobs,
             "native_path": native_path,
         }
+
+    def _routed_forward_multi(
+        self,
+        turn_pretok_pairs: list[tuple[str, dict]],
+        model: Any,
+        mb_start: int = 0,
+        mb_end: Optional[int] = None,
+        accumulate_entropy: bool = False,
+    ) -> list[list[Any]]:
+        """Adapter-routing-aware wrapper around ``_forward_from_pretokenized_multi``.
+
+        In single-adapter mode (``self._routing.enabled == False``), behaves
+        exactly like calling the underlying multi-forward on the pretokenized
+        sets in the given order — one batched forward pass over all turns.
+
+        In multi-adapter mode, groups the input pairs by their resolved
+        adapter (``self._routing.adapter_for_turn(turn)``). For each group:
+          1. Activates the adapter via ``_set_active_adapter``.
+          2. Runs ``_forward_from_pretokenized_multi`` on the group's
+             pretoks (one fused forward per adapter, preserving the
+             batching efficiency when several turns share an adapter).
+          3. Stores results indexed back to the caller's original turn order.
+
+        This means a typical response/feedback split (A1+A2 share an
+        adapter, F1 has its own) collapses to 2 forward passes per
+        mini-batch — same per-token gradient semantics, only ~33% more
+        forward overhead than the fused single-adapter path.
+
+        After all groups have run, the active adapter is restored to the
+        first trainable spec in the routing list so any downstream code
+        that assumes a known active adapter (e.g. the next mini-batch)
+        sees a stable value.
+
+        Args:
+            turn_pretok_pairs: List of (turn_name, pretok_dict). turn_name
+                is one of ``"a1"`` / ``"f1"`` / ``"a2"``. Order is preserved
+                in the output.
+            model: Unwrapped PEFT model to run forward on.
+            mb_start: Mini-batch start index (passed through).
+            mb_end: Mini-batch end index (passed through).
+            accumulate_entropy: Whether the forward should accumulate
+                per-token entropy stats (passed through).
+
+        Returns:
+            List of len(turn_pretok_pairs) sublists — each sublist holds
+            the per-trajectory log-prob tensors for that input set, in
+            input order.
+        """
+        if not self._routing.enabled:
+            pretok_list = [pt for _, pt in turn_pretok_pairs]
+            return self._forward_from_pretokenized_multi(
+                pretok_list, model, mb_start, mb_end, accumulate_entropy
+            )
+
+        # Group input indices by resolved adapter, preserving input order
+        # within each group.
+        adapter_to_indices: dict[str, list[int]] = {}
+        for i, (turn, _) in enumerate(turn_pretok_pairs):
+            adapter = self._routing.adapter_for_turn(turn)
+            adapter_to_indices.setdefault(adapter, []).append(i)
+
+        results: list[Optional[list[Any]]] = [None] * len(turn_pretok_pairs)
+        for adapter_name, indices in adapter_to_indices.items():
+            self._set_active_adapter(model, adapter_name)
+            group_pretoks = [turn_pretok_pairs[i][1] for i in indices]
+            group_outs = self._forward_from_pretokenized_multi(
+                group_pretoks, model, mb_start, mb_end, accumulate_entropy
+            )
+            for local_idx, original_idx in enumerate(indices):
+                results[original_idx] = group_outs[local_idx]
+
+        # Restore active adapter to the first trainable so the next
+        # mini-batch / save / KL pass observes a stable starting point.
+        trainable = self._routing.trainable_adapter_names()
+        if trainable:
+            self._set_active_adapter(model, trainable[0])
+
+        # All slots filled by the group loop above; assert defensively.
+        assert all(r is not None for r in results), "routed forward lost a turn"
+        return results  # type: ignore[return-value]
 
     def _forward_from_pretokenized_multi(
         self,
@@ -2485,11 +2594,116 @@ class SelfReflectionGRPOTrainer:
 
         return self.patience_counter >= es_config.patience
 
+    def _set_active_adapter(self, peft_model: Any, name: str) -> None:
+        """Set the active adapter, preserving requires_grad on ALL trainable adapters.
+
+        PEFT's ``set_adapter`` flips ``requires_grad=False`` on every adapter
+        whose name is not in the active list. That is fine when there is a
+        single trainable adapter, but breaks multi-trainable setups: when we
+        switch from "response" to "feedback" to run the F1 forward, response
+        LoRA params would lose ``requires_grad`` and any pending backward
+        edges to them would be silently dropped — gradients on A1+A2 (computed
+        with response active) would not reach the response weights.
+
+        We work around this by calling PEFT's ``set_adapter`` and then
+        immediately re-enabling ``requires_grad=True`` on every LoRA param
+        belonging to an adapter that the routing config marks as trainable.
+        Inactive adapters still contribute zero gradient because PEFT's LoRA
+        ``forward`` only mixes in adapters listed in ``active_adapters`` —
+        ``requires_grad`` controls autograd leaf participation, not forward
+        inclusion. The end result: one optimizer can step every trainable
+        adapter even though we route per turn.
+
+        Args:
+            peft_model: Unwrapped PEFT model.
+            name: Target adapter name.
+        """
+        active = getattr(peft_model, "active_adapters", None)
+        if active and len(active) == 1 and active[0] == name:
+            return
+        peft_model.set_adapter(name)
+        if self._routing.enabled:
+            self._enforce_trainable_grad_flags(peft_model)
+
+    def _enforce_trainable_grad_flags(self, peft_model: Any) -> None:
+        """Re-apply ``requires_grad`` per ``self._routing`` adapter specs.
+
+        Called after every PEFT ``set_adapter`` to undo the side-effect that
+        flips requires_grad off on non-active adapters. Frozen adapters stay
+        frozen; trainable adapters stay trainable regardless of active state.
+        """
+        spec_by_name = {a.name: a for a in self._routing.adapters}
+        for pname, param in peft_model.named_parameters():
+            if ".lora_A." not in pname and ".lora_B." not in pname:
+                continue
+            for adapter_name, spec in spec_by_name.items():
+                if f".{adapter_name}." in pname:
+                    desired = spec.trainable
+                    if param.requires_grad != desired:
+                        param.requires_grad = desired
+                    break
+
+    def _build_adapter_callback(self, gen_model: Any) -> Any:
+        """Return a per-turn rollout callback for multi-adapter routing.
+
+        The callback is invoked by ``generate_self_reflection_rollout`` with
+        turn name ``"a1"`` / ``"f1"`` / ``"a2"`` before each batched
+        generation. It:
+
+          1. Resolves ``turn → adapter_name`` via ``self._routing.adapter_for_turn``.
+          2. No-ops when the target adapter is already active.
+          3. When a switch is needed: switches the HF adapter, then if vLLM
+             is colocated, sleeps it, wakes for weights, re-syncs the new
+             adapter's merged weights, and wakes for generation. The
+             sleep-then-resync pattern keeps vLLM's base weights in lock-step
+             with whichever adapter is currently routing.
+
+        The dual-merge cost (sleep + wake + resync) only fires when the
+        adapter actually changes — F1→A2 with both on the same adapter
+        skips the resync entirely.
+
+        Args:
+            gen_model: Unwrapped PEFT model used for generation.
+
+        Returns:
+            ``Callable[[str], None]`` suitable for the rollout's
+            ``adapter_callback`` parameter, or ``None`` when routing is
+            disabled.
+        """
+        if not self._routing.enabled:
+            return None
+
+        def callback(turn: str) -> None:
+            target = self._routing.adapter_for_turn(turn)
+            active = getattr(gen_model, "active_adapters", None)
+            if active and len(active) == 1 and active[0] == target:
+                return
+
+            self._set_active_adapter(gen_model, target)
+
+            if self.vllm_engine is None:
+                return
+
+            self.vllm_engine.sleep()
+            self.vllm_engine.wake_up_for_weights()
+            self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
+            self.vllm_engine.wake_up_for_generation()
+
+        return callback
+
     def _save_checkpoint(self, path: Path) -> None:
         """Save model checkpoint + optimizer state for resume.
 
+        Layout:
+          * Single-adapter mode: ``<path>/adapter_model.safetensors`` (PEFT
+            default for the "default" adapter). Backwards-compatible with
+            existing resume paths.
+          * Multi-adapter mode: each trainable adapter is saved under
+            ``<path>/<adapter_name>/``. Frozen adapters are skipped (their
+            weights live in their original ``init_from_checkpoint``).
+
         Args:
-            path: Directory to save to
+            path: Directory to save to.
         """
         import torch
 
@@ -2499,7 +2713,18 @@ class SelfReflectionGRPOTrainer:
             if self.accelerator is not None
             else self.model
         )
-        unwrapped.save_pretrained(path)
+
+        if self._routing.enabled:
+            trainable = self._routing.trainable_adapter_names()
+            # Restore active adapter to the first trainable so any
+            # active-adapter-sensitive code paths see a stable value after save.
+            unwrapped.save_pretrained(path, selected_adapters=trainable)
+            if trainable:
+                self._set_active_adapter(unwrapped, trainable[0])
+            logger.info(f"Saved checkpoint to {path} (multi-adapter: {trainable})")
+        else:
+            unwrapped.save_pretrained(path)
+            logger.info(f"Saved checkpoint to {path}")
         self.processor.save_pretrained(path)
 
         # Save optimizer state for resume
@@ -2508,5 +2733,3 @@ class SelfReflectionGRPOTrainer:
         config_path = path / "training_config.json"
         with open(config_path, "w") as f:
             json.dump(self.config.to_dict(), f, indent=2)
-
-        logger.info(f"Saved checkpoint to {path}")

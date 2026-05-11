@@ -277,6 +277,7 @@ def generate_self_reflection_rollout(
     model_type: str = "llava",
     vllm_engine: Any = None,
     baseline_weights: Any = None,
+    adapter_callback: Any = None,
 ) -> list[SelfReflectionRolloutResult]:
     """Generate K full self-reflection trajectories per sample.
 
@@ -300,6 +301,11 @@ def generate_self_reflection_rollout(
         device: Device for generation
         model_type: Model family ("llava" or "qwen2vl")
         vllm_engine: Optional VLLMRolloutEngine for faster generation
+        adapter_callback: Optional ``Callable[[str], None]`` invoked once
+            before each turn's batched generation with ``"a1"`` / ``"f1"`` /
+            ``"a2"``. Used by multi-adapter routing to switch the active
+            PEFT adapter (and re-sync vLLM weights) per turn. When None
+            (single-adapter mode), no adapter switching happens.
 
     Returns:
         List of SelfReflectionRolloutResult, one per sample
@@ -307,6 +313,8 @@ def generate_self_reflection_rollout(
     import torch
 
     if getattr(config, "single_turn_a1", False):
+        if adapter_callback is not None:
+            adapter_callback("a1")
         return generate_baseline_a1_rollout(
             model=model,
             processor=processor,
@@ -400,6 +408,8 @@ def generate_self_reflection_rollout(
                     model_type=model_type,
                 )
 
+            if adapter_callback is not None:
+                adapter_callback("a1")
             a1_outs = _gen(
                 a1_prompts,
                 imgs_expanded,
@@ -423,6 +433,8 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
+            if adapter_callback is not None:
+                adapter_callback("f1")
             f1_outs = _gen(
                 f1_prompts,
                 imgs_expanded,
@@ -448,6 +460,8 @@ def generate_self_reflection_rollout(
                 for i in range(chunk_size)
                 for j in range(k)
             ]
+            if adapter_callback is not None:
+                adapter_callback("a2")
             a2_outs = _gen(
                 a2_prompts,
                 imgs_expanded,

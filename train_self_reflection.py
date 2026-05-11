@@ -343,6 +343,24 @@ def parse_args() -> argparse.Namespace:
         "--resume_from_checkpoint.",
     )
 
+    # Multi-adapter routing
+    parser.add_argument(
+        "--adapter_routing_json",
+        type=str,
+        default="",
+        help=(
+            "JSON blob describing per-turn LoRA-adapter routing. When empty "
+            "(default), the trainer uses a single 'default' adapter for all "
+            "turns. Schema: "
+            '{"turns": {"a1": <name>, "f1": <name>, "a2": <name>}, '
+            '"adapters": [{"name": <str>, "trainable": <bool>, '
+            '"init_from_checkpoint": <path?>, '
+            '"warm_start_from_adapter": <name?>}]}. '
+            "Adapters are loaded in list order — sources for warm_start "
+            "must come before consumers."
+        ),
+    )
+
     # Debug
     parser.add_argument(
         "--debug", action="store_true", help="Print generated trajectories and reward breakdowns"
@@ -357,6 +375,84 @@ def parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+def _load_adapter_weights_from_checkpoint(
+    ckpt_path: "Path",  # noqa: F821 - forward ref, Path imported by callers
+    model: object,
+    accelerator: object,
+    adapter_routing: object,
+) -> None:
+    """Load LoRA adapter weights from a checkpoint into ``model`` in place.
+
+    Layout assumptions:
+      * Single-adapter mode: weights live at
+        ``<ckpt>/adapter_model.safetensors`` (legacy path; one adapter named
+        "default"). The file is loaded directly via set_peft_model_state_dict
+        on the "default" adapter.
+      * Multi-adapter mode: each trainable adapter lives under
+        ``<ckpt>/<adapter_name>/adapter_model.safetensors``. Each is loaded
+        in turn onto its matching named adapter.
+
+    Backwards-compat: in multi-adapter mode, if a per-adapter sub-directory
+    is missing but a top-level adapter_model.safetensors exists AND there is
+    exactly one trainable adapter, the top-level file is loaded into that
+    adapter. Helps when a single-adapter checkpoint is being repurposed as
+    init for a new multi-adapter run.
+
+    Args:
+        ckpt_path: Filesystem path to the checkpoint directory.
+        model: The (DDP-wrapped) PEFT model whose adapter weights are
+            being overwritten in place.
+        accelerator: HuggingFace Accelerator (for unwrap + device).
+        adapter_routing: AdapterRoutingConfig describing the adapters.
+
+    Raises:
+        FileNotFoundError: When no adapter file can be located for one or
+            more trainable adapters.
+    """
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    unwrapped = accelerator.unwrap_model(model)
+
+    if not adapter_routing.enabled:
+        adapter_file = ckpt_path / "adapter_model.safetensors"
+        if not adapter_file.exists():
+            raise FileNotFoundError(
+                f"Checkpoint {ckpt_path} is missing adapter_model.safetensors. "
+                "Aborting to avoid silently running on random LoRA init."
+            )
+        state = load_file(str(adapter_file), device=str(accelerator.device))
+        set_peft_model_state_dict(unwrapped, state)
+        logger.info(f"Loaded LoRA adapter from {adapter_file} (single-adapter mode)")
+        return
+
+    trainable_names = adapter_routing.trainable_adapter_names()
+    top_level_file = ckpt_path / "adapter_model.safetensors"
+    use_top_level_fallback = top_level_file.exists() and len(trainable_names) == 1
+
+    for adapter_name in trainable_names:
+        per_adapter_file = ckpt_path / adapter_name / "adapter_model.safetensors"
+        if per_adapter_file.exists():
+            src = per_adapter_file
+        elif use_top_level_fallback:
+            src = top_level_file
+            logger.info(
+                f"No {adapter_name}/ sub-dir at {ckpt_path}; falling back to "
+                f"top-level adapter_model.safetensors for the only trainable "
+                f"adapter."
+            )
+        else:
+            raise FileNotFoundError(
+                f"Checkpoint {ckpt_path} missing adapter weights for "
+                f"adapter {adapter_name!r}. Expected file at "
+                f"{per_adapter_file} (or a top-level adapter_model.safetensors "
+                "for single-trainable-adapter back-compat)."
+            )
+        state = load_file(str(src), device=str(accelerator.device))
+        set_peft_model_state_dict(unwrapped, state, adapter_name=adapter_name)
+        logger.info(f"Loaded LoRA adapter {adapter_name!r} from {src}")
 
 
 def main() -> None:
@@ -391,12 +487,32 @@ def main() -> None:
 
     # Build configs
     from vlm_grpo.config import (
+        AdapterRoutingConfig,
         BaselineA1RewardWeights,
         FeedbackRewardWeights,
         ResponseRewardWeights,
         RolloutConfig,
         SelfReflectionConfig,
     )
+
+    # Parse adapter routing JSON early so any schema errors surface before
+    # the heavy model load. Empty string → routing.enabled=False → single-
+    # adapter mode (unchanged behavior).
+    if args.adapter_routing_json.strip():
+        import json as _json
+
+        try:
+            routing_data = _json.loads(args.adapter_routing_json)
+        except _json.JSONDecodeError as e:
+            raise SystemExit(f"--adapter_routing_json is not valid JSON: {e}") from e
+        adapter_routing = AdapterRoutingConfig.from_dict(routing_data)
+        logger.info(
+            f"Multi-adapter routing enabled: turns={adapter_routing.turns}, "
+            f"adapters={[a.name for a in adapter_routing.adapters]} "
+            f"(trainable={adapter_routing.trainable_adapter_names()})"
+        )
+    else:
+        adapter_routing = AdapterRoutingConfig()
 
     response_weights = ResponseRewardWeights(
         w_a1_correctness=args.w_a1_correctness,
@@ -453,6 +569,7 @@ def main() -> None:
         response_weights=response_weights,
         feedback_weights=feedback_weights,
         baseline_weights=baseline_weights,
+        adapter_routing=adapter_routing,
         learning_rate=args.learning_rate,
         lr_warmup_steps=args.lr_warmup_steps,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -650,7 +767,13 @@ def main() -> None:
             target_modules=target_modules,
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(model, lora_config)
+
+        if adapter_routing.enabled:
+            from vlm_grpo.multi_adapter import init_multi_adapter_model
+
+            model = init_multi_adapter_model(model, lora_config, adapter_routing)
+        else:
+            model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
         logger.info(f"LoRA applied (r={args.lora_r}, alpha={args.lora_alpha})")
 
@@ -743,23 +866,14 @@ def main() -> None:
     if args.init_from_checkpoint and not args.resume_from_checkpoint:
         from pathlib import Path
 
-        from peft import set_peft_model_state_dict
-        from safetensors.torch import load_file
-
         init_path = Path(args.init_from_checkpoint)
         logger.info(f"Initializing from checkpoint weights at: {init_path}")
-
-        adapter_path = init_path / "adapter_model.safetensors"
-        if not adapter_path.exists():
-            raise FileNotFoundError(
-                f"--init_from_checkpoint requested from {init_path} but "
-                f"adapter_model.safetensors is missing. Aborting to avoid "
-                f"silently running on random LoRA init."
-            )
-        adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
-        unwrapped = accelerator.unwrap_model(model)
-        set_peft_model_state_dict(unwrapped, adapter_state)
-        logger.info(f"Loaded LoRA adapter from {adapter_path}")
+        _load_adapter_weights_from_checkpoint(
+            ckpt_path=init_path,
+            model=model,
+            accelerator=accelerator,
+            adapter_routing=adapter_routing,
+        )
 
         # Optimizer state: load if present so Adam moments carry over. Without
         # this, peak LR on cold Adam (m=v=0) destroys the starting weights.
@@ -798,21 +912,12 @@ def main() -> None:
         ckpt_path = Path(args.resume_from_checkpoint)
         logger.info(f"Resuming from checkpoint: {ckpt_path}")
 
-        # Load LoRA adapter weights into the PEFT model
-        from peft import set_peft_model_state_dict
-        from safetensors.torch import load_file
-
-        adapter_path = ckpt_path / "adapter_model.safetensors"
-        if not adapter_path.exists():
-            raise FileNotFoundError(
-                f"Resume requested from {ckpt_path} but "
-                f"adapter_model.safetensors is missing. Aborting to avoid "
-                f"silently running on random LoRA init."
-            )
-        adapter_state = load_file(str(adapter_path), device=str(accelerator.device))
-        unwrapped = accelerator.unwrap_model(model)
-        set_peft_model_state_dict(unwrapped, adapter_state)
-        logger.info(f"Loaded LoRA adapter from {adapter_path}")
+        _load_adapter_weights_from_checkpoint(
+            ckpt_path=ckpt_path,
+            model=model,
+            accelerator=accelerator,
+            adapter_routing=adapter_routing,
+        )
 
         # Load optimizer state if saved
         optim_path = ckpt_path / "optimizer.pt"
