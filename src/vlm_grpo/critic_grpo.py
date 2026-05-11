@@ -751,12 +751,20 @@ class SelfReflectionGRPOTrainer:
         # wake_up(tags=...) pattern avoids the refcount crash that affects
         # wake_up() without tags (vLLM issues #20431, #16993, #24879).
         #
-        # In multi-adapter mode, the per-turn ``adapter_callback`` (built
-        # below) performs the same wake/sync/wake cycle every time the
-        # active adapter changes, so the prelim sync here would just be
-        # overwritten by the callback's first invocation. Skip it.
+        # We ALWAYS run the wake+sync prelim here, regardless of routing
+        # mode: vLLM is in sleep state at step start (after last step's
+        # final sleep()), so generation cannot proceed without the wake.
+        # In multi-adapter mode we additionally activate the A1 adapter
+        # BEFORE the sync so the merged weights pushed to vLLM correspond
+        # to the head that will generate A1. The per-turn callback then
+        # handles subsequent F1 / A2 adapter switches (re-merging the
+        # newly-activated adapter into vLLM) — and no-ops when the next
+        # turn routes to the same adapter as the current one.
         adapter_callback = self._build_adapter_callback(gen_model)
-        if self.vllm_engine is not None and adapter_callback is None:
+        if self.vllm_engine is not None:
+            if self._routing.enabled:
+                a1_adapter = self._routing.adapter_for_turn("a1")
+                self._set_active_adapter(gen_model, a1_adapter)
             self.vllm_engine.wake_up_for_weights()
             self.vllm_engine.update_weights_from_peft(gen_model, accelerator=self.accelerator)
             self.vllm_engine.wake_up_for_generation()
