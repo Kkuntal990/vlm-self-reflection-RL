@@ -212,5 +212,91 @@ def test_weight_zero_component_has_no_effect():
     assert torch.allclose(out_zeroed, out_only, atol=1e-6)
 
 
+def test_gdpo_does_not_amplify_when_most_groups_degenerate():
+    """Regression for the production grad-explosion (commit 8ee2b27 run).
+
+    When the response head saturates, most K-groups have zero std on every
+    component → their ``a_sum`` is 0. The original batch-renorm divided
+    ``a_sum`` by the (now tiny) batch_std, amplifying the few surviving
+    non-degenerate groups by ~sqrt(N*K). With N*K=24 this is a ~5x
+    amplification; combined with the GDPO renormalize step it drove pre-clip
+    grad_norm to 50,000+ and ultimately caused the OOM.
+
+    The fix: when fewer than 2 K-groups are alive (std>0 on any component),
+    skip the batch-renorm step entirely and return mean-centered advantages.
+    Within-group GRPO signal still flows for the surviving group, but no
+    catastrophic amplification.
+    """
+    import torch
+
+    trainer = _stub_trainer()
+    k = 3
+    # 4 groups × k=3 trajectories × 1 component.
+    # Group 0: alive (real variance). Groups 1-3: degenerate (all equal).
+    components = torch.tensor(
+        [
+            [0.0],
+            [1.0],
+            [-1.0],
+            [0.5],
+            [0.5],
+            [0.5],
+            [0.5],
+            [0.5],
+            [0.5],
+            [0.5],
+            [0.5],
+            [0.5],
+        ]
+    )
+    weights = torch.tensor([1.0])
+    advantages = trainer._compute_gdpo_advantages(components, weights, k=k)
+
+    # After the fix the batch-renorm step is SKIPPED (only 1 alive group),
+    # so the surviving group's advantage stays in the ~±1.22 range,
+    # NOT amplified to ±5+ as it was in the buggy version.
+    alive_max = advantages[:k].abs().max().item()
+    assert alive_max < 3.0, (
+        f"GDPO advantage amplified to {alive_max} (>= 3.0) when only one of "
+        f"4 K-groups was alive. Production saw ~5x amplification before fix."
+    )
+    # Degenerate groups must still yield ~0 advantage.
+    deg_max = advantages[k:].abs().max().item()
+    assert deg_max < 1e-4, f"Degenerate groups got nonzero advantage {deg_max}"
+
+
+def test_gdpo_normal_batch_still_runs_batch_renorm():
+    """Sanity: when ≥2 groups are alive, batch-renorm still fires."""
+    import torch
+
+    trainer = _stub_trainer()
+    k = 3
+    # 4 groups, all alive with different spreads → batch_std well-defined.
+    components = torch.tensor(
+        [
+            [0.0],
+            [1.0],
+            [-1.0],
+            [0.0],
+            [2.0],
+            [-2.0],
+            [0.0],
+            [0.5],
+            [-0.5],
+            [0.0],
+            [1.5],
+            [-1.5],
+        ]
+    )
+    weights = torch.tensor([1.0])
+    advantages = trainer._compute_gdpo_advantages(components, weights, k=k)
+
+    # Batch-renorm should fire and produce ~unit-batch-std advantages.
+    batch_std = advantages.std(correction=0).item()
+    assert 0.5 < batch_std < 2.0, (
+        f"Batch-renorm not firing on healthy batch (batch_std={batch_std:.3f})"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

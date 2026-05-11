@@ -317,3 +317,48 @@ class TestAntonymContradiction:
             "open",
         )
         assert r.verdict == WRONG
+
+
+# =============================================================================
+# Pathological-float guards (regression for production OverflowError)
+# =============================================================================
+
+
+class TestNonFiniteFloatGuards:
+    """Regression: a diverged model can emit numeric tokens that parse to inf.
+
+    Production crash on 2026-05-11: after 8h of training, A1 text contained
+    a scientific-notation token whose ``float()`` overflowed to ``inf``.
+    The counting verifier then called ``int(float('inf'))`` which raises
+    ``OverflowError`` and brought down the training pod. The fix is a
+    ``math.isfinite`` guard in both the non-strict and strict-mode
+    counting verifier paths.
+    """
+
+    def test_extract_number_handles_inf_token(self) -> None:
+        """``_extract_number_from_sentence`` returns None on overflow tokens.
+
+        The number regex captures plain digit sequences (no scientific
+        notation). A digit string longer than ~308 chars overflows the
+        float64 range and ``float()`` returns ``inf``; the buggy code
+        then called ``int(inf)`` and crashed via ``OverflowError``.
+        """
+        from vlm_grpo.rewards.verifier import _extract_number_from_sentence
+
+        overflow_str = "1" + "0" * 310  # > 1.8e308 → float() returns inf
+        result = _extract_number_from_sentence(f"the count is {overflow_str}")
+        assert result is None, f"Expected None, got {result!r}"
+
+    def test_verify_answer_counting_inf_does_not_crash_nonstrict(self) -> None:
+        """Non-strict counting verifier survives inf in prediction."""
+        overflow_str = "1" + "0" * 310
+        r = verify_answer(f"the count is {overflow_str} birds", "3", "counting")
+        # Whatever the verdict, the call MUST NOT raise OverflowError.
+        assert r.verdict in (CORRECT, WRONG)
+
+    def test_verify_answer_counting_inf_does_not_crash_strict(self) -> None:
+        """Strict-mode counting verifier also survives inf in prediction."""
+        overflow_str = "1" + "0" * 310
+        r = verify_answer(f"<answer>{overflow_str}</answer>", "3", "counting", strict=True)
+        assert r.verdict == WRONG
+        assert r.parse_ok is False

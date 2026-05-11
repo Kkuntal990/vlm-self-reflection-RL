@@ -88,6 +88,7 @@ spec:
             --use_think_answer_tags \
             --use_rescaled_rewards \
             --use_gdpo_normalization \
+            --use_dynamic_sampling \
             --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.40} \
             --max_samples ${MAX_SAMPLES:-0} \
             --k_samples ${K_SAMPLES:-12} \
@@ -300,8 +301,13 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
+        # Defragment GPU memory. Especially important for the GDPO variant
+        # because the batch-renorm step concentrates gradient mass on
+        # whichever K-groups survive the response-head-saturation regime,
+        # leading to large optimizer state allocations. Avoids the
+        # fragmentation-driven OOM observed at ~7h45m on the first deploy.
         - name: PYTORCH_CUDA_ALLOC_CONF
-          value: ""
+          value: "expandable_segments:True"
         - name: NCCL_TIMEOUT
           value: "1800"
         - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC

@@ -454,7 +454,14 @@ class SelfReflectionGRPOTrainer:
         # Open per-rank trajectory log (all ranks write, not just rank 0)
         rank = getattr(self.accelerator, "process_index", 0) if self.accelerator else 0
         traj_log_path = output_dir / f"trajectories_rank{rank}.jsonl"
-        self._trajectory_log = open(traj_log_path, "a")
+        # ``buffering=1`` enables line buffering — every ``\n``-terminated
+        # write flushes to disk automatically. Without this, an OOM kill
+        # or pod eviction during a training forward pass can lose records
+        # that were written but still sat in the OS buffer. The trajectory
+        # log is the primary post-crash diagnostic artifact (carries every
+        # A1/F1/A2 with rewards), so durable-on-write matters more than
+        # the tiny per-write syscall overhead.
+        self._trajectory_log = open(traj_log_path, "a", buffering=1)
         logger.info(f"Trajectory log: {traj_log_path}")
 
         total_steps = math.ceil(len(train_dataset) / batch_size) * num_epochs
@@ -2540,32 +2547,68 @@ class SelfReflectionGRPOTrainer:
         # arXiv:2601.05242) writes the per-group normalisation in standard
         # population-variance form, so we match that.
         a_sum = torch.zeros(n_total, dtype=components.dtype, device=components.device)
+        # Track per-group non-degeneracy so the batch-renorm step can detect
+        # the "most groups dead, one alive" trap that caused the production
+        # grad explosion (see comment on the batch-renorm guard below).
+        # A group is "alive" if ANY component had non-zero std.
+        group_alive = torch.zeros(n_groups, dtype=torch.bool, device=components.device)
         for gi in range(n_groups):
             start = gi * k
             end = start + k
             group = components[start:end]  # [k, n_components]
             mean = group.mean(dim=0, keepdim=True)  # [1, n_components]
             std = group.std(dim=0, keepdim=True, correction=0)  # [1, n_components]
-            # std=0 components: divide by eps would blow up; instead
-            # zero out their normalized advantage cleanly.
-            std_safe = torch.where(std > eps, std, torch.full_like(std, float("inf")))
-            normalized = (group - mean) / (std_safe + eps)  # [k, n_components]
+            # std=0 components: clamp the denominator + mask via torch.where
+            # rather than materialising `float("inf")` in the graph. The
+            # outcome is numerically identical (normalized = 0 for the
+            # degenerate component) but stays well-behaved under
+            # torch.autograd.set_detect_anomaly debugging.
+            std_clamped = torch.clamp(std, min=eps)
+            normalized = torch.where(
+                std > eps,
+                (group - mean) / std_clamped,
+                torch.zeros_like(group),
+            )
             # Weighted sum across components
             a_sum[start:end] = (normalized * weights.unsqueeze(0)).sum(dim=1)
+            group_alive[gi] = (std > eps).any()
 
-        # Handle remainder (tail not divisible by k) — same pattern
+        # Handle remainder (tail not divisible by k) — same pattern. No
+        # alive-counting needed since the remainder is single-trajectory
+        # tail and feeds the same batch-renorm decision.
         remaining = n_total - n_groups * k
         if remaining > 0:
             start = n_groups * k
             group = components[start:]
             mean = group.mean(dim=0, keepdim=True)
             std = group.std(dim=0, keepdim=True, correction=0)
-            std_safe = torch.where(std > eps, std, torch.full_like(std, float("inf")))
-            normalized = (group - mean) / (std_safe + eps)
+            std_clamped = torch.clamp(std, min=eps)
+            normalized = torch.where(
+                std > eps,
+                (group - mean) / std_clamped,
+                torch.zeros_like(group),
+            )
             a_sum[start:] = (normalized * weights.unsqueeze(0)).sum(dim=1)
 
         # Step 3: batch-wide renormalization. Same population-std convention.
+        # GUARD against the GDPO grad-explosion trap discovered in production
+        # (commit 8ee2b27 run: feedback grad_norm spiked to 50k). When the
+        # response head saturates, almost every K-group has std=0 on every
+        # component → a_sum is mostly zero → batch_std collapses to the
+        # spread of the ONE surviving non-degenerate group divided by
+        # ~sqrt(N*K). Dividing the surviving group's a_sum by that tiny
+        # batch_std then amplifies its advantage by ~sqrt(n_groups / n_alive),
+        # driving grad_norm into the hundreds-to-thousands range.
+        #
+        # Fix: skip batch-renorm ONLY when (a) at least one group is
+        # degenerate AND (b) fewer than 2 groups survived. The healthy
+        # paths — all groups alive, or single-group batches — keep the
+        # original batch-renorm behaviour bit-for-bit.
+        n_alive = int(group_alive.sum().item())
+        n_dead = n_groups - n_alive
         batch_mean = a_sum.mean()
+        if n_dead > 0 and n_alive < 2:
+            return a_sum - batch_mean
         batch_std = a_sum.std(correction=0)
         if batch_std > eps:
             return (a_sum - batch_mean) / (batch_std + eps)
@@ -2639,13 +2682,17 @@ class SelfReflectionGRPOTrainer:
         Called after every PEFT ``set_adapter`` to undo the side-effect that
         flips requires_grad off on non-active adapters. Frozen adapters stay
         frozen; trainable adapters stay trainable regardless of active state.
+
+        Adapter-name matching is anchored by the LoRA-tensor prefix
+        (``lora_A.<name>.`` / ``lora_B.<name>.``) so adapter names that
+        share a substring prefix (e.g. ``"response"`` and ``"response_v2"``)
+        cannot cross-match and silently corrupt requires_grad on the wrong
+        adapter.
         """
         spec_by_name = {a.name: a for a in self._routing.adapters}
         for pname, param in peft_model.named_parameters():
-            if ".lora_A." not in pname and ".lora_B." not in pname:
-                continue
             for adapter_name, spec in spec_by_name.items():
-                if f".{adapter_name}." in pname:
+                if f".lora_A.{adapter_name}." in pname or f".lora_B.{adapter_name}." in pname:
                     desired = spec.trainable
                     if param.requires_grad != desired:
                         param.requires_grad = desired

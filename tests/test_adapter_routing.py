@@ -253,3 +253,59 @@ def test_apply_trainable_flags_freezes_non_trainable_specs() -> None:
     assert model.a1_B.requires_grad is False
     assert model.f1_A.requires_grad is True
     assert model.f1_B.requires_grad is True
+
+
+def test_apply_trainable_flags_anchored_match_avoids_prefix_collision() -> None:
+    """Adapter names that share a prefix must not cross-match.
+
+    Latent bug pre-fix: ``_apply_trainable_flags`` matched the adapter
+    marker as ``f".{adapter_name}."``. For routing with adapters
+    ``"response"`` (trainable) and ``"response_v2"`` (frozen), every
+    param of ``response_v2`` ALSO contains ``.response.`` as a substring
+    so the inner loop matched on the FIRST entry of the dict (``response``)
+    and silently flipped ``response_v2``'s requires_grad to True.
+
+    Fix: match anchored by the PEFT LoRA tensor prefix
+    (``.lora_A.<name>.`` / ``.lora_B.<name>.``) so ``response`` does
+    not appear inside the marker for ``response_v2``.
+    """
+    import torch
+
+    from vlm_grpo.multi_adapter import _apply_trainable_flags
+
+    class _FakePeftModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.r_A = torch.nn.Parameter(torch.zeros(2))
+            self.r_B = torch.nn.Parameter(torch.zeros(2))
+            self.r_v2_A = torch.nn.Parameter(torch.zeros(2))
+            self.r_v2_B = torch.nn.Parameter(torch.zeros(2))
+
+        def named_parameters(self, prefix: str = "", recurse: bool = True):  # type: ignore[override]
+            # PEFT-style names: ``base_model...lora_A.<adapter>.weight``
+            yield "base.lora_A.response.weight", self.r_A
+            yield "base.lora_B.response.weight", self.r_B
+            yield "base.lora_A.response_v2.weight", self.r_v2_A
+            yield "base.lora_B.response_v2.weight", self.r_v2_B
+
+    model = _FakePeftModel()
+    for p in (model.r_A, model.r_B, model.r_v2_A, model.r_v2_B):
+        p.requires_grad = True
+
+    routing = AdapterRoutingConfig(
+        turns={"a1": "response", "f1": "response_v2", "a2": "response"},
+        adapters=[
+            AdapterSpec(name="response", trainable=True),
+            AdapterSpec(name="response_v2", trainable=False),
+        ],
+    )
+
+    _apply_trainable_flags(model, routing)
+
+    # response (prefix of response_v2) must NOT freeze response_v2 by
+    # accident, and response_v2 (frozen spec) must NOT trickle False into
+    # response.
+    assert model.r_A.requires_grad is True
+    assert model.r_B.requires_grad is True
+    assert model.r_v2_A.requires_grad is False
+    assert model.r_v2_B.requires_grad is False

@@ -25,6 +25,7 @@ Usage:
 """
 
 import logging
+import math
 import re
 import string
 import sys
@@ -671,9 +672,7 @@ def _verify_counting(
                 score=None,
             )
         try:
-            pred_num: float | int = float(pred_str)
-            if pred_num == int(pred_num):
-                pred_num = int(pred_num)
+            pred_num_f = float(pred_str)
         except ValueError:
             return MatchResult(
                 answer_type="counting",
@@ -682,6 +681,18 @@ def _verify_counting(
                 extracted="",
                 score=None,
             )
+        # Guard against pathological floats (inf/-inf/nan) parsed from
+        # diverged model output (e.g. "1e9999"). int(inf) raises
+        # OverflowError; treat non-finite as un-parseable.
+        if not math.isfinite(pred_num_f):
+            return MatchResult(
+                answer_type="counting",
+                parse_ok=False,
+                verdict=WRONG,
+                extracted="",
+                score=None,
+            )
+        pred_num: float | int = int(pred_num_f) if pred_num_f == int(pred_num_f) else pred_num_f
         gt_num = _extract_number_from_sentence(ground_truth)
         if gt_num is None:
             return MatchResult(
@@ -807,9 +818,17 @@ def _extract_number_from_sentence(text: str) -> int | float | None:
         num_str = digit_matches[-1].group(0).replace(",", "")
         try:
             val = float(num_str)
-            return int(val) if val == int(val) else val
         except ValueError:
             pass
+        else:
+            # Guard against pathological model outputs (e.g. "1e9999")
+            # whose float() result is non-finite — int(inf) raises
+            # OverflowError, which previously crashed training after the
+            # policy drifted enough to emit such tokens. Treat non-finite
+            # as "no parseable number" so the caller falls through to the
+            # word-number path or a clean None.
+            if math.isfinite(val):
+                return int(val) if val == int(val) else val
 
     # Try word-numbers
     word_match = _WORD_NUM_PATTERN.search(text)

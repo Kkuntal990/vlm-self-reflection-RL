@@ -182,12 +182,18 @@ def _copy_adapter_weights(model: Any, src: str, dst: str) -> int:
     src_params: dict[str, torch.nn.Parameter] = {}
     dst_params: dict[str, torch.nn.Parameter] = {}
 
+    # Anchor matching by the LoRA-tensor prefix so adapter names that
+    # share a substring (e.g. ``"response"`` and ``"response_v2"``) cannot
+    # cross-match. The key used for src/dst pairing strips ``lora_<X>.<adapter>``
+    # → ``lora_<X>.__ADAPTER__`` so identical layers in the two adapters align.
     for name, param in model.named_parameters():
         for adapter, bucket in ((src, src_params), (dst, dst_params)):
-            marker = f".{adapter}."
-            if marker in name and (".lora_A." in name or ".lora_B." in name):
-                key = name.replace(marker, ".__ADAPTER__.")
-                bucket[key] = param
+            for projection in (".lora_A.", ".lora_B."):
+                marker = f"{projection}{adapter}."
+                if marker in name:
+                    key = name.replace(marker, f"{projection}__ADAPTER__.")
+                    bucket[key] = param
+                    break
 
     n_copied = 0
     with torch.no_grad():
@@ -232,16 +238,15 @@ def _apply_trainable_flags(model: Any, routing: AdapterRoutingConfig) -> None:
     routed forward.
     """
     name_to_trainable = {a.name: a.trainable for a in routing.adapters}
+    # Anchor matching by the LoRA-tensor prefix so adapter names that share
+    # a substring prefix (e.g. ``"response"`` vs ``"response_v2"``) cannot
+    # cross-match and silently swap requires_grad.
     for name, param in model.named_parameters():
-        if ".lora_A." not in name and ".lora_B." not in name:
-            continue
         for adapter_name, trainable in name_to_trainable.items():
-            marker = f".{adapter_name}."
-            if marker not in name:
-                continue
-            if param.requires_grad != trainable:
-                param.requires_grad = trainable
-            break  # one adapter match per param
+            if f".lora_A.{adapter_name}." in name or f".lora_B.{adapter_name}." in name:
+                if param.requires_grad != trainable:
+                    param.requires_grad = trainable
+                break
 
 
 def _log_adapter_param_split(model: Any, routing: AdapterRoutingConfig) -> None:

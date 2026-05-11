@@ -88,6 +88,7 @@ spec:
             --use_vllm_native_loss \
             --use_think_answer_tags \
             --use_rescaled_rewards \
+            --use_dynamic_sampling \
             --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.40} \
             --max_samples ${MAX_SAMPLES:-0} \
             --k_samples ${K_SAMPLES:-12} \
@@ -308,8 +309,15 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
+        # Defragment GPU memory and absorb the 3x merge_adapter spike per
+        # rollout step (each per-turn adapter switch in multi-adapter mode
+        # transiently doubles parameter memory during merge_adapter →
+        # load_weights → unmerge_adapter). expandable_segments lets the
+        # allocator re-use freed blocks without requiring contiguous
+        # virtual addresses, eliminating the fragmentation-driven OOM
+        # we hit at ~7h45m on the first deploy.
         - name: PYTORCH_CUDA_ALLOC_CONF
-          value: ""
+          value: "expandable_segments:True"
         - name: NCCL_TIMEOUT
           value: "1800"
         - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
