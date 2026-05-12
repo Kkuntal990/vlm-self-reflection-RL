@@ -348,6 +348,19 @@ def parse_args() -> argparse.Namespace:
         "another run as the starting point). Should not be set together with "
         "--resume_from_checkpoint.",
     )
+    parser.add_argument(
+        "--ref_model_init_from_checkpoint",
+        type=str,
+        default="",
+        help="Path to checkpoint dir whose LoRA adapter weights are merged into a "
+        "second frozen copy of the base model, used as the KL reference distribution. "
+        "When set, the trainer's per-turn KL anchors against THIS checkpoint instead "
+        "of the raw base model. Required whenever you initialize a trainable adapter "
+        "from a checkpoint (e.g. baseline-A1 ckpt-1000 as the starting point for "
+        "frozen-a1-mt runs) — otherwise the default ``disable_adapter_layers()`` ref "
+        "path anchors to the raw base model and pulls A1 away from the init "
+        "distribution. Costs one extra forward-pass model copy on each rank.",
+    )
 
     # Multi-adapter routing
     parser.add_argument(
@@ -835,6 +848,54 @@ def main() -> None:
             )
             accelerator.wait_for_everyone()
 
+    # Load frozen KL reference model (separate copy of base + checkpoint LoRA merged in).
+    #
+    # Without this, the trainer's KL-ref pass falls back to
+    # ``unwrapped_model.disable_adapter_layers()`` (see critic_grpo.py:1331), which
+    # produces RAW BASE MODEL log-probs as the KL target — wrong whenever the
+    # trainable adapter was initialized from a checkpoint (e.g. baseline-A1
+    # ckpt-1000). A1 then drifts from its init distribution toward the raw base
+    # model, dragging A2 with it through the shared LoRA. See the KL-audit notes
+    # in the experiments log for the full diagnosis.
+    ref_model: object | None = None
+    if args.ref_model_init_from_checkpoint:
+        logger.info(
+            f"Loading frozen KL reference model: base={args.model_id}, "
+            f"LoRA={args.ref_model_init_from_checkpoint} (will be merged into base)."
+        )
+        from peft import PeftModel
+
+        if model_type == "qwen2vl":
+            ref_base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                args.model_id,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            ).to(accelerator.device)
+        else:
+            from transformers import AutoModelForVision2Seq
+
+            ref_base = AutoModelForVision2Seq.from_pretrained(
+                args.model_id,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            ).to(accelerator.device)
+
+        ref_with_lora = PeftModel.from_pretrained(
+            ref_base,
+            args.ref_model_init_from_checkpoint,
+            is_trainable=False,
+        )
+        ref_model = ref_with_lora.merge_and_unload()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+        ref_model.eval()
+        logger.info(
+            "Frozen KL reference model ready (LoRA merged; all params requires_grad=False)."
+        )
+
+        if accelerator.num_processes > 1:
+            accelerator.wait_for_everyone()
+
     # Create optimizer and prepare for distributed training
     from torch.optim import AdamW
 
@@ -993,7 +1054,7 @@ def main() -> None:
 
     trainer = SelfReflectionGRPOTrainer(
         model=model,
-        ref_model=None,
+        ref_model=ref_model,
         processor=processor,
         config=config,
         optimizer=optimizer,
