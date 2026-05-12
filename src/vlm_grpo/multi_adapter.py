@@ -236,16 +236,27 @@ def _apply_trainable_flags(model: Any, routing: AdapterRoutingConfig) -> None:
     only mixes in ``active_adapters`` — so ``requires_grad=True`` on them
     is safe; the leaves stay un-updated until they participate in a
     routed forward.
+
+    Beyond per-adapter trainability, ``routing.frozen_lora_patterns``
+    forces ``requires_grad=False`` on LoRA params whose name contains any
+    pattern in the list — overriding ``spec.trainable=True``. This is the
+    mechanism used to freeze module-family LoRA (e.g. ``visual``) across
+    every adapter, including adapters loaded from a checkpoint that
+    happens to carry LoRA on that family.
     """
     name_to_trainable = {a.name: a.trainable for a in routing.adapters}
+    frozen_patterns = tuple(routing.frozen_lora_patterns)
     # Anchor matching by the LoRA-tensor prefix so adapter names that share
     # a substring prefix (e.g. ``"response"`` vs ``"response_v2"``) cannot
     # cross-match and silently swap requires_grad.
     for name, param in model.named_parameters():
         for adapter_name, trainable in name_to_trainable.items():
             if f".lora_A.{adapter_name}." in name or f".lora_B.{adapter_name}." in name:
-                if param.requires_grad != trainable:
-                    param.requires_grad = trainable
+                desired = trainable
+                if desired and frozen_patterns and any(p in name for p in frozen_patterns):
+                    desired = False
+                if param.requires_grad != desired:
+                    param.requires_grad = desired
                 break
 
 

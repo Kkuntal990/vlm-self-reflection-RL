@@ -301,10 +301,24 @@ class AdapterRoutingConfig:
         adapters: Ordered list of adapter specs. The first adapter is the
             one PEFT wraps the base model with; subsequent adapters are
             added via add_adapter. Empty list = single-adapter mode.
+        frozen_lora_patterns: List of substring patterns that, when matched
+            against a LoRA parameter's full name, force its ``requires_grad``
+            to ``False`` across EVERY adapter — overriding the per-adapter
+            ``trainable`` flag. Use this to keep specific module families
+            from training even though their hosting adapter is otherwise
+            trainable, e.g. ``["visual"]`` freezes vision-encoder and merger
+            LoRA on both response and feedback while leaving language-decoder
+            LoRA trainable. Matching is anchored on the LoRA-tensor segments
+            ``.lora_A.<adapter>.<pattern>`` / ``.lora_B.<adapter>.<pattern>``
+            implicitly — the pattern itself is a plain substring check
+            against the full parameter name, but only LoRA params (those
+            already containing ``.lora_A.<adapter>.`` or ``.lora_B.<adapter>.``)
+            are considered. Empty list (default) = no extra freezing.
     """
 
     turns: dict[str, str] = field(default_factory=dict)
     adapters: list[AdapterSpec] = field(default_factory=list)
+    frozen_lora_patterns: list[str] = field(default_factory=list)
 
     @property
     def enabled(self) -> bool:
@@ -379,6 +393,7 @@ class AdapterRoutingConfig:
         return {
             "turns": dict(self.turns),
             "adapters": [a.to_dict() for a in self.adapters],
+            "frozen_lora_patterns": list(self.frozen_lora_patterns),
         }
 
     @classmethod
@@ -386,7 +401,8 @@ class AdapterRoutingConfig:
         """Build from a plain dict (typically parsed from JSON).
 
         Args:
-            data: ``{"turns": {...}, "adapters": [{"name": ..., ...}, ...]}``.
+            data: ``{"turns": {...}, "adapters": [{"name": ..., ...}, ...],
+                "frozen_lora_patterns": [...]}``. The last key is optional.
 
         Returns:
             Validated AdapterRoutingConfig. Empty / missing data → disabled.
@@ -396,7 +412,8 @@ class AdapterRoutingConfig:
         adapters_raw = data.get("adapters", []) or []
         adapters = [AdapterSpec(**spec) for spec in adapters_raw]
         turns = dict(data.get("turns", {}) or {})
-        cfg = cls(turns=turns, adapters=adapters)
+        frozen = list(data.get("frozen_lora_patterns", []) or [])
+        cfg = cls(turns=turns, adapters=adapters, frozen_lora_patterns=frozen)
         cfg.validate()
         return cfg
 

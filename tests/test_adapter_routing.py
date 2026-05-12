@@ -483,3 +483,113 @@ def test_multi_adapter_backward_falls_back_for_single_turn_a1() -> None:
     # Some LoRA param must have received a gradient (proves backward fired).
     n_with_grad = sum(1 for p in peft_model.parameters() if p.grad is not None)
     assert n_with_grad > 0, "Single-turn-A1 fallback did not call backward at all"
+
+
+# =============================================================================
+# frozen_lora_patterns: cross-adapter module-family freeze
+# =============================================================================
+
+
+def test_frozen_lora_patterns_from_json() -> None:
+    """``frozen_lora_patterns`` round-trips through from_dict/to_dict."""
+    raw = {
+        "turns": {"a1": "response", "f1": "feedback", "a2": "response"},
+        "adapters": [
+            {"name": "response", "trainable": True},
+            {"name": "feedback", "trainable": True},
+        ],
+        "frozen_lora_patterns": ["visual"],
+    }
+    cfg = AdapterRoutingConfig.from_dict(raw)
+    assert cfg.frozen_lora_patterns == ["visual"]
+    # round-trip
+    rt = AdapterRoutingConfig.from_dict(cfg.to_dict())
+    assert rt.frozen_lora_patterns == ["visual"]
+
+
+def test_frozen_lora_patterns_overrides_adapter_trainable() -> None:
+    """A LoRA param matching a frozen pattern must have requires_grad=False
+    even on an adapter whose ``trainable=True``.
+
+    Regression: the Job-A two-adapter setup loads the baseline-A1 ckpt for
+    ``response``, which carries merger LoRA. Without this override the
+    merger LoRA would silently continue training even with
+    ``--freeze_vision_tower`` set — exactly what happened in the prior runs.
+    """
+    import torch.nn as nn
+
+    from peft import LoraConfig, get_peft_model
+
+    from vlm_grpo.multi_adapter import _apply_trainable_flags
+
+    class M(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # ``visual.merger.fc`` simulates the vision-merger module.
+            self.visual_merger_fc = nn.Linear(8, 8)
+            self.language_fc = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.language_fc(self.visual_merger_fc(x))
+
+        def prepare_inputs_for_generation(self, *a, **k):
+            return {}
+
+    model = M()
+    lora_cfg = LoraConfig(
+        r=4, lora_alpha=8, target_modules=["visual_merger_fc", "language_fc"]
+    )
+    peft_model = get_peft_model(model, lora_cfg, adapter_name="response")
+    peft_model.add_adapter("feedback", lora_cfg)
+    for name, p in peft_model.named_parameters():
+        if "lora_" in name:
+            p.requires_grad_(True)
+
+    routing = AdapterRoutingConfig.from_dict(
+        {
+            "turns": {"a1": "response", "f1": "feedback", "a2": "response"},
+            "adapters": [
+                {"name": "response", "trainable": True},
+                {"name": "feedback", "trainable": True},
+            ],
+            "frozen_lora_patterns": ["visual"],
+        }
+    )
+    _apply_trainable_flags(peft_model, routing)
+
+    # Snapshot every LoRA param's requires_grad bucketed by module + adapter.
+    state: dict[str, bool] = {}
+    for name, p in peft_model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            state[name] = p.requires_grad
+
+    # Visual-merger LoRA: frozen on BOTH adapters.
+    visual_merger_keys = [k for k in state if "visual_merger_fc" in k]
+    assert visual_merger_keys, "test setup did not produce any visual-merger LoRA params"
+    for k in visual_merger_keys:
+        assert state[k] is False, (
+            f"frozen_lora_patterns=['visual'] should have set requires_grad=False "
+            f"on {k}, but it is True"
+        )
+
+    # Language-decoder LoRA: trainable on BOTH adapters.
+    lang_keys = [k for k in state if "language_fc" in k]
+    assert lang_keys
+    for k in lang_keys:
+        assert state[k] is True, (
+            f"language LoRA should remain trainable, but {k} has requires_grad=False"
+        )
+
+
+def test_frozen_lora_patterns_default_empty() -> None:
+    """When ``frozen_lora_patterns`` is missing from JSON, the field defaults
+    to an empty list (i.e. no extra freezing)."""
+    raw = {
+        "turns": {"a1": "response", "f1": "feedback", "a2": "response"},
+        "adapters": [
+            {"name": "response", "trainable": True},
+            {"name": "feedback", "trainable": True},
+        ],
+    }
+    cfg = AdapterRoutingConfig.from_dict(raw)
+    assert cfg.frozen_lora_patterns == []

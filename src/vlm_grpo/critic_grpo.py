@@ -2841,6 +2841,12 @@ class SelfReflectionGRPOTrainer:
         flips requires_grad off on non-active adapters. Frozen adapters stay
         frozen; trainable adapters stay trainable regardless of active state.
 
+        Honors ``self._routing.frozen_lora_patterns``: any LoRA param whose
+        name contains a listed pattern (e.g. ``"visual"``) is forced to
+        ``requires_grad=False`` regardless of its hosting adapter's
+        ``trainable`` flag — used to freeze module-family LoRA inherited
+        from a warm-start checkpoint.
+
         Adapter-name matching is anchored by the LoRA-tensor prefix
         (``lora_A.<name>.`` / ``lora_B.<name>.``) so adapter names that
         share a substring prefix (e.g. ``"response"`` and ``"response_v2"``)
@@ -2848,10 +2854,13 @@ class SelfReflectionGRPOTrainer:
         adapter.
         """
         spec_by_name = {a.name: a for a in self._routing.adapters}
+        frozen_patterns = tuple(self._routing.frozen_lora_patterns)
         for pname, param in peft_model.named_parameters():
             for adapter_name, spec in spec_by_name.items():
                 if f".lora_A.{adapter_name}." in pname or f".lora_B.{adapter_name}." in pname:
                     desired = spec.trainable
+                    if desired and frozen_patterns and any(p in pname for p in frozen_patterns):
+                        desired = False
                     if param.requires_grad != desired:
                         param.requires_grad = desired
                     break

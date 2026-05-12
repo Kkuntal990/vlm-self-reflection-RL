@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-livr-v2-9k-two-adapters-a1init
+  name: qwen-grpo-livr-v2-9k-2a-gdpo-vision-frozen
 spec:
   backoffLimit: 2
   template:
@@ -9,7 +9,7 @@ spec:
       labels:
         app: grpo-trainer
         model: qwen2-5-vl-7b
-        task: livr-perception-grpo-two-adapters-a1init
+        task: livr-perception-grpo-2a-gdpo-vision-frozen
     spec:
       restartPolicy: Never
       containers:
@@ -20,34 +20,29 @@ spec:
         - |
           set -eo pipefail
           echo "========================================="
-          echo "two-adapters-a1init: Qwen2.5-VL-7B + Pattern A + per-turn LoRA routing"
+          echo "two-adapters GDPO + vision-frozen variant"
           echo ""
           echo "Setup:"
-          echo "  - TWO trainable LoRA adapters:"
-          echo "      * 'response'  active for A1 and A2 turns. INIT FROM the"
-          echo "                    baseline-A1 single-turn checkpoint"
-          echo "                    (${RESPONSE_INIT_CHECKPOINT}) — 61.4% BLINK avg,"
-          echo "                    +5.3pp over base Qwen. Gives A1 a proven"
-          echo "                    starting policy and reduces the cold-start"
-          echo "                    drift that contributed to response collapse"
-          echo "                    in the prior two_adapters run."
-          echo "      * 'feedback'  active for F1 turn. FRESH from base Qwen."
-          echo "                    Diverges from response by virtue of training"
-          echo "                    on F1 trajectories only."
-          echo "  - HIGH A1 KL anchor (KL_COEFF * A1_KL_COEFF = ${KL_COEFF:-0.001} *"
-          echo "    ${A1_KL_COEFF:-700} = ~7e-1 effective). With this run the KL"
-          echo "    reference is the BASELINE-A1 policy (because the routing"
-          echo "    init carries it), not base Qwen — so A1 KL anchors A2 toward"
-          echo "    the proven A1 distribution, not the untrained base."
-          echo "  - Rewards (same simplified regime as previous two-adapter runs):"
+          echo "  - TWO trainable LoRA adapters, ALL visual LoRA frozen:"
+          echo "      * 'response' (init from baseline-A1 ckpt-1000 — 61.4% BLINK)."
+          echo "        Note baseline-A1 ckpt-1000 was trained with LoRA on the"
+          echo "        merger MLP; loading it brings those tensors with it."
+          echo "        The frozen_lora_patterns=[\"visual\"] entry in routing"
+          echo "        forces requires_grad=False on every visual.* LoRA"
+          echo "        param (both adapters), so the merger LoRA does not"
+          echo "        update during this run — matching LIVR-paper recipe."
+          echo "      * 'feedback' starts FRESH from base."
+          echo "  - --freeze_vision_tower: freezes vision encoder + merger BASE"
+          echo "    weights (existing flag, complements the LoRA freeze above)."
+          echo "  - LoRA rank ${LORA_R:-32} (smaller than r=64 baseline) — only"
+          echo "    language-decoder LoRA actually trains in this variant."
+          echo "  - GDPO normalization ON (per-component K-group advantage"
+          echo "    normalize → weighted sum → batch renorm), Dr.GRPO loss OFF."
+          echo "  - Rewards (simplified two-adapter regime):"
           echo "      A2:   correctness=${W_A2_CORRECTNESS:-0.45}  format=${W_A2_FORMAT:-0.05}"
           echo "      F1:   verification=${W_VERIFICATION_ACCURACY:-0.45}"
           echo "            format=${W_FB_FORMAT:-0.05}"
-          echo "      A1, no_regression, downstream  ALL ZERO."
-          echo "  - --use_vllm_native_loss ON: vLLM's per-token logprobs serve as old_lp"
-          echo "    after every adapter switch (the per-turn rollout callback re-syncs"
-          echo "    vLLM weights from the freshly-activated PEFT adapter before each"
-          echo "    turn's batched generation)."
+          echo "  - --use_vllm_native_loss ON."
           echo ""
           echo "Model: \${MODEL_ID}"
           echo "Dataset: \${DATASET_PATH}"
@@ -56,32 +51,18 @@ spec:
           echo "Branch: \${GIT_BRANCH:-two-adapters}"
           echo "========================================="
 
-          # GPU check
           nvidia-smi
           echo ""
 
-          # Pin vllm to 0.12.0 — newer versions drag torch 2.11 + transformers
-          # 5.x which break the Qwen2.5-VL vision encoder forward (NVRTC kernel
-          # JIT fails on image_grid_thw.prod(-1)). Leave torch/transformers at
-          # the trl:0.29.0 image's defaults.
           pip install "vllm==0.12.0" wandb sentence-transformers 2>&1 | tail -5
 
-          # Clone and install project. Pins to the two-adapters branch which
-          # carries the AdapterRoutingConfig / multi_adapter init code.
           git clone https://github.com/Kkuntal990/vlm-self-reflection-RL.git /workspace/vlm-self-reflection-RL
           cd /workspace/vlm-self-reflection-RL
           git checkout "${GIT_BRANCH:-two-adapters}"
           pip install -e . 2>&1 | tail -3
 
-          # Create output dir
           mkdir -p "${OUTPUT_DIR}"
 
-          # Run training. The ADAPTER_ROUTING_JSON env wires the per-turn LoRA
-          # routing — 'response' loads from RESPONSE_INIT_CHECKPOINT, 'feedback'
-          # is fresh from base. init_multi_adapter_model handles both at startup.
-          # INIT_CHECKPOINT (HF Trainer resume) stays empty — we are not
-          # resuming a prior multi-adapter run; we are bootstrapping fresh from
-          # the single-adapter baseline.
           accelerate launch \
             --config_file /workspace/vlm-self-reflection-RL/k8s/multi_gpu.yaml \
             --num_processes=${NUM_GPUS:-4} \
@@ -97,6 +78,7 @@ spec:
             --use_think_answer_tags \
             --use_rescaled_rewards \
             --use_dynamic_sampling \
+            --use_gdpo_normalization \
             --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.40} \
             --max_samples ${MAX_SAMPLES:-0} \
             --k_samples ${K_SAMPLES:-12} \
@@ -107,7 +89,7 @@ spec:
             --temperature ${TEMPERATURE:-1.0} \
             --feedback_temperature ${FEEDBACK_TEMPERATURE:-1.0} \
             --a2_temperature ${A2_TEMPERATURE:-0.7} \
-            --learning_rate ${LEARNING_RATE:-1e-5} \
+            --learning_rate ${LEARNING_RATE:-5e-6} \
             --lr_warmup_steps ${LR_WARMUP_STEPS:-100} \
             --per_device_train_batch_size ${BATCH_SIZE:-2} \
             --gradient_accumulation_steps ${GRAD_ACC:-1} \
@@ -115,14 +97,14 @@ spec:
             --num_inner_epochs ${INNER_EPOCHS:-1} \
             --kl_coeff ${KL_COEFF:-0.001} \
             --a1_kl_coeff ${A1_KL_COEFF:-700.0} \
-            --a2_kl_coeff ${A2_KL_COEFF:-1.0} \
-            --fb_kl_coeff ${FB_KL_COEFF:-1.0} \
+            --a2_kl_coeff ${A2_KL_COEFF:-40.0} \
+            --fb_kl_coeff ${FB_KL_COEFF:-40.0} \
             --separate_turn_loss \
             --clip_range ${CLIP_RANGE:-0.2} \
             --clip_high ${CLIP_HIGH:-0.28} \
-            --loss_type ${LOSS_TYPE:-dr_grpo} \
-            --lora_r ${LORA_R:-64} \
-            --lora_alpha ${LORA_ALPHA:-128} \
+            --loss_type ${LOSS_TYPE:-grpo} \
+            --lora_r ${LORA_R:-32} \
+            --lora_alpha ${LORA_ALPHA:-64} \
             --freeze_vision_tower \
             --max_pixels ${MAX_PIXELS:-401408} \
             --min_pixels ${MIN_PIXELS:-200704} \
@@ -147,71 +129,32 @@ spec:
           echo "=== Training complete ==="
 
         env:
-        # Model and data
         - name: MODEL_ID
           value: "Qwen/Qwen2.5-VL-7B-Instruct"
         - name: DATASET_PATH
           value: "/outputs/livr_v2_train_snapshots/snap_20260501_154345_final/data/livr_v2_9task_train.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v2_9k_two_adapters_a1init"
+          value: "/outputs/grpo_qwen_livr_v2_9k_2a_gdpo_vfrozen"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
-        # HF-Trainer-level resume — leave empty. Adapter-level init is handled
-        # by ADAPTER_ROUTING_JSON below via init_multi_adapter_model().
+        # No HF-Trainer-level resume; adapter init is via ADAPTER_ROUTING_JSON.
         - name: INIT_CHECKPOINT
           value: ""
 
-        # === Response-adapter init source ===
-        # Path to the baseline-A1 single-turn LoRA checkpoint. Loaded onto the
-        # 'response' adapter at init via PeftModel.from_pretrained. The
-        # feedback adapter is added fresh from base after that.
-        - name: RESPONSE_INIT_CHECKPOINT
-          value: "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"
-
         # === Adapter routing ===
-        # Two trainable adapters. 'response' loads from the baseline-A1 ckpt;
-        # 'feedback' is fresh from base. The trainer's per-turn callback
-        # switches the active adapter (and re-syncs vLLM) before each turn's
-        # generation. Inside the training step, _routed_forward_multi groups
-        # turns by adapter so A1+A2 still fuse into a single forward pass;
-        # F1 runs a separate forward with the feedback adapter active.
+        # response: init from baseline-A1 ckpt-1000. feedback: fresh from base.
+        # frozen_lora_patterns=["visual"] forces requires_grad=False on every
+        # LoRA tensor whose path contains "visual" — i.e. the vision encoder
+        # AND the merger MLP — across BOTH adapters. Combined with
+        # --freeze_vision_tower freezing the base weights, this gives a
+        # fully-frozen vision side (matching LIVR-paper recipe).
         - name: ADAPTER_ROUTING_JSON
           value: |
-            {"turns": {"a1": "response", "f1": "feedback", "a2": "response"}, "adapters": [{"name": "response", "trainable": true, "init_from_checkpoint": "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"}, {"name": "feedback", "trainable": true}]}
+            {"turns": {"a1": "response", "f1": "feedback", "a2": "response"}, "adapters": [{"name": "response", "trainable": true, "init_from_checkpoint": "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"}, {"name": "feedback", "trainable": true}], "frozen_lora_patterns": ["visual"]}
 
-        # KL anchor
-        # ---------
-        # KL aggregation is sum_t(k3) / max_completion_length per turn. For a
-        # full-length completion this is equivalent to a mean-aggregated KL
-        # with β_equivalent = KL_COEFF * turn_coeff. Comparing against
-        # public VLM-RL setups (all β values are full-length-equivalent):
-        #
-        #   VL-Rethinker (Qwen2.5-VL 7B/72B, NeurIPS '25):  β = 0.0
-        #   DeepSeek-R1 (text-only):                         β = 0.001
-        #   SCoRe Stage II β1 (text-only multi-turn):        β = 0.01
-        #   VLM-R1 (Qwen2.5-VL REC) / DocThinker / TRL def:  β = 0.04
-        #   SCoRe Stage I β2 (text-only, first-attempt only):β = 0.1
-        #
-        # Our targets:
-        #   A1:  β = 0.7   (KL_COEFF=0.001 * A1_KL_COEFF=700)  — strong anchor.
-        #                   W_A1_*=0 so KL is the ONLY force on A1; matches
-        #                   the spirit of SCoRe Stage I but 7x stricter than
-        #                   their β2=0.1 (intentional: A1 has zero policy
-        #                   gradient, all drift control comes from KL).
-        #   A2:  β = 0.04  (KL_COEFF=0.001 * A2_KL_COEFF=40)   — matches
-        #                   VLM-R1, DocThinker, and TRL GRPOTrainer default.
-        #                   Mid-VLM-RL range.
-        #   F1:  β = 0.04  (same as A2).
-        #
-        # A1:A2 ratio = 17.5x. Within SCoRe's 10-25x envelope (Stage I MATH
-        # uses 10x, MBPP uses 25x). Single-turn VLM-RL papers have no
-        # comparable ratio because they have one β; the asymmetric anchor
-        # is specific to multi-turn frozen-first-turn designs.
-        #
-        # Prior runs ran A2 / F1 at turn_coeff=1.0 (β=0.001, matches
-        # DeepSeek but 40x below VLM-RL norm). That permissive KL was a
-        # contributing factor to the response-head collapse at step 260
-        # (grad_norm pre-clip → 33,625, a2_tok_len → 1).
+        # KL anchor — see two-adapters-a1init's predecessor for the lit
+        # comparison. A1 effective β=0.7 (anchors the W_A1=0 turn). A2 / F1
+        # effective β=0.04, matching VLM-R1, DocThinker, TRL default.
         - name: KL_COEFF
           value: "0.001"
         - name: A1_KL_COEFF
@@ -221,14 +164,12 @@ spec:
         - name: FB_KL_COEFF
           value: "40.0"
 
-        # GRPO core
-        # ---------
-        # Dr.GRPO. K=12 with DAPO clip-higher (0.28 upper, 0.2 lower) so
-        # positive-advantage tokens get more headroom.
+        # GRPO core — vanilla GRPO loss + GDPO normalization. DAPO clip-higher
+        # 0.28 + dynamic sampling.
         - name: K_SAMPLES
           value: "12"
         - name: LOSS_TYPE
-          value: "dr_grpo"
+          value: "grpo"
         - name: CLIP_RANGE
           value: "0.2"
         - name: CLIP_HIGH
@@ -236,7 +177,6 @@ spec:
         - name: INNER_EPOCHS
           value: "1"
 
-        # Generation
         - name: MAX_SAMPLES
           value: "0"
         - name: MAX_COMPLETION_LENGTH
@@ -254,15 +194,8 @@ spec:
         - name: A2_TEMPERATURE
           value: "0.7"
 
-        # Optimization
-        # ------------
-        # LR=5e-6 with 100-step linear warmup. The prior 1e-5 was on the
-        # upper edge of viable for 7B Qwen2.5-VL + LoRA r=64 — DeepSeek-R1
-        # uses 1e-6 (full-param), Critique-GRPO (70B LoRA) uses 5e-6,
-        # TRL GRPOTrainer LoRA default is 1e-6. 5e-6 sits in the middle
-        # of the LoRA-RL range and pairs better with the tighter A2/F1 KL
-        # anchor; the previous LR + near-zero KL combination left no
-        # margin once advantage signals got noisy at step ~260.
+        # LR=5e-6 (SCoRe MATH value). Lower than the 1e-5 used in the prior
+        # crashed two-adapter runs.
         - name: LEARNING_RATE
           value: "5e-6"
         - name: LR_WARMUP_STEPS
@@ -276,20 +209,19 @@ spec:
         - name: NUM_GPUS
           value: "4"
 
-        # LoRA (both adapters share these settings; the routing config builds
-        # both with the same LoraConfig)
+        # LoRA r=32 (half the r=64 used elsewhere). With vision LoRA frozen
+        # there is less effective capacity; r=32 is a reasonable language-
+        # decoder-only rank.
         - name: LORA_R
-          value: "64"
+          value: "32"
         - name: LORA_ALPHA
-          value: "128"
+          value: "64"
 
-        # vLLM
         - name: VLLM_GPU_MEM
           value: "0.40"
         - name: GIT_BRANCH
           value: "two-adapters"
 
-        # === User-message instruction text (Pattern A) ===
         - name: THINK_ANSWER_INSTRUCTION
           value: |
             The reasoning process MUST BE enclosed within <think> </think> tags. The final answer MUST BE put in <answer> </answer> tags.
@@ -297,16 +229,11 @@ spec:
           value: |
             Re-examine the image and determine whether the candidate answer is correct or incorrect. The reasoning process MUST BE enclosed within <think> </think> tags. The final verdict MUST BE put in \boxed{} as either CORRECT or INCORRECT.
 
-        # Qwen2.5-VL image resolution
         - name: MAX_PIXELS
           value: "401408"
         - name: MIN_PIXELS
           value: "200704"
 
-        # Reward shaping
-        # --------------
-        # α=1 is set for log readability; W_NO_REGRESSION and W_DOWNSTREAM are
-        # both 0 so the shaping multipliers do not enter the loss.
         - name: REWARD_SHAPING_ALPHA
           value: "1.0"
         - name: RESPONSE_ALPHA
@@ -314,8 +241,6 @@ spec:
         - name: FEEDBACK_ALPHA
           value: "1.0"
 
-        # Reward weights — A2 correctness/format on the response head,
-        # F1 verification/format on the feedback head. Everything else zero.
         - name: W_A2_CORRECTNESS
           value: "0.45"
         - name: W_A2_FORMAT
@@ -325,7 +250,6 @@ spec:
         - name: W_FB_FORMAT
           value: "0.05"
 
-        # Logging
         - name: LOGGING_STEPS
           value: "10"
         - name: SAVE_STEPS
@@ -333,11 +257,9 @@ spec:
         - name: SEED
           value: "42"
 
-        # LLM Judge disabled for MCQ
         - name: VLM_USE_LLM_JUDGE
           value: "0"
 
-        # HuggingFace
         - name: HF_TOKEN
           valueFrom:
             secretKeyRef:
@@ -351,16 +273,11 @@ spec:
         - name: TORCH_HOME
           value: "/cache/torch"
 
-        # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
-        # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is INCOMPATIBLE
-        # with vLLM's CuMemAllocator — it triggers an immediate AssertionError
-        # at vLLM init ("Expandable segments are not compatible with memory
-        # pool", vllm/device_allocator/cumem.py:155). Do not re-add it.
-        # The original GDPO grad-explosion OOM that motivated this env var
-        # is already addressed by the batch-renorm guard in
-        # _compute_gdpo_advantages (commit 9630cb4).
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True intentionally NOT
+        # set — it's incompatible with vLLM's CuMemAllocator and was the
+        # source of the 4-minute pod crash on the first two-adapter deploy.
         - name: NCCL_TIMEOUT
           value: "1800"
         - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
@@ -379,7 +296,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-v2-9k-two-adapters-a1init"
+          value: "grpo-livr-v2-9k-2a-gdpo-vision-frozen"
 
         resources:
           limits:
