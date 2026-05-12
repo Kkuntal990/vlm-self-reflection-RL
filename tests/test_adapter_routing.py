@@ -309,3 +309,177 @@ def test_apply_trainable_flags_anchored_match_avoids_prefix_collision() -> None:
     assert model.r_B.requires_grad is True
     assert model.r_v2_A.requires_grad is False
     assert model.r_v2_B.requires_grad is False
+
+
+# =============================================================================
+# Regression: gradient-checkpointing + multi-adapter backward
+# =============================================================================
+
+
+def test_multi_adapter_backward_routes_grad_to_each_adapters_text_lora() -> None:
+    """Regression for the dead-feedback-text-LoRA bug.
+
+    Reproduces the gradient-checkpoint mis-attribution discovered in the
+    two-adapters runs: a single ``mb_loss.backward()`` lands ALL text-decoder
+    gradient on whichever adapter is active at backward time, regardless of
+    which adapter ran the original forward. The fix (``_multi_adapter_backward``)
+    splits the loss per adapter and calls backward separately with the right
+    adapter active before each.
+
+    Production observation: after 250 steps both adapters' text-side
+    ``lora_B`` should be non-zero, but feedback's was exactly 0 across all
+    196 text-decoder tensors (only its merger LoRA — which is not grad-
+    checkpointed — had moved). The optimizer state confirmed only 400 of
+    1432 LoRA params ever received a gradient (the response head's 296 +
+    feedback's 4 merger; no feedback text).
+    """
+    import torch
+    import torch.nn as nn
+
+    from peft import LoraConfig, get_peft_model
+
+    from vlm_grpo.config import AdapterRoutingConfig
+    from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
+
+    # Tiny stand-in for the trainer's text decoder: two linear layers,
+    # the SECOND wrapped in gradient checkpointing. Only the second layer's
+    # gradient flow is affected by the bug — the first is not checkpointed
+    # and serves as a sanity baseline.
+    class MiniDecoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = nn.Linear(8, 8)
+            self.second = nn.Linear(8, 8)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            h = self.first(x)
+            h = torch.utils.checkpoint.checkpoint(self.second, h, use_reentrant=True)
+            return h
+
+        # PEFT looks for this on the inner model.
+        def prepare_inputs_for_generation(self, *args, **kwargs):  # noqa: D401
+            return {}
+
+    model = MiniDecoder()
+    lora_cfg = LoraConfig(r=4, lora_alpha=8, target_modules=["first", "second"])
+    peft_model = get_peft_model(model, lora_cfg, adapter_name="response")
+    peft_model.add_adapter("feedback", lora_cfg)
+    for name, param in peft_model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad_(True)
+
+    # Build a stub trainer that owns just the routing config + the helper
+    # methods involved in the bug + fix.
+    trainer = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
+    trainer._routing = AdapterRoutingConfig.from_dict(
+        {
+            "turns": {"a1": "response", "f1": "feedback", "a2": "response"},
+            "adapters": [
+                {"name": "response", "trainable": True},
+                {"name": "feedback", "trainable": True},
+            ],
+        }
+    )
+
+    # Reproduce the routing pattern: A1+A2 batched forward with response
+    # active, F1 forward with feedback active.
+    x = torch.randn(2, 8, requires_grad=True)
+
+    peft_model.set_adapter("response")
+    out_response = peft_model(x).sum()
+
+    peft_model.set_adapter("feedback")
+    out_feedback = peft_model(x).sum()
+
+    # Per-trajectory traj_resp_loss / traj_fb_loss accumulators feed the
+    # per-adapter buckets we hand to ``_multi_adapter_backward``.
+    mb_response_loss = out_response
+    mb_feedback_loss = out_feedback
+    mb_loss = mb_response_loss + mb_feedback_loss  # legacy combined loss
+
+    # Apply the fix.
+    trainer._multi_adapter_backward(
+        inner_model=peft_model,
+        mb_loss=mb_loss,
+        mb_response_loss=mb_response_loss,
+        mb_feedback_loss=mb_feedback_loss,
+    )
+
+    # Collect gradient norms on the grad-checkpointed second linear's
+    # ``lora_B`` for each adapter — this is the tensor that stayed at
+    # exactly 0 in production.
+    grads: dict[str, float | None] = {"response": None, "feedback": None}
+    for name, param in peft_model.named_parameters():
+        if "second.lora_B" in name:
+            for adapter in grads:
+                if f".lora_B.{adapter}." in name:
+                    grads[adapter] = (
+                        None if param.grad is None else param.grad.float().norm().item()
+                    )
+
+    assert grads["response"] is not None and grads["response"] > 0.0, (
+        f"Response adapter's grad-checkpointed text-LoRA still has zero / None "
+        f"gradient after the fix (got {grads['response']!r})"
+    )
+    assert grads["feedback"] is not None and grads["feedback"] > 0.0, (
+        f"Feedback adapter's grad-checkpointed text-LoRA still has zero / None "
+        f"gradient after the fix (got {grads['feedback']!r}) — this is the "
+        "exact production bug; the per-adapter backward split is not working."
+    )
+
+
+def test_multi_adapter_backward_falls_back_for_single_turn_a1() -> None:
+    """Single-turn A1 path leaves the per-adapter accumulators at None.
+
+    ``_multi_adapter_backward`` must detect that case and use the legacy
+    combined ``mb_loss.backward()`` instead of skipping backward entirely.
+    """
+    import torch
+    import torch.nn as nn
+
+    from peft import LoraConfig, get_peft_model
+
+    from vlm_grpo.config import AdapterRoutingConfig
+    from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
+
+    class M(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.l = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.l(x)
+
+        def prepare_inputs_for_generation(self, *args, **kwargs):
+            return {}
+
+    model = M()
+    peft_model = get_peft_model(
+        model, LoraConfig(r=4, lora_alpha=8, target_modules=["l"]), adapter_name="response"
+    )
+    for name, p in peft_model.named_parameters():
+        if "lora_" in name:
+            p.requires_grad_(True)
+
+    trainer = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
+    trainer._routing = AdapterRoutingConfig.from_dict(
+        {
+            "turns": {"a1": "response", "f1": "response", "a2": "response"},
+            "adapters": [{"name": "response", "trainable": True}],
+        }
+    )
+
+    x = torch.randn(2, 8, requires_grad=True)
+    out = peft_model(x).sum()
+
+    # Single-turn-A1 path: only mb_loss populated, per-adapter accumulators None.
+    trainer._multi_adapter_backward(
+        inner_model=peft_model,
+        mb_loss=out,
+        mb_response_loss=None,
+        mb_feedback_loss=None,
+    )
+
+    # Some LoRA param must have received a gradient (proves backward fired).
+    n_with_grad = sum(1 for p in peft_model.parameters() if p.grad is not None)
+    assert n_with_grad > 0, "Single-turn-A1 fallback did not call backward at all"

@@ -1469,6 +1469,11 @@ class SelfReflectionGRPOTrainer:
                 #   - TRL GRPOTrainer: github.com/huggingface/trl
                 #   - DAPO token-level loss: arXiv:2503.14476
                 mb_loss = None
+                # Per-adapter partial losses (only populated in the multi-turn
+                # path). See _multi_adapter_backward for why these are tracked
+                # separately from mb_loss when routing is enabled.
+                mb_response_loss = None
+                mb_feedback_loss = None
                 for j in range(mb_end - mb_start):
                     ti = mb_start + j
 
@@ -1611,6 +1616,12 @@ class SelfReflectionGRPOTrainer:
                     # SCoRe insight: strong A1 KL anchors first turn near base
                     # model, preventing "direct solution collapse" where the
                     # model just improves A1 instead of learning self-correction.
+                    #
+                    # NOTE: KL terms are tracked per-turn (a1_kl_term, a2_kl_term,
+                    # f1_kl_term) — not just as a single traj_kl_loss — so that
+                    # the multi-adapter backward path below can route each KL
+                    # contribution to the adapter that owns its turn. The
+                    # single-adapter path still consumes the summed traj_kl_loss.
                     if self.config.kl_coeff > 0 and ref_a1_lps is not None:
                         a1_kl_max_len = float(self.config.rollout.a1_max_completion_length or 200)
                         a2_kl_max_len = float(self.config.rollout.a2_max_completion_length or 200)
@@ -1624,19 +1635,62 @@ class SelfReflectionGRPOTrainer:
                         a2_kl_c = self.config.kl_coeff * getattr(self.config, "a2_kl_coeff", 1.0)
                         fb_kl_c = self.config.kl_coeff * getattr(self.config, "fb_kl_coeff", 1.0)
 
-                        traj_kl_loss = a1_kl_c * a1_kl + a2_kl_c * a2_kl + fb_kl_c * f1_kl
+                        a1_kl_term = a1_kl_c * a1_kl
+                        a2_kl_term = a2_kl_c * a2_kl
+                        f1_kl_term = fb_kl_c * f1_kl
+                        traj_kl_loss = a1_kl_term + a2_kl_term + f1_kl_term
                     else:
-                        traj_kl_loss = torch.tensor(0.0, device=fb_new.device)
+                        zero_kl = torch.tensor(0.0, device=fb_new.device)
+                        a1_kl_term = zero_kl
+                        a2_kl_term = zero_kl
+                        f1_kl_term = zero_kl
+                        traj_kl_loss = zero_kl
 
                     traj_loss = (traj_resp_loss + traj_fb_loss + traj_kl_loss) / n_traj_inner
                     mb_loss = traj_loss if mb_loss is None else mb_loss + traj_loss
+
+                    # Per-adapter partial losses. With multi-adapter routing AND
+                    # gradient checkpointing, a SINGLE backward on the combined
+                    # ``mb_loss`` mis-attributes the gradient checkpointed text-
+                    # decoder gradients: the checkpoint recomputes the forward
+                    # at backward time using the model's CURRENT active adapter,
+                    # so all text-decoder gradient lands on whichever adapter
+                    # happened to be active when ``.backward()`` fires (regardless
+                    # of which adapter was active during the original forward).
+                    # Splitting the loss per adapter and calling ``.backward()``
+                    # separately with the correct active adapter set before each
+                    # call routes each turn's gradient to the right adapter.
+                    #
+                    # Loss decomposition (assumes a1+a2 share an adapter, f1
+                    # uses its own — matches every routing configuration we ship):
+                    #   response part:  a1_loss + a2_loss + a1_kl_term + a2_kl_term
+                    #   feedback part:  f1_loss + f1_kl_term
+                    # If a future routing puts a1/a2 on different adapters,
+                    # the multi-adapter backward path below would need a 3-way
+                    # split — guarded by an assertion in _multi_adapter_backward.
+                    traj_response_part = (traj_resp_loss + a1_kl_term + a2_kl_term) / n_traj_inner
+                    traj_feedback_part = (traj_fb_loss + f1_kl_term) / n_traj_inner
+                    mb_response_loss = (
+                        traj_response_part
+                        if mb_response_loss is None
+                        else mb_response_loss + traj_response_part
+                    )
+                    mb_feedback_loss = (
+                        traj_feedback_part
+                        if mb_feedback_loss is None
+                        else mb_feedback_loss + traj_feedback_part
+                    )
 
                     epoch_resp_loss += traj_resp_loss.item() / n_traj_inner
                     epoch_fb_loss += traj_fb_loss.item() / n_traj_inner
                     epoch_kl_loss += traj_kl_loss.item() / n_traj_inner
 
-                if mb_loss is not None:
-                    mb_loss.backward()
+                self._multi_adapter_backward(
+                    inner_model=inner_model,
+                    mb_loss=mb_loss,
+                    mb_response_loss=mb_response_loss,
+                    mb_feedback_loss=mb_feedback_loss,
+                )
 
             # Manually all-reduce gradients across DDP processes
             if self.accelerator is not None and torch.distributed.is_initialized():
@@ -2217,11 +2271,14 @@ class SelfReflectionGRPOTrainer:
             for local_idx, original_idx in enumerate(indices):
                 results[original_idx] = group_outs[local_idx]
 
-        # Restore active adapter to the first trainable so the next
-        # mini-batch / save / KL pass observes a stable starting point.
-        trainable = self._routing.trainable_adapter_names()
-        if trainable:
-            self._set_active_adapter(model, trainable[0])
+        # NOTE: we used to "restore active adapter to first trainable" here so
+        # the next mini-batch / save / KL pass observed a stable starting
+        # point. That cleanup is the trigger for the grad-ckpt mis-attribution
+        # bug — see ``_multi_adapter_backward`` for details. We deliberately
+        # LEAVE the active adapter at whichever group ran last; the trainer's
+        # per-adapter backward path resets it explicitly before each
+        # ``.backward()``, and the next mini-batch's first
+        # ``_set_active_adapter`` call also resets it.
 
         # All slots filled by the group loop above; assert defensively.
         assert all(r is not None for r in results), "routed forward lost a turn"
@@ -2644,6 +2701,107 @@ class SelfReflectionGRPOTrainer:
             self.patience_counter += 1
 
         return self.patience_counter >= es_config.patience
+
+    def _multi_adapter_backward(
+        self,
+        inner_model: Any,
+        mb_loss: Any,
+        mb_response_loss: Any,
+        mb_feedback_loss: Any,
+    ) -> None:
+        """Call ``.backward()`` on the mini-batch loss, splitting across
+        adapters when routing is enabled.
+
+        Background — the bug this fixes:
+
+        When gradient checkpointing is enabled on the text decoder AND multiple
+        LoRA adapters route per turn, a single combined ``mb_loss.backward()``
+        does NOT correctly attribute text-decoder gradients to the adapter that
+        was active during the original forward.
+
+        The reason: ``torch.utils.checkpoint`` (used by HF
+        ``gradient_checkpointing_enable``) recomputes the wrapped function's
+        forward during backward. That recompute reads the model's CURRENT
+        state — including the active LoRA adapter — instead of the state at
+        original-forward time. So every text-decoder gradient lands on
+        whichever adapter is currently active, regardless of which adapter
+        ran the original forward.
+
+        We verified this empirically: with the response/feedback split, every
+        F1 forward (feedback active) was followed by a "restore to first
+        trainable = response" cleanup; backward then recomputed text-decoder
+        forwards with response active, and feedback's text-side LoRA received
+        zero gradient across 250 steps × 4 ranks (optimizer state confirms
+        only 400 of 1432 LoRA params ever received a gradient — exactly the
+        296 response merger+text plus 4 feedback merger, no feedback text).
+
+        Workaround — split the loss per adapter and backward each separately
+        with the correct active adapter set BEFORE the call:
+
+          1. Backward ``mb_response_loss`` with the response-adapter active.
+             Its recompute uses response → response's text LoRA gets gradient.
+          2. Backward ``mb_feedback_loss`` with the feedback-adapter active.
+             Its recompute uses feedback → feedback's text LoRA gets gradient.
+
+        Single-adapter mode falls through to the combined ``mb_loss.backward()``
+        (no split needed because there is only one set of LoRA tensors).
+
+        Args:
+            inner_model: Unwrapped PEFT model (used for ``_set_active_adapter``).
+            mb_loss: The combined trajectory loss summed across turns. Used in
+                single-adapter mode (or when all turns route to the same
+                adapter, e.g. for the single-turn-A1 baseline).
+            mb_response_loss: Sum of A1+A2 policy losses + their KL terms.
+                ``None`` when single_turn_a1 (only ``mb_loss`` is populated).
+            mb_feedback_loss: F1 policy loss + F1 KL term. ``None`` when
+                single_turn_a1.
+        """
+        # Single-adapter or single-turn paths: do the combined backward.
+        # ``mb_response_loss is None and mb_feedback_loss is None`` covers the
+        # ``single_turn_a1`` baseline, which leaves the per-adapter
+        # accumulators untouched and only fills ``mb_loss`` (with A1-only loss).
+        if (
+            not self._routing.enabled
+            or (mb_response_loss is None and mb_feedback_loss is None)
+        ):
+            if mb_loss is not None:
+                mb_loss.backward()
+            return
+
+        a1_adapter = self._routing.adapter_for_turn("a1")
+        a2_adapter = self._routing.adapter_for_turn("a2")
+        f1_adapter = self._routing.adapter_for_turn("f1")
+
+        # Generalisation guard: this code splits the loss into two adapter
+        # buckets — one for A1+A2, one for F1. If a future routing puts A1
+        # and A2 on different adapters, we'd need a 3-way split (one backward
+        # per adapter). Flag loudly instead of silently mis-attributing.
+        if a1_adapter != a2_adapter:
+            raise NotImplementedError(
+                f"Multi-adapter backward currently assumes A1 and A2 share an "
+                f"adapter (got a1={a1_adapter!r}, a2={a2_adapter!r}). To support "
+                "asymmetric A1/A2 routing, extend this method to bucket by "
+                "{a1, a2, f1} → adapter and call backward once per bucket."
+            )
+
+        # When all three turns share an adapter (e.g. single-adapter routing
+        # with explicit names), the gradient-checkpoint recompute uses that
+        # single adapter regardless — fall back to the combined backward.
+        if a1_adapter == f1_adapter:
+            if mb_loss is not None:
+                mb_loss.backward()
+            return
+
+        # Multi-adapter split. After _routed_forward_multi's cleanup, the
+        # active adapter is already the first-trainable, which is typically
+        # the response adapter. We re-assert explicitly for clarity (and so
+        # this code is correct even if the cleanup is later removed).
+        if mb_response_loss is not None and mb_response_loss.requires_grad:
+            self._set_active_adapter(inner_model, a1_adapter)
+            mb_response_loss.backward()
+        if mb_feedback_loss is not None and mb_feedback_loss.requires_grad:
+            self._set_active_adapter(inner_model, f1_adapter)
+            mb_feedback_loss.backward()
 
     def _set_active_adapter(self, peft_model: Any, name: str) -> None:
         """Set the active adapter, preserving requires_grad on ALL trainable adapters.
