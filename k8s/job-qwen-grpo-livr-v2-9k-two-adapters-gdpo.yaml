@@ -301,13 +301,10 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
-        # Defragment GPU memory. Especially important for the GDPO variant
-        # because the batch-renorm step concentrates gradient mass on
-        # whichever K-groups survive the response-head-saturation regime,
-        # leading to large optimizer state allocations. Avoids the
-        # fragmentation-driven OOM observed at ~7h45m on the first deploy.
-        - name: PYTORCH_CUDA_ALLOC_CONF
-          value: "expandable_segments:True"
+        # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is INCOMPATIBLE
+        # with vLLM's CuMemAllocator (AssertionError at vLLM init). Removed.
+        # The GDPO grad-explosion OOM that motivated this env var is already
+        # addressed by the batch-renorm guard in _compute_gdpo_advantages.
         - name: NCCL_TIMEOUT
           value: "1800"
         - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC

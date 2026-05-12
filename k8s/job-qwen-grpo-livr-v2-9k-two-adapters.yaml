@@ -309,15 +309,10 @@ spec:
         # Python and CUDA
         - name: PYTHONUNBUFFERED
           value: "1"
-        # Defragment GPU memory and absorb the 3x merge_adapter spike per
-        # rollout step (each per-turn adapter switch in multi-adapter mode
-        # transiently doubles parameter memory during merge_adapter →
-        # load_weights → unmerge_adapter). expandable_segments lets the
-        # allocator re-use freed blocks without requiring contiguous
-        # virtual addresses, eliminating the fragmentation-driven OOM
-        # we hit at ~7h45m on the first deploy.
-        - name: PYTORCH_CUDA_ALLOC_CONF
-          value: "expandable_segments:True"
+        # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is INCOMPATIBLE
+        # with vLLM's CuMemAllocator — it triggers an immediate AssertionError
+        # at vLLM init ("Expandable segments are not compatible with memory
+        # pool", vllm/device_allocator/cumem.py:155). Do not re-add it.
         - name: NCCL_TIMEOUT
           value: "1800"
         - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
