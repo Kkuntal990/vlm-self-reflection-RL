@@ -803,42 +803,14 @@ def main() -> None:
         else:
             model = get_peft_model(model, lora_config)
 
-        # PEFT's get_peft_model freezes ALL non-LoRA base parameters by default
-        # (its purpose: keep the base model fixed and only train LoRA leaves).
-        # That includes the vision tower, even if ``--freeze_vision_tower`` is
-        # NOT set. Consequence: without this opt-back-in, ``--freeze_vision_tower``
-        # is a no-op (PEFT had already frozen vision base) and — worse — vision-
-        # encoder LoRA cannot receive gradient. The reentrant gradient
-        # checkpointing block around the visual encoder requires at least one
-        # input tensor with ``requires_grad=True`` for backward to fire; with the
-        # raw image tensor and frozen base both at ``requires_grad=False``, the
-        # checkpoint's backward short-circuits and ALL vision-side LoRA stays
-        # dead (``lora_B=0``).
-        #
-        # When ``--freeze_vision_tower`` is NOT set, unfreeze the vision base
-        # weights here so:
-        #   1. Vision encoder forward produces grad-bearing output.
-        #   2. The grad-checkpoint backward fires.
-        #   3. Vision-encoder LoRA (on both adapters in multi-adapter mode)
-        #      receives gradient.
-        # This matches veRL / VLM-R1's default of trainable-vision-tower RL.
-        # When ``--freeze_vision_tower`` IS set, leave vision base frozen and
-        # rely on ``routing.frozen_lora_patterns`` to also freeze vision LoRA
-        # if a fully-frozen vision side is desired.
-        if not args.freeze_vision_tower:
-            n_unfrozen_base = 0
-            for name, param in model.named_parameters():
-                # Match base layer params under the visual subtree. PEFT names
-                # them ``...visual.<...>.base_layer.weight`` (when LoRA wrapped)
-                # or ``...visual.<...>.weight`` (when not LoRA wrapped — e.g.
-                # patch_embed Conv3d, layernorms). Both should be unfrozen.
-                if "visual" in name and "lora_" not in name and not param.requires_grad:
-                    param.requires_grad = True
-                    n_unfrozen_base += 1
-            logger.info(
-                f"Unfroze {n_unfrozen_base} vision-tower base params (PEFT had auto-frozen "
-                "them; --freeze_vision_tower not set so we want them trainable)."
-            )
+        # PEFT's ``get_peft_model`` freezes ALL non-LoRA base parameters by
+        # default — that is the entire purpose of LoRA fine-tuning. Vision
+        # tower, merger, and language-decoder base weights all end up frozen
+        # automatically. With ``exclude_modules`` set above (via
+        # ``frozen_lora_patterns``), visual modules also have no LoRA wrapping,
+        # so the vision side is fully frozen end-to-end without any extra
+        # bookkeeping. This is the recipe that matches LIVR / VLM-R1's LoRA
+        # mode: language-decoder LoRA only, everything else frozen.
 
         model.print_trainable_parameters()
         logger.info(f"LoRA applied (r={args.lora_r}, alpha={args.lora_alpha})")

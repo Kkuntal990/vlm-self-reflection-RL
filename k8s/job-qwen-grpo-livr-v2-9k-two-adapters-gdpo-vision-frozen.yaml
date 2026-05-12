@@ -22,20 +22,22 @@ spec:
           echo "========================================="
           echo "two-adapters GDPO + vision-frozen variant"
           echo ""
-          echo "Setup:"
-          echo "  - TWO trainable LoRA adapters, ALL visual LoRA frozen:"
+          echo "Setup — text-decoder-only LoRA training (LIVR/VLM-R1 recipe):"
+          echo "  - TWO trainable LoRA adapters; vision side fully frozen."
           echo "      * 'response' (init from baseline-A1 ckpt-1000 — 61.4% BLINK)."
-          echo "        Note baseline-A1 ckpt-1000 was trained with LoRA on the"
-          echo "        merger MLP; loading it brings those tensors with it."
-          echo "        The frozen_lora_patterns=[\"visual\"] entry in routing"
-          echo "        forces requires_grad=False on every visual.* LoRA"
-          echo "        param (both adapters), so the merger LoRA does not"
-          echo "        update during this run — matching LIVR-paper recipe."
-          echo "      * 'feedback' starts FRESH from base."
-          echo "  - --freeze_vision_tower: freezes vision encoder + merger BASE"
-          echo "    weights (existing flag, complements the LoRA freeze above)."
-          echo "  - LoRA rank ${LORA_R:-32} (smaller than r=64 baseline) — only"
-          echo "    language-decoder LoRA actually trains in this variant."
+          echo "        baseline-A1 was trained with LoRA on the merger; loading"
+          echo "        carries those tensors over. frozen_lora_patterns=[\"visual\"]"
+          echo "        forces requires_grad=False on response's visual LoRA so"
+          echo "        the merger LoRA does NOT update this run."
+          echo "      * 'feedback' is fresh; exclude_modules=\".*visual.*\" tells"
+          echo "        PEFT not to wrap visual modules with LoRA at all, so"
+          echo "        feedback has no visual LoRA tensors to begin with."
+          echo "  - Vision encoder + merger base: frozen by PEFT default"
+          echo "    (get_peft_model freezes all non-LoRA base parameters). No"
+          echo "    custom freeze code, no --freeze_vision_tower flag needed."
+          echo "  - LoRA rank ${LORA_R:-16}, alpha ${LORA_ALPHA:-32} (matches LIVR"
+          echo "    recipe; smaller than baseline-A1's r=64 since only the"
+          echo "    language decoder is being adapted)."
           echo "  - GDPO normalization ON (per-component K-group advantage"
           echo "    normalize → weighted sum → batch renorm), Dr.GRPO loss OFF."
           echo "  - Rewards (simplified two-adapter regime):"
@@ -89,8 +91,8 @@ spec:
             --temperature ${TEMPERATURE:-1.0} \
             --feedback_temperature ${FEEDBACK_TEMPERATURE:-1.0} \
             --a2_temperature ${A2_TEMPERATURE:-0.7} \
-            --learning_rate ${LEARNING_RATE:-5e-6} \
-            --lr_warmup_steps ${LR_WARMUP_STEPS:-100} \
+            --learning_rate ${LEARNING_RATE:-1e-5} \
+            --lr_warmup_steps ${LR_WARMUP_STEPS:-56} \
             --per_device_train_batch_size ${BATCH_SIZE:-2} \
             --gradient_accumulation_steps ${GRAD_ACC:-1} \
             --num_train_epochs ${EPOCHS:-1} \
@@ -103,9 +105,8 @@ spec:
             --clip_range ${CLIP_RANGE:-0.2} \
             --clip_high ${CLIP_HIGH:-0.28} \
             --loss_type ${LOSS_TYPE:-grpo} \
-            --lora_r ${LORA_R:-32} \
-            --lora_alpha ${LORA_ALPHA:-64} \
-            --freeze_vision_tower \
+            --lora_r ${LORA_R:-16} \
+            --lora_alpha ${LORA_ALPHA:-32} \
             --max_pixels ${MAX_PIXELS:-401408} \
             --min_pixels ${MIN_PIXELS:-200704} \
             --w_a1_correctness 0.0 \
@@ -194,14 +195,29 @@ spec:
         - name: A2_TEMPERATURE
           value: "0.7"
 
-        # LR=5e-6 (SCoRe MATH value). Lower than the 1e-5 used in the prior
-        # crashed two-adapter runs.
+        # LR=1e-5: matches VLM-R1 LoRA recipe (run_grpo_rec_lora.sh) and SCoRe
+        # MBPP. Higher than the 5e-6 used in the prior crashed two-adapter
+        # runs, but paired with tighter KL anchor (A2/F1 β=0.04 vs prior 1e-6)
+        # the trust region constrains drift.
         - name: LEARNING_RATE
-          value: "5e-6"
+          value: "1e-5"
+        # Warmup = 5% of total outer steps. With dataset=9000 prompts,
+        # per_device_train_batch_size=2, num_gpus=4, grad_acc=1 → effective
+        # batch=8 prompts → 1125 outer steps for 1 epoch. 5% ≈ 56 steps.
         - name: LR_WARMUP_STEPS
-          value: "100"
+          value: "56"
         - name: BATCH_SIZE
           value: "2"
+        # GRAD_ACC: currently NOT wired into the GRPO trainer's outer loop
+        # (only used by HF Trainer's optimizer.step()). The CLI flag exists
+        # and is stored on SelfReflectionConfig but critic_grpo.py does not
+        # consult it — every outer step calls optimizer.step() unconditionally.
+        # Setting GRAD_ACC>1 here is therefore currently a no-op; the
+        # effective batch is per_device_train_batch_size × num_gpus × K=12
+        # = 96 trajectories per gradient update regardless. If we want to
+        # accumulate across outer steps in future, the inner-loop's
+        # zero_grad/step calls in critic_grpo.py:1424/1730 need to be gated
+        # on (global_step % grad_acc == 0).
         - name: GRAD_ACC
           value: "1"
         - name: EPOCHS
@@ -209,13 +225,13 @@ spec:
         - name: NUM_GPUS
           value: "4"
 
-        # LoRA r=32 (half the r=64 used elsewhere). With vision LoRA frozen
-        # there is less effective capacity; r=32 is a reasonable language-
-        # decoder-only rank.
+        # LoRA r=16, alpha=32 (alpha/r = 2.0). Matches the LIVR paper recipe
+        # exactly (r=16). VLM-R1 LoRA recipe uses r=64; the smaller rank here
+        # is appropriate when only the language decoder is being adapted.
         - name: LORA_R
-          value: "32"
+          value: "16"
         - name: LORA_ALPHA
-          value: "64"
+          value: "32"
 
         - name: VLLM_GPU_MEM
           value: "0.40"
