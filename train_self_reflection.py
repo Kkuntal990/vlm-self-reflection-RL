@@ -747,24 +747,52 @@ def main() -> None:
 
     # Apply LoRA
     if not args.no_peft:
+        import re as _re
+
         from peft import LoraConfig, get_peft_model
 
-        # Qwen2.5-VL: use all-linear targets. PEFT auto-excludes frozen
-        # vision tower params (requires_grad=False), but includes the
-        # visual merger MLP which bridges vision→language. Removing the
-        # merger from LoRA targets caused entropy collapse (v6 runs) due
-        # to higher effective lr per param. The dead vision LoRA_B params
-        # (~350MB) are acceptable overhead for training stability.
+        # Qwen2.5-VL: use all-linear targets. The visual merger MLP bridges
+        # vision→language; removing the merger from LoRA targets unconditionally
+        # caused entropy collapse (v6 runs) due to higher effective lr per
+        # param, so we keep "all-linear" as the default discovery.
         # LLaVA: use explicit target modules from config.
         if model_type == "qwen2vl":
             target_modules = "all-linear"
         else:
             target_modules = config.lora_target_modules
 
+        # When routing declares ``frozen_lora_patterns`` (e.g. Job A:
+        # ["visual"]), translate those substring patterns into a regex for
+        # PEFT's ``exclude_modules`` so the matching modules are not even
+        # LoRA-wrapped for adapters we add fresh (the ``feedback`` adapter in
+        # our standard routing). PEFT's exclude_modules with a STRING is
+        # treated as a regex matched against the full module name; we wrap
+        # each user-supplied pattern as ``.*<pattern>.*`` and join with |.
+        #
+        # NOTE: this affects only the LoRA config used for FRESH adapters
+        # (``add_adapter`` inside init_multi_adapter_model). The first
+        # adapter loaded via ``PeftModel.from_pretrained`` reads its own
+        # ``adapter_config.json`` from the checkpoint and ignores our
+        # exclude regex — e.g. the response adapter warm-started from
+        # baseline-A1 still carries vision LoRA tensors, but they remain
+        # frozen via ``frozen_lora_patterns`` enforcement in
+        # ``_apply_trainable_flags`` / ``_enforce_trainable_grad_flags``.
+        exclude_modules = None
+        if adapter_routing.enabled and adapter_routing.frozen_lora_patterns:
+            exclude_modules = "|".join(
+                ".*" + _re.escape(p) + ".*"
+                for p in adapter_routing.frozen_lora_patterns
+            )
+            logger.info(
+                f"LoRA exclude_modules regex set to {exclude_modules!r} "
+                f"(derived from frozen_lora_patterns={adapter_routing.frozen_lora_patterns})"
+            )
+
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             target_modules=target_modules,
+            exclude_modules=exclude_modules,
             task_type="CAUSAL_LM",
         )
 

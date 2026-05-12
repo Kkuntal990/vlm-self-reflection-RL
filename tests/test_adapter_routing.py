@@ -593,3 +593,55 @@ def test_frozen_lora_patterns_default_empty() -> None:
     }
     cfg = AdapterRoutingConfig.from_dict(raw)
     assert cfg.frozen_lora_patterns == []
+
+
+def test_frozen_lora_patterns_translate_to_exclude_modules_regex() -> None:
+    """When ``frozen_lora_patterns`` is non-empty, ``train_self_reflection.py``
+    builds a regex that PEFT's ``LoraConfig.exclude_modules`` understands as
+    ``fullmatch``-able, so the matching modules are SKIPPED entirely (not
+    LoRA-wrapped). Save memory on fresh adapters in Job-A-style runs.
+
+    PEFT's exclude_modules with a substring LIST does NOT match by substring
+    (it uses suffix matching), so the trainer translates ``["visual"]`` →
+    ``".*visual.*"``. This test pins that translation and verifies PEFT
+    actually excludes the matching modules.
+    """
+    import re
+
+    import torch.nn as nn
+
+    from peft import LoraConfig, get_peft_model
+
+    class M(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.visual_qkv = nn.Linear(8, 8)
+            self.visual_merger = nn.Linear(8, 8)
+            self.language_q = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.language_q(x)
+
+        def prepare_inputs_for_generation(self, *a, **k):
+            return {}
+
+    frozen_patterns = ["visual"]
+    # Same translation the trainer applies.
+    exclude_regex = "|".join(".*" + re.escape(p) + ".*" for p in frozen_patterns)
+    assert exclude_regex == ".*visual.*"
+
+    cfg = LoraConfig(
+        r=4, lora_alpha=8, target_modules="all-linear", exclude_modules=exclude_regex
+    )
+    pm = get_peft_model(M(), cfg, adapter_name="response")
+
+    # Every LoRA-wrapped module's name should NOT contain "visual".
+    lora_module_names = {
+        n.split(".lora_A.")[0]
+        for n, _ in pm.named_parameters()
+        if ".lora_A." in n and ".weight" in n
+    }
+    assert lora_module_names, "no LoRA wrapping happened at all — bad test setup"
+    assert all("visual" not in n for n in lora_module_names), (
+        f"exclude_modules regex did not exclude visual modules; LoRA names: {lora_module_names}"
+    )
