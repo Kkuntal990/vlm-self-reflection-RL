@@ -98,9 +98,9 @@ spec:
             --num_train_epochs ${EPOCHS:-1} \
             --num_inner_epochs ${INNER_EPOCHS:-1} \
             --kl_coeff ${KL_COEFF:-0.001} \
-            --a1_kl_coeff ${A1_KL_COEFF:-700.0} \
-            --a2_kl_coeff ${A2_KL_COEFF:-40.0} \
-            --fb_kl_coeff ${FB_KL_COEFF:-40.0} \
+            --a1_kl_coeff ${A1_KL_COEFF:-1500.0} \
+            --a2_kl_coeff ${A2_KL_COEFF:-220.0} \
+            --fb_kl_coeff ${FB_KL_COEFF:-220.0} \
             --separate_turn_loss \
             --clip_range ${CLIP_RANGE:-0.2} \
             --clip_high ${CLIP_HIGH:-0.28} \
@@ -153,17 +153,43 @@ spec:
           value: |
             {"turns": {"a1": "response", "f1": "feedback", "a2": "response"}, "adapters": [{"name": "response", "trainable": true, "init_from_checkpoint": "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"}, {"name": "feedback", "trainable": true}], "frozen_lora_patterns": ["visual"]}
 
-        # KL anchor — see two-adapters-a1init's predecessor for the lit
-        # comparison. A1 effective β=0.7 (anchors the W_A1=0 turn). A2 / F1
-        # effective β=0.04, matching VLM-R1, DocThinker, TRL default.
+        # KL anchor
+        # ---------
+        # The trainer aggregates KL as sum_t(k3) / max_completion_length per
+        # turn. For a completion of N tokens this is equivalent to a mean-
+        # aggregated KL with β_effective = (KL_COEFF * turn_coeff) *
+        # (N / max_len). Our typical completion lengths from prior trajectory
+        # logs: A1~150, F1~85, A2~70 of max_len=386. At those lengths:
+        #
+        #   A1 β_eff = 0.001 * 1500 * (150/386) = 0.583
+        #   A2 β_eff = 0.001 *  220 * (70/386)  = 0.040
+        #   F1 β_eff = 0.001 *  220 * (85/386)  = 0.048
+        #
+        # Field reference values (all mean-aggregation):
+        #   VL-Rethinker (Qwen2.5-VL 7B/72B, NeurIPS '25):  β = 0.0
+        #   DeepSeek-R1 (text-only):                         β = 0.001
+        #   SCoRe Stage II β1 (text-only multi-turn):        β = 0.01
+        #   VLM-R1 LoRA / DocThinker / TRL default:          β = 0.04
+        #   SCoRe Stage I β2 MATH (frozen first-attempt):    β = 0.10
+        #   SCoRe Stage I β2 MBPP:                           β = 0.25
+        #
+        # A1  β_eff 0.583  →  5.8x SCoRe MATH, 2.3x SCoRe MBPP. Extra
+        #                     safety margin since A1 has W_A1_*=0 and
+        #                     shares the response LoRA with A2 (which
+        #                     creates "free drift" through shared params).
+        # A2  β_eff 0.040  →  matches VLM-R1 / DocThinker / TRL default at
+        #                     typical completion length (prior turn_coeff=40
+        #                     only matched at FULL length; turn_coeff=220
+        #                     compensates for our shorter A2 completions).
+        # F1  β_eff 0.048  →  same regime as A2.
         - name: KL_COEFF
           value: "0.001"
         - name: A1_KL_COEFF
-          value: "700.0"
+          value: "1500.0"
         - name: A2_KL_COEFF
-          value: "40.0"
+          value: "220.0"
         - name: FB_KL_COEFF
-          value: "40.0"
+          value: "220.0"
 
         # GRPO core — vanilla GRPO loss + GDPO normalization. DAPO clip-higher
         # 0.28 + dynamic sampling.
