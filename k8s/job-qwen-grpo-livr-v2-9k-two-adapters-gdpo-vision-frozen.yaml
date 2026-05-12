@@ -324,9 +324,16 @@ spec:
 
         - name: PYTHONUNBUFFERED
           value: "1"
-        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True intentionally NOT
-        # set — it's incompatible with vLLM's CuMemAllocator and was the
-        # source of the 4-minute pod crash on the first two-adapter deploy.
+        # PYTORCH_CUDA_ALLOC_CONF must be explicitly EMPTY here — the
+        # huggingface/trl:0.29.0 image bakes in
+        # ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` which is
+        # INCOMPATIBLE with vLLM 0.12.0's CuMemAllocator and triggers an
+        # immediate AssertionError at vLLM init (vllm/device_allocator/
+        # cumem.py:155, "Expandable segments are not compatible with memory
+        # pool"). A Kubernetes env entry with ``value: ""`` overrides the
+        # image's setting, letting the assertion pass.
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: ""
         - name: NCCL_TIMEOUT
           value: "1800"
         - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
