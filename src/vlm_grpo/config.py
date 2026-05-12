@@ -137,6 +137,7 @@ class ResponseRewardWeights:
                + w_a2_correctness * R_a2_correct
                + w_a2_format       * R_a2_format
                + w_no_regression  * R_no_regression
+               + w_wr_bonus       * R_wr_bonus
 
     Per-turn split convention: each turn carries a 0.9·corr + 0.1·fmt
     sub-reward. With turn weight 0.3 each and no_regression 0.4, this
@@ -153,6 +154,14 @@ class ResponseRewardWeights:
         w_a2_correctness: Weight for A2 correctness  (0.9 × turn_weight)
         w_a2_format:      Weight for A2 format       (0.1 × turn_weight)
         w_no_regression:  Weight for transition / shaped reward
+        w_wr_bonus:       Weight for an additive bonus that fires when
+            A1 is wrong AND A2 is right (the WR quadrant). The component
+            is a Bernoulli {0, 1} indicator, so the contribution to
+            total reward is either 0 or ``w_wr_bonus``. Designed as a
+            "promote-WR without penalising-RW" knob that does NOT push
+            the model to actively degrade A1 (Option 5 in the literature
+            menu vs SCoRe / ReST-MCTS shaping). Defaults to 0.0 so
+            existing experiments are unaffected.
     """
 
     w_a1_correctness: float = 0.27
@@ -160,6 +169,7 @@ class ResponseRewardWeights:
     w_a2_correctness: float = 0.27
     w_a2_format: float = 0.03
     w_no_regression: float = 0.40
+    w_wr_bonus: float = 0.0
 
     def __post_init__(self) -> None:
         _validate_weight_sum("ResponseRewardWeights", self.to_dict())

@@ -579,12 +579,19 @@ def compute_response_reward_breakdown(
         else:
             r_no_reg = 2.0 if a2_correct else 0.0
 
+    # WR bonus: Bernoulli {0, 1} indicator that fires when A1 was wrong
+    # and A2 corrected to right (the WR quadrant). Additive — does NOT
+    # penalise RW (unlike no_regression shaping). Off by default
+    # (w_wr_bonus=0.0). See ResponseRewardWeights docstring.
+    r_wr_bonus = 1.0 if (not a1_correct and a2_correct) else 0.0
+
     components = {
         "a1_correctness": r_a1,
         "a1_format": r_a1_format,
         "a2_correctness": r_a2,
         "a2_format": r_a2_format,
         "no_regression": r_no_reg,
+        "wr_bonus": r_wr_bonus,
     }
     weighted_components = {
         "a1_correctness": r_a1 * weights.w_a1_correctness,
@@ -592,6 +599,7 @@ def compute_response_reward_breakdown(
         "a2_correctness": r_a2 * weights.w_a2_correctness,
         "a2_format": r_a2_format * weights.w_a2_format,
         "no_regression": r_no_reg * weights.w_no_regression,
+        "wr_bonus": r_wr_bonus * weights.w_wr_bonus,
     }
     total_reward = sum(weighted_components.values())
 
@@ -1101,12 +1109,17 @@ def compute_response_reward_breakdown_01(
             raw_no_reg = 2.0 if a2_correct else 0.0
         r_no_reg = _to_unit(raw_no_reg, _NO_REG_OPEN_RANGE[0], _NO_REG_OPEN_RANGE[1])
 
+    # WR bonus (rescaled path): same Bernoulli {0, 1} indicator. Already
+    # in [0, 1] so no rescaling needed. Matches the raw path component.
+    r_wr_bonus = 1.0 if (not a1_correct and a2_correct) else 0.0
+
     components = {
         "a1_correctness": r_a1,
         "a1_format": r_a1_format,
         "a2_correctness": r_a2,
         "a2_format": r_a2_format,
         "no_regression": r_no_reg,
+        "wr_bonus": r_wr_bonus,
     }
     weighted_components = {
         "a1_correctness": r_a1 * weights.w_a1_correctness,
@@ -1114,6 +1127,7 @@ def compute_response_reward_breakdown_01(
         "a2_correctness": r_a2 * weights.w_a2_correctness,
         "a2_format": r_a2_format * weights.w_a2_format,
         "no_regression": r_no_reg * weights.w_no_regression,
+        "wr_bonus": r_wr_bonus * weights.w_wr_bonus,
     }
     total_reward = sum(weighted_components.values())
 

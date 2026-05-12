@@ -314,6 +314,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_a2_correctness", type=float, default=0.27)
     parser.add_argument("--w_a2_format", type=float, default=0.03)
     parser.add_argument("--w_no_regression", type=float, default=0.40)
+    # WR-bonus: additive Bernoulli reward when A1 wrong AND A2 right.
+    # Default 0 keeps existing experiments unaffected. Set to 1.0 to
+    # promote refinement without penalising RW (Option 5 from the
+    # reward-design menu — distinct from no_regression shaping which
+    # also penalises RW).
+    parser.add_argument("--w_wr_bonus", type=float, default=0.0)
 
     # Feedback reward weights (must sum to 1.0)
     parser.add_argument("--w_downstream", type=float, default=0.45)
@@ -520,6 +526,7 @@ def main() -> None:
         w_a2_correctness=args.w_a2_correctness,
         w_a2_format=args.w_a2_format,
         w_no_regression=args.w_no_regression,
+        w_wr_bonus=args.w_wr_bonus,
     )
     feedback_weights = FeedbackRewardWeights(
         w_downstream=args.w_downstream,
@@ -780,8 +787,7 @@ def main() -> None:
         exclude_modules = None
         if adapter_routing.enabled and adapter_routing.frozen_lora_patterns:
             exclude_modules = "|".join(
-                ".*" + _re.escape(p) + ".*"
-                for p in adapter_routing.frozen_lora_patterns
+                ".*" + _re.escape(p) + ".*" for p in adapter_routing.frozen_lora_patterns
             )
             logger.info(
                 f"LoRA exclude_modules regex set to {exclude_modules!r} "
