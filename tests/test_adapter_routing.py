@@ -645,3 +645,87 @@ def test_frozen_lora_patterns_translate_to_exclude_modules_regex() -> None:
     assert all("visual" not in n for n in lora_module_names), (
         f"exclude_modules regex did not exclude visual modules; LoRA names: {lora_module_names}"
     )
+
+
+def test_multi_adapter_backward_loss_scale() -> None:
+    """``loss_scale`` divides each adapter's loss before backward, so the
+    accumulated gradient over N micro-steps reproduces the unscaled single-
+    step magnitude. Used by the grad-accumulation wrapper.
+    """
+    import torch
+    import torch.nn as nn
+
+    from peft import LoraConfig, get_peft_model
+
+    from vlm_grpo.config import AdapterRoutingConfig
+    from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
+
+    class M(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.l = nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.l(x)
+
+        def prepare_inputs_for_generation(self, *a, **k):
+            return {}
+
+    # ONE model — we'll run two backwards on it with different loss_scale
+    # values, zeroing grads in between, and compare. Using one model avoids
+    # the Kaiming-init randomness that would otherwise differ between two
+    # separate ``get_peft_model`` calls.
+    model = M()
+    peft_model = get_peft_model(
+        model, LoraConfig(r=4, lora_alpha=8, target_modules=["l"]), adapter_name="response"
+    )
+    peft_model.add_adapter("feedback", LoraConfig(r=4, lora_alpha=8, target_modules=["l"]))
+    for name, p in peft_model.named_parameters():
+        if "lora_" in name:
+            p.requires_grad_(True)
+    trainer = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
+    trainer._routing = AdapterRoutingConfig.from_dict(
+        {
+            "turns": {"a1": "response", "f1": "feedback", "a2": "response"},
+            "adapters": [
+                {"name": "response", "trainable": True},
+                {"name": "feedback", "trainable": True},
+            ],
+        }
+    )
+
+    x = torch.randn(2, 8, requires_grad=True)
+
+    def run_backward(loss_scale: float) -> dict:
+        for p in peft_model.parameters():
+            p.grad = None
+        peft_model.set_adapter("response")
+        out_resp = peft_model(x).sum()
+        peft_model.set_adapter("feedback")
+        out_fb = peft_model(x).sum()
+        trainer._multi_adapter_backward(
+            inner_model=peft_model,
+            mb_loss=out_resp + out_fb,
+            mb_response_loss=out_resp,
+            mb_feedback_loss=out_fb,
+            loss_scale=loss_scale,
+        )
+        return {
+            name: p.grad.detach().clone()
+            for name, p in peft_model.named_parameters()
+            if "lora_B" in name and p.grad is not None
+        }
+
+    baseline_grads = run_backward(loss_scale=1.0)
+    assert baseline_grads, "baseline backward produced no gradients"
+
+    scaled_grads = run_backward(loss_scale=0.25)
+
+    # Each parameter's scaled gradient should equal 0.25 * baseline.
+    for name in baseline_grads:
+        assert name in scaled_grads
+        assert torch.allclose(scaled_grads[name], baseline_grads[name] * 0.25, atol=1e-6), (
+            f"loss_scale=0.25 should produce 0.25x gradient for {name}; "
+            f"got max abs diff "
+            f"{(scaled_grads[name] - baseline_grads[name] * 0.25).abs().max().item()}"
+        )

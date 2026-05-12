@@ -196,30 +196,37 @@ spec:
           value: "0.7"
 
         # LR=1e-5: matches VLM-R1 LoRA recipe (run_grpo_rec_lora.sh) and SCoRe
-        # MBPP. Higher than the 5e-6 used in the prior crashed two-adapter
-        # runs, but paired with tighter KL anchor (A2/F1 β=0.04 vs prior 1e-6)
-        # the trust region constrains drift.
+        # MBPP. Paired with the tighter KL anchor (A2/F1 β=0.04) the trust
+        # region constrains drift.
         - name: LEARNING_RATE
           value: "1e-5"
-        # Warmup = 5% of total outer steps. With dataset=9000 prompts,
-        # per_device_train_batch_size=2, num_gpus=4, grad_acc=1 → effective
-        # batch=8 prompts → 1125 outer steps for 1 epoch. 5% ≈ 56 steps.
+        # Warmup = 5% of total outer steps. The trainer's LR scheduler reads
+        # ``self.global_step`` (raw outer-step counter) regardless of
+        # gradient accumulation, so the warmup horizon stays in outer-step
+        # units even with grad_acc=8. With dataset=9000 prompts,
+        # per_device_train_batch_size=2, num_gpus=4 → 8 prompts per outer
+        # step → 1125 outer steps for one epoch. 5% ≈ 56 outer steps. With
+        # grad_acc=8 those 56 outer steps correspond to 7 actual optimizer
+        # updates (warmup rises 1/8 → 8/8 across those 7 steps).
         - name: LR_WARMUP_STEPS
           value: "56"
         - name: BATCH_SIZE
           value: "2"
-        # GRAD_ACC: currently NOT wired into the GRPO trainer's outer loop
-        # (only used by HF Trainer's optimizer.step()). The CLI flag exists
-        # and is stored on SelfReflectionConfig but critic_grpo.py does not
-        # consult it — every outer step calls optimizer.step() unconditionally.
-        # Setting GRAD_ACC>1 here is therefore currently a no-op; the
-        # effective batch is per_device_train_batch_size × num_gpus × K=12
-        # = 96 trajectories per gradient update regardless. If we want to
-        # accumulate across outer steps in future, the inner-loop's
-        # zero_grad/step calls in critic_grpo.py:1424/1730 need to be gated
-        # on (global_step % grad_acc == 0).
+        # GRAD_ACC: wired in critic_grpo.py:
+        #   * zero_grad fires at the start of each grad_acc-step cycle
+        #     (global_step % grad_acc == 0).
+        #   * Each outer step's backward accumulates into the existing grads,
+        #     with the loss pre-multiplied by 1/grad_acc to keep magnitude
+        #     comparable to a single equivalent-batch backward.
+        #   * Grad-norm clip + optimizer.step fire at the cycle end
+        #     ((global_step + 1) % grad_acc == 0).
+        #   * DDP all-reduce still runs every outer step.
+        # Effective batch with grad_acc=8:
+        #   per_device_train_batch_size × num_gpus × K_samples × grad_acc
+        #   = 2 × 4 × 12 × 8 = 768 trajectories per gradient update.
+        # Number of actual optimizer updates per epoch: 1125 / 8 ≈ 140.
         - name: GRAD_ACC
-          value: "1"
+          value: "8"
         - name: EPOCHS
           value: "1"
         - name: NUM_GPUS

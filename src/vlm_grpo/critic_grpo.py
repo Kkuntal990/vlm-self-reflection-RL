@@ -1403,6 +1403,39 @@ class SelfReflectionGRPOTrainer:
         clip_high = _ch if _ch > 0 else clip_range
         num_inner = self.config.num_inner_epochs
 
+        # Gradient accumulation. With ``grad_acc > 1`` we treat N consecutive
+        # outer ``train_step`` calls as a single optimization micro-cycle:
+        #   * ``optimizer.zero_grad()`` fires at the START of the cycle
+        #     (when ``global_step % grad_acc == 0``).
+        #   * Each outer step's backward accumulates into the existing grads.
+        #   * ``optimizer.step()`` + grad-clip fire at the END of the cycle
+        #     (when ``(global_step + 1) % grad_acc == 0``).
+        #   * Each loss is multiplied by ``1/grad_acc`` before backward so
+        #     the sum of N micro-batches' gradients reproduces the magnitude
+        #     of a single equivalent-batch backward (the "mean" convention,
+        #     matching HF Trainer).
+        #
+        # DDP all-reduce still fires every outer step — accumulating across
+        # ranks but reducing each rank's micro-step's gradient as it arrives
+        # is correct and avoids a giant final all-reduce.
+        #
+        # Guard: ``num_inner > 1`` is PPO-style multiple-pass updates per
+        # outer step. Combining it with grad-acc would require deciding
+        # whether to accumulate across inner_epochs or across outer steps;
+        # the current trainer only supports outer-step accumulation. We
+        # explicitly forbid the combination rather than silently mis-stepping.
+        grad_acc = max(1, int(getattr(self.config, "gradient_accumulation_steps", 1) or 1))
+        if grad_acc > 1 and num_inner > 1:
+            raise NotImplementedError(
+                f"gradient_accumulation_steps={grad_acc} is only wired for "
+                f"num_inner_epochs=1; got num_inner_epochs={num_inner}. To support "
+                "both, decide whether accumulation runs across inner epochs or "
+                "outer steps and gate the zero_grad/step calls accordingly."
+            )
+        is_cycle_start = (self.global_step % grad_acc == 0)
+        is_cycle_end = ((self.global_step + 1) % grad_acc == 0)
+        loss_scale = 1.0 / grad_acc
+
         # Step 5: Inner optimization epochs -- use pre-tokenized data to skip
         # redundant apply_chat_template / tokenizer calls on every pass.
         total_resp_loss = 0.0
@@ -1421,7 +1454,10 @@ class SelfReflectionGRPOTrainer:
         self._fb_total_tokens = 0
 
         for inner_epoch in range(num_inner):
-            self.optimizer.zero_grad()
+            # zero_grad only at the start of an accumulation cycle (and always
+            # when grad_acc=1, which makes is_cycle_start always True).
+            if is_cycle_start:
+                self.optimizer.zero_grad()
             epoch_resp_loss = 0.0
             epoch_fb_loss = 0.0
             epoch_kl_loss = 0.0
@@ -1690,6 +1726,7 @@ class SelfReflectionGRPOTrainer:
                     mb_loss=mb_loss,
                     mb_response_loss=mb_response_loss,
                     mb_feedback_loss=mb_feedback_loss,
+                    loss_scale=loss_scale,
                 )
 
             # Manually all-reduce gradients across DDP processes
@@ -1705,7 +1742,17 @@ class SelfReflectionGRPOTrainer:
             # With GRPO inner_epochs=1 and kl=0, loss is mathematically 0
             # but gradients are non-zero (REINFORCE gradient estimator).
             # Confirmed by TRL issue #3452: loss=0 with grad_norm>0 is expected.
-            grad_norm = torch.nn.utils.clip_grad_norm_(inner_model.parameters(), 1.0).item()
+            #
+            # When ``grad_acc > 1`` we want to clip and log the FULL accumulated
+            # gradient — but the clip itself must only fire at the end of the
+            # cycle, otherwise we'd clip mid-cycle gradients (already partial)
+            # and the cycle's effective contribution would be artificially
+            # capped. Compute the norm every micro-step for observability;
+            # only clip + step at cycle end.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                inner_model.parameters(),
+                1.0 if is_cycle_end else float("inf"),
+            ).item()
 
             # Linear LR warmup: 0 -> learning_rate over lr_warmup_steps. When
             # lr_warmup_steps == 0 (default), compute_warmup_lr returns
@@ -1718,16 +1765,20 @@ class SelfReflectionGRPOTrainer:
                 for g in self.optimizer.param_groups:
                     g["lr"] = effective_lr
 
-            # Skip optimizer step if any gradient contains NaN/inf
+            # Skip optimizer step if any gradient contains NaN/inf. A NaN
+            # anywhere in the accumulated gradients also poisons subsequent
+            # micro-steps in the same cycle — we zero_grad to discard the
+            # entire cycle's accumulation, then resume cleanly.
             has_nan_grad = not math.isfinite(grad_norm)
             if has_nan_grad:
                 logger.warning(
                     f"  [inner epoch {inner_epoch + 1}] NaN/inf gradient detected -- "
-                    "skipping optimizer step to preserve model weights"
+                    "skipping optimizer step and discarding accumulated grads"
                 )
                 self.optimizer.zero_grad()
-            else:
+            elif is_cycle_end:
                 self.optimizer.step()
+            # else: mid-cycle micro-step — keep grads, wait for cycle end.
 
             total_resp_loss += epoch_resp_loss
             total_fb_loss += epoch_fb_loss
@@ -2708,6 +2759,7 @@ class SelfReflectionGRPOTrainer:
         mb_loss: Any,
         mb_response_loss: Any,
         mb_feedback_loss: Any,
+        loss_scale: float = 1.0,
     ) -> None:
         """Call ``.backward()`` on the mini-batch loss, splitting across
         adapters when routing is enabled.
@@ -2755,6 +2807,12 @@ class SelfReflectionGRPOTrainer:
                 ``None`` when single_turn_a1 (only ``mb_loss`` is populated).
             mb_feedback_loss: F1 policy loss + F1 KL term. ``None`` when
                 single_turn_a1.
+            loss_scale: Scalar multiplied into every loss before
+                ``.backward()``. Used by the grad-accumulation wrapper to
+                divide each micro-step's loss by ``gradient_accumulation_steps``
+                so that the sum of N accumulated backward()s reproduces the
+                same gradient magnitude as a single equivalent-batch backward.
+                Default ``1.0`` (no scaling — standard non-accumulating path).
         """
         # Single-adapter or single-turn paths: do the combined backward.
         # ``mb_response_loss is None and mb_feedback_loss is None`` covers the
@@ -2765,7 +2823,7 @@ class SelfReflectionGRPOTrainer:
             or (mb_response_loss is None and mb_feedback_loss is None)
         ):
             if mb_loss is not None:
-                mb_loss.backward()
+                (mb_loss * loss_scale).backward()
             return
 
         a1_adapter = self._routing.adapter_for_turn("a1")
@@ -2789,7 +2847,7 @@ class SelfReflectionGRPOTrainer:
         # single adapter regardless — fall back to the combined backward.
         if a1_adapter == f1_adapter:
             if mb_loss is not None:
-                mb_loss.backward()
+                (mb_loss * loss_scale).backward()
             return
 
         # Multi-adapter split. After _routed_forward_multi's cleanup, the
@@ -2798,10 +2856,10 @@ class SelfReflectionGRPOTrainer:
         # this code is correct even if the cleanup is later removed).
         if mb_response_loss is not None and mb_response_loss.requires_grad:
             self._set_active_adapter(inner_model, a1_adapter)
-            mb_response_loss.backward()
+            (mb_response_loss * loss_scale).backward()
         if mb_feedback_loss is not None and mb_feedback_loss.requires_grad:
             self._set_active_adapter(inner_model, f1_adapter)
-            mb_feedback_loss.backward()
+            (mb_feedback_loss * loss_scale).backward()
 
     def _set_active_adapter(self, peft_model: Any, name: str) -> None:
         """Set the active adapter, preserving requires_grad on ALL trainable adapters.
