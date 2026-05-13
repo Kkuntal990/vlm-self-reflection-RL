@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen-grpo-livr-v2-9k-pag-faithful
+  name: qwen-grpo-livr-v2-9k-pag-1a-k8
 spec:
   backoffLimit: 2
   template:
@@ -20,25 +20,28 @@ spec:
         - |
           set -eo pipefail
           echo "========================================="
-          echo "PAG-faithful (arXiv:2506.10406) arm"
+          echo "PAG-faithful (arXiv:2506.10406) — single-adapter pivot"
           echo ""
-          echo "Three loadbearing differences vs the existing 2a-gdpo-vfrozen pod:"
-          echo "  1. Selective revision gate: F1 boxed verdict CORRECT -> no A2."
-          echo "     A2 is excluded from the A2 K-group baseline and from the"
-          echo "     A2 policy loss for that trajectory (matches PAG \xa73.1)."
-          echo "  2. Per-segment binary {0,1} rewards (PAG composition):"
+          echo "Key features:"
+          echo "  1. SINGLE adapter shared by A1, F1, A2. The verifier (F1)"
+          echo "     and reasoner (A1/A2) live in the SAME LoRA weights, so"
+          echo "     F1's verdict cannot drift to a marginal policy decoupled"
+          echo "     from A1/A2 confidence (the two-adapter sycophancy mode)."
+          echo "  2. Selective revision gate: F1 boxed verdict CORRECT -> no A2."
+          echo "     A2 excluded from K-group baseline + policy loss (PAG \xa73.1)."
+          echo "  3. Per-segment binary {0,1} rewards (PAG composition):"
           echo "       r_a1 = 0.9*R_a1_corr_01 + 0.1*R_a1_fmt"
           echo "       r_a2 = 0.9*R_a2_corr_01 + 0.1*R_a2_fmt + alpha*(R_a2_corr_01 - R_a1_corr_01)"
           echo "       r_f1 = 0.9*R_verification_01 + 0.1*R_fb_fmt"
-          echo "     alpha = ${PAG_SHAPING_ALPHA:-1.0} (matches PAG's rs_coef=1)."
-          echo "  3. A1 UNFROZEN + KL-anchored on baseline-A1 ckpt-1000."
-          echo "     A1 trains actively; A1_KL_COEFF=${A1_KL_COEFF:-220} matches"
-          echo "     A2/F1 anchor (uniform, since A1 is no longer frozen)."
+          echo "     alpha = ${PAG_SHAPING_ALPHA:-1.0} (PAG's rs_coef=1)."
+          echo "  4. A1 UNFROZEN + KL-anchored on baseline-A1 ckpt-1000."
+          echo "     A1_KL_COEFF=${A1_KL_COEFF:-220} uniform with A2/F1."
+          echo "  5. K = ${K_SAMPLES:-8} (was 12 in two-adapter scaffold;"
+          echo "     compute saved by sharing one forward across turns)."
           echo ""
-          echo "Kept from 2a-gdpo-vfrozen: two-adapter routing, K=12,"
-          echo "vanilla GRPO loss, vLLM-native loss path."
-          echo "Dropped: GDPO normalization, DAPO (dynamic sampling +"
-          echo "clip-higher) — symmetric PPO clip 0.2 now."
+          echo "Vanilla GRPO + symmetric PPO clip 0.2. No DAPO, no GDPO."
+          echo "Audit cleanup landed: A2 PPO temperature fix (Bug #1),"
+          echo "a2_reward_mean dilution fix (Bug #3), R_no_regression deleted."
           echo ""
           echo "Reward consumption path:"
           echo "  rollout.py routes to compute_pag_response_breakdown and"
@@ -130,20 +133,23 @@ spec:
         - name: DATASET_PATH
           value: "/outputs/livr_v2_train_snapshots/snap_20260501_154345_final/data/livr_v2_9task_train.jsonl"
         - name: OUTPUT_DIR
-          value: "/outputs/grpo_qwen_livr_v2_9k_pag_faithful"
+          value: "/outputs/grpo_qwen_livr_v2_9k_pag_1a_k8"
         - name: IMAGE_BASE_DIR
           value: "/outputs/image_base"
         - name: INIT_CHECKPOINT
           value: ""
 
         # === Adapter routing ===
-        # Same scaffold as 2a-gdpo-vision-frozen: response adapter inherits
-        # baseline-A1 ckpt-1000; feedback adapter is fresh; visual LoRA
-        # frozen on both. A1 trains actively (no --freeze_a1_steps flag —
-        # defaults to 0), anchored by KL on baseline-A1.
+        # SINGLE adapter shared by A1, F1, and A2. Pivot from the prior
+        # two-adapter scaffold — single-adapter restores internal consistency
+        # between the verifier (F1) and the reasoner (A1/A2): F1's verdict
+        # gradient and A1/A2's policy gradient flow through the SAME LoRA
+        # weights, so F1 can no longer drift to a marginal "always CORRECT"
+        # policy decoupled from the response head's actual confidence.
+        # Inherits from baseline-A1 ckpt-1000; visual LoRA stays frozen.
         - name: ADAPTER_ROUTING_JSON
           value: |
-            {"turns": {"a1": "response", "f1": "feedback", "a2": "response"}, "adapters": [{"name": "response", "trainable": true, "init_from_checkpoint": "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"}, {"name": "feedback", "trainable": true}], "frozen_lora_patterns": ["visual"]}
+            {"turns": {"a1": "shared", "f1": "shared", "a2": "shared"}, "adapters": [{"name": "shared", "trainable": true, "init_from_checkpoint": "/outputs/grpo_qwen_livr_v2_9k_baseline_a1/checkpoint-1000"}], "frozen_lora_patterns": ["visual"]}
 
         # PAG-faithful arm — α = 1.0 (paper default)
         - name: PAG_SHAPING_ALPHA
@@ -177,7 +183,7 @@ spec:
         # no clip-higher), NO GDPO (PAG uses RoleAdvNorm; two-adapter routing
         # provides role-isolation at the parameter level).
         - name: K_SAMPLES
-          value: "12"
+          value: "8"
         - name: LOSS_TYPE
           value: "grpo"
         - name: CLIP_RANGE
@@ -217,10 +223,12 @@ spec:
         - name: NUM_GPUS
           value: "4"
 
+        # LoRA r/α match baseline-A1 ckpt-1000 (single adapter inherits its
+        # weights via init_from_checkpoint above, so dimensions must agree).
         - name: LORA_R
-          value: "16"
+          value: "64"
         - name: LORA_ALPHA
-          value: "32"
+          value: "128"
 
         - name: VLLM_GPU_MEM
           # Lowered from 0.40 after step-17 OOM at cumem_allocator.cpp:112
@@ -305,7 +313,7 @@ spec:
               name: wandb-api-key
               key: key
         - name: WANDB_RUN_NAME
-          value: "grpo-livr-v2-9k-pag-faithful"
+          value: "grpo-livr-v2-9k-pag-1a-k8"
 
         resources:
           limits:
