@@ -231,7 +231,12 @@ spec:
           value: "32"
 
         - name: VLLM_GPU_MEM
-          value: "0.40"
+          # Lowered from 0.40 after step-17 OOM at cumem_allocator.cpp:112
+          # (vLLM 0.12 known issue: repeated sleep/wake cycles fragment the
+          # KV cache pool over many hundreds of cycles; 0.30 gives more
+          # headroom for the fragmentation cushion). Each turn is 3 wakes
+          # × 17 steps × 4 ranks ≈ 200+ cycles before the previous crash.
+          value: "0.30"
         - name: GIT_BRANCH
           value: "grpo-kl-ref-fix"
 
@@ -268,7 +273,10 @@ spec:
         - name: LOGGING_STEPS
           value: "10"
         - name: SAVE_STEPS
-          value: "250"
+          # Lowered from 250 → 100 after the previous run OOM'd at step ~17
+          # with no checkpoint saved. 100 steps ≈ 30 min of training, gives
+          # us a recoverable state much sooner if vLLM OOMs again.
+          value: "100"
         - name: SEED
           value: "42"
 
