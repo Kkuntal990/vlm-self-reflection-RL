@@ -634,6 +634,37 @@ class SelfReflectionGRPOTrainer:
                         "ema/a2_fmt_violation": metrics.get("sr/a2_format_violation_rate", 0),
                         "ema/fb_fmt_violation": metrics.get("sr/fb_format_violation_rate", 0),
                     }
+                    # PAG-only EMA metrics. Skipped silently on legacy runs
+                    # where the per-segment reward / gated fields are absent.
+                    # Selective revision (arXiv:2506.10406): the gate decides
+                    # whether A2 runs, so these tell you whether the model is
+                    # making sensible revise/skip decisions.
+                    if "sr/gated_rate" in metrics:
+                        ema_sources["ema/gated_rate"] = metrics["sr/gated_rate"]
+                    if "sr/effective_accuracy" in metrics:
+                        ema_sources["ema/effective_acc"] = metrics["sr/effective_accuracy"]
+                    if "sr/r_a1_mean" in metrics:
+                        ema_sources["ema/r_a1"] = metrics["sr/r_a1_mean"]
+                    if "sr/r_a2_mean" in metrics:
+                        ema_sources["ema/r_a2"] = metrics["sr/r_a2_mean"]
+                    if "sr/r_f1_mean" in metrics:
+                        ema_sources["ema/r_f1"] = metrics["sr/r_f1_mean"]
+                    if "sr/shaping_bonus_mean" in metrics:
+                        ema_sources["ema/shaping_bonus"] = metrics["sr/shaping_bonus_mean"]
+                    if "sr/productive_gate_rate" in metrics:
+                        ema_sources["ema/productive_gate_rate"] = metrics["sr/productive_gate_rate"]
+                    if "sr/sycophantic_gate_rate" in metrics:
+                        ema_sources["ema/sycophantic_gate_rate"] = metrics[
+                            "sr/sycophantic_gate_rate"
+                        ]
+                    if "sr/f1_correct_verdict_precision" in metrics:
+                        ema_sources["ema/f1_correct_verdict_precision"] = metrics[
+                            "sr/f1_correct_verdict_precision"
+                        ]
+                    if "sr/f1_wrong_verdict_precision" in metrics:
+                        ema_sources["ema/f1_wrong_verdict_precision"] = metrics[
+                            "sr/f1_wrong_verdict_precision"
+                        ]
                     for ema_key, raw_val in ema_sources.items():
                         wandb_dict[ema_key] = self._update_ema(ema_key, raw_val)
 
@@ -644,13 +675,24 @@ class SelfReflectionGRPOTrainer:
                     wandb_dict["ema/wr_minus_rw"] = self._ema.get("ema/wr_rate", 0) - self._ema.get(
                         "ema/rw_rate", 0
                     )
+                    if "ema/effective_acc" in self._ema and "ema/a1_acc" in self._ema:
+                        # Selective revision should LIFT effective accuracy
+                        # above A1 alone (the gate stops bad revisions while
+                        # productive revisions still fire). Watch this go
+                        # positive over training.
+                        wandb_dict["ema/effective_minus_a1"] = (
+                            self._ema["ema/effective_acc"] - self._ema["ema/a1_acc"]
+                        )
 
                     # Add reward component breakdown if available
                     for key in [
                         "sr/resp_a1_correctness_mean",
+                        "sr/resp_a1_format_mean",
                         "sr/resp_a2_correctness_mean",
-                        "sr/resp_no_regression_mean",
                         "sr/resp_a2_format_mean",
+                        "sr/resp_no_regression_mean",
+                        "sr/resp_shaping_bonus_mean",
+                        "sr/resp_wr_bonus_mean",
                         "sr/fb_downstream_mean",
                         "sr/fb_verification_mean",
                         "sr/fb_format_mean",
@@ -1882,11 +1924,23 @@ class SelfReflectionGRPOTrainer:
         rollout_metrics["sr/response_reward_std"] = resp_rewards_t.std().item()
         rollout_metrics["sr/feedback_reward_std"] = fb_rewards_t.std().item()
 
-        # Reward component breakdown (averaged across trajectories)
+        # Reward component breakdown (averaged across trajectories).
+        # A2-related components on the PAG path carry placeholder 0.0 for
+        # gated trajectories (A2 never ran). Averaging those zeros into the
+        # mean would understate the actual A2 component signal by exactly
+        # the gating fraction. Detect PAG breakdowns via the ``gated``
+        # attribute and skip A2 components for gated trajectories. A1 and
+        # F1 components are valid for every trajectory (A1 always runs;
+        # F1 always runs) and accumulate unconditionally.
+        _a2_component_keys = ("a2_correctness", "a2_format", "shaping_bonus")
         for result in rollout_results:
             if result.response_breakdowns:
                 for bd in result.response_breakdowns:
+                    is_gated = bool(getattr(bd, "gated", False))
                     for comp_name, comp_val in bd.weighted_components.items():
+                        if is_gated and comp_name in _a2_component_keys:
+                            # Skip — gated A2 placeholder, would bias the mean.
+                            continue
                         key = f"sr/resp_{comp_name}_mean"
                         rollout_metrics.setdefault(key, [])
                         rollout_metrics[key].append(comp_val)

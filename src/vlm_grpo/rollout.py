@@ -939,6 +939,27 @@ def compute_self_reflection_metrics(
     # in wandb dashboards.
     a2_fmt_violation_count = 0
     fb_fmt_violation_count = 0
+    # Per-segment PAG reward accumulators. Only meaningful when the rollout
+    # routed to ``compute_pag_response_breakdown`` (segment-rewards path).
+    # We detect this by the presence of ``r_a1`` / ``r_a2`` attributes; for
+    # legacy ``TrajectoryResponseRewardBreakdown`` these are absent and we
+    # skip the per-segment block entirely.
+    is_pag_path = False
+    r_a1_sum = 0.0
+    r_a2_sum = 0.0  # over non-gated trajectories only
+    r_f1_sum = 0.0
+    shaping_sum = 0.0  # over non-gated trajectories only
+    # F1 verdict calibration: F1 says CORRECT → trajectory gates.
+    #   • productive gate: gated AND A1 was actually correct (F1 right).
+    #   • sycophantic gate: gated AND A1 was actually wrong (F1 wrongly endorsed
+    #     a bad A1, preventing the corrective A2 from running).
+    # Among non-gated trajectories (F1 said WRONG or unparseable → A2 ran),
+    # honest_wrong_count = those where A1 was actually wrong (F1 right about
+    # needing revision).
+    productive_gate_count = 0
+    sycophantic_gate_count = 0
+    honest_wrong_count = 0
+    spurious_wrong_count = 0  # not gated AND A1 was actually correct (F1 wrongly demanded revision)
 
     for r in results:
         for resp_bd, fb_bd in zip(r.response_breakdowns, r.feedback_breakdowns):
@@ -959,13 +980,19 @@ def compute_self_reflection_metrics(
             is_gated = bool(getattr(resp_bd, "gated", False))
             if is_gated:
                 gated_count += 1
+                if resp_bd.a1_correct:
+                    productive_gate_count += 1
+                else:
+                    sycophantic_gate_count += 1
             else:
                 if resp_bd.a1_correct:
+                    spurious_wrong_count += 1
                     if resp_bd.a2_correct:
                         rr_count += 1
                     else:
                         rw_count += 1
                 else:
+                    honest_wrong_count += 1
                     if resp_bd.a2_correct:
                         wr_count += 1
                     else:
@@ -977,6 +1004,19 @@ def compute_self_reflection_metrics(
             if fb_bd.components.get("format", 1.0) == 0.0:
                 fb_fmt_violation_count += 1
 
+            # Per-segment PAG accumulators. ``r_a1``, ``r_a2`` exist only
+            # on ``PAGSegmentRewardBreakdown``; legacy breakdowns skip
+            # this block.
+            if hasattr(resp_bd, "r_a1"):
+                is_pag_path = True
+                r_a1_sum += float(resp_bd.r_a1)
+                if not is_gated and resp_bd.r_a2 is not None:
+                    r_a2_sum += float(resp_bd.r_a2)
+                    shaping_sum += float(resp_bd.components.get("shaping_bonus", 0.0))
+            # F1 reward is per-segment in both paths (the feedback breakdown
+            # is its own total). Accumulate unconditionally.
+            r_f1_sum += float(fb_bd.total_reward)
+
     a2_correct_count = rr_count + wr_count
     n = max(total, 1)
     # Denominator for transition rates: only non-gated trajectories actually
@@ -984,10 +1024,16 @@ def compute_self_reflection_metrics(
     # path / gate disabled) this collapses to ``n`` and the rates match the
     # historical definitions exactly.
     n_transitions = max(total - gated_count, 1)
-    return {
+    # Effective accuracy = A1 when gated (no A2 ran), A2 otherwise.
+    # This is the "what would actually be returned at inference" metric and
+    # is the right top-line accuracy for PAG runs.
+    effective_correct_count = productive_gate_count + a2_correct_count
+
+    metrics: dict[str, float] = {
         "sr/total_trajectories": float(total),
         "sr/a1_accuracy": a1_correct_count / n,
-        "sr/a2_accuracy": a2_correct_count / max(total - gated_count, 1),
+        "sr/a2_accuracy": a2_correct_count / n_transitions,
+        "sr/effective_accuracy": effective_correct_count / n,
         "sr/rr_rate": rr_count / n_transitions,
         "sr/rw_rate": rw_count / n_transitions,
         "sr/wr_rate": wr_count / n_transitions,
@@ -995,6 +1041,37 @@ def compute_self_reflection_metrics(
         "sr/gated_rate": gated_count / n,
         "sr/response_reward_mean": resp_reward_sum / n,
         "sr/feedback_reward_mean": fb_reward_sum / n,
-        "sr/a2_format_violation_rate": a2_fmt_violation_count / n,
+        # A2 format violation rate denominated by non-gated trajectories
+        # (gated A2 is empty by construction — counting that as a violation
+        # would just track the gating rate).
+        "sr/a2_format_violation_rate": a2_fmt_violation_count / n_transitions
+        if gated_count > 0
+        else a2_fmt_violation_count / n,
         "sr/fb_format_violation_rate": fb_fmt_violation_count / n,
     }
+
+    if is_pag_path:
+        # F1 verdict calibration. ``gated_count`` = number of times F1 said
+        # CORRECT; ``productive_gate_count`` is the subset where A1 was
+        # actually right. Similarly for the WRONG verdict path.
+        n_correct_verdicts = max(gated_count, 1)
+        n_wrong_verdicts = max(n_transitions, 1)
+        metrics.update(
+            {
+                # Per-segment reward means (the actual training signal).
+                "sr/r_a1_mean": r_a1_sum / n,
+                "sr/r_a2_mean": r_a2_sum / n_transitions,
+                "sr/r_f1_mean": r_f1_sum / n,
+                "sr/shaping_bonus_mean": shaping_sum / n_transitions,
+                # Gate quality.
+                "sr/productive_gate_rate": productive_gate_count / n,
+                "sr/sycophantic_gate_rate": sycophantic_gate_count / n,
+                # F1 verdict accuracy by direction:
+                #   • CORRECT verdict precision: P(A1 right | F1 said CORRECT)
+                #   • WRONG verdict precision:   P(A1 wrong | F1 said WRONG)
+                "sr/f1_correct_verdict_precision": productive_gate_count / n_correct_verdicts,
+                "sr/f1_wrong_verdict_precision": honest_wrong_count / n_wrong_verdicts,
+            }
+        )
+
+    return metrics
