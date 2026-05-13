@@ -377,17 +377,7 @@ def generate_self_reflection_rollout(
 
             # Step 1: Generate K A1s for every sample in the chunk.
             # repeat_interleave: [q0]*k + [q1]*k + ... -> chunk_size*k prompts
-            use_tags = config.use_think_answer_tags
-            use_answer_only = getattr(config, "use_answer_tag_only", False)
-            a1_prompts = [
-                build_initial_answer_prompt(
-                    q,
-                    use_think_answer_tags=use_tags,
-                    use_answer_tag_only=use_answer_only,
-                )
-                for q in chunk_qs
-                for _ in range(k)
-            ]
+            a1_prompts = [build_initial_answer_prompt(q) for q in chunk_qs for _ in range(k)]
             imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
 
             # Route generation through vLLM (if available) or HF generate.
@@ -497,8 +487,6 @@ def generate_self_reflection_rollout(
                         chunk_qs[i],
                         chunk_a1s[idx],
                         chunk_f1s[idx],
-                        use_think_answer_tags=use_tags,
-                        use_answer_tag_only=use_answer_only,
                     )
                 )
                 a2_imgs_active.append(imgs_expanded[idx])
@@ -602,8 +590,6 @@ def generate_self_reflection_rollout(
                     answer_type=answer_types[i],
                     choices=choices_list[i],
                     weights=response_weights,
-                    use_think_answer_tags=config.use_think_answer_tags,
-                    use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
                     pag_shaping_alpha=pag_alpha,
                     gated=gated,
                 )
@@ -637,8 +623,6 @@ def generate_self_reflection_rollout(
                     answer_type=answer_types[i],
                     choices=choices_list[i],
                     weights=response_weights,
-                    use_think_answer_tags=config.use_think_answer_tags,
-                    use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
                     reward_shaping_alpha=_get_response_alpha(config),
                 )
                 fb_bd = fb_fn(
@@ -744,17 +728,7 @@ def generate_baseline_a1_rollout(
             chunk_qs = questions[chunk_start:chunk_end]
             chunk_imgs = images[chunk_start:chunk_end]
 
-            use_tags = config.use_think_answer_tags
-            use_answer_only = getattr(config, "use_answer_tag_only", False)
-            a1_prompts = [
-                build_initial_answer_prompt(
-                    q,
-                    use_think_answer_tags=use_tags,
-                    use_answer_tag_only=use_answer_only,
-                )
-                for q in chunk_qs
-                for _ in range(k)
-            ]
+            a1_prompts = [build_initial_answer_prompt(q) for q in chunk_qs for _ in range(k)]
             imgs_expanded = [img for img in chunk_imgs for _ in range(k)]
 
             if vllm_engine is not None:

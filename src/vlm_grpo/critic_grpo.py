@@ -945,8 +945,6 @@ class SelfReflectionGRPOTrainer:
                     image = s.get("image")
                     break
 
-            use_tags = self.config.rollout.use_think_answer_tags
-            use_answer_only = bool(getattr(self.config.rollout, "use_answer_tag_only", False))
             single_turn_a1 = bool(getattr(self.config.rollout, "single_turn_a1", False))
             # rollout result token-id / logprob lists may be empty when
             # rolling back to legacy rollout paths; default to None per turn
@@ -969,11 +967,7 @@ class SelfReflectionGRPOTrainer:
                 f1_lp_list,
                 a2_lp_list,
             ):
-                a1_prompt = build_initial_answer_prompt(
-                    result.question,
-                    use_think_answer_tags=use_tags,
-                    use_answer_tag_only=use_answer_only,
-                )
+                a1_prompt = build_initial_answer_prompt(result.question)
                 a1_full = build_prompt_with_completion(a1_prompt, a1)
 
                 if single_turn_a1:
@@ -1002,13 +996,7 @@ class SelfReflectionGRPOTrainer:
                     )
                     f1_full = build_prompt_with_completion(f1_prompt, f1)
 
-                    a2_prompt = build_refiner_prompt(
-                        result.question,
-                        a1,
-                        f1,
-                        use_think_answer_tags=use_tags,
-                        use_answer_tag_only=use_answer_only,
-                    )
+                    a2_prompt = build_refiner_prompt(result.question, a1, f1)
                     a2_full = build_prompt_with_completion(a2_prompt, a2)
 
                     trajectory_data.append(
@@ -1284,6 +1272,7 @@ class SelfReflectionGRPOTrainer:
             imgs,
             completion_token_ids=[t.get("a1_completion_ids") for t in trajectory_data],
             completion_logprobs=[t.get("a1_completion_logprobs") for t in trajectory_data],
+            sampling_temperature=float(self.config.rollout.temperature),
         )
         if single_turn_a1:
             # Skip F1/A2 pretokenization entirely in baseline mode.
@@ -1295,12 +1284,14 @@ class SelfReflectionGRPOTrainer:
                 imgs,
                 completion_token_ids=[t.get("a2_completion_ids") for t in trajectory_data],
                 completion_logprobs=[t.get("a2_completion_logprobs") for t in trajectory_data],
+                sampling_temperature=float(self.config.rollout.a2_temperature),
             )
             f1_pretok = self._preprocess_trajectory_texts(
                 [t["f1_full"] for t in trajectory_data],
                 imgs,
                 completion_token_ids=[t.get("f1_completion_ids") for t in trajectory_data],
                 completion_logprobs=[t.get("f1_completion_logprobs") for t in trajectory_data],
+                sampling_temperature=float(self.config.rollout.feedback_temperature),
             )
 
         # Completion token lengths from pre-tokenized data (token count, not word count).
@@ -2024,13 +2015,29 @@ class SelfReflectionGRPOTrainer:
         # reflect the global view (matches rollout_metrics).
         resp_reward_global = resp_rewards_t.mean().item()
         fb_reward_global = fb_rewards_t.mean().item()
-        # Per-turn means (SCoRe-style), only populated when separate_turn_loss
+        # Per-turn means (SCoRe-style), only populated when separate_turn_loss.
+        # Under PAG selective revision, gated trajectories carry a 0.0 placeholder
+        # in a2_rewards_t (gated → A2 didn't run). Naive mean over all N·K would
+        # mechanically depress a2_reward_mean as F1's gate fires more often,
+        # disconnecting the metric from actual A2 quality. Compute a2_reward_mean
+        # over the active (non-gated) trajectories only, mirroring sr/r_a2_mean
+        # in rollout.compute_self_reflection_metrics. (Bug #3 fix.)
         if separate_turns and a1_rewards_t is not None and a2_rewards_t is not None:
             a1_reward_global = a1_rewards_t.mean().item()
-            a2_reward_global = a2_rewards_t.mean().item()
+            if use_pag:
+                a2_sum_local = float(a2_rewards_t[a2_active_mask].sum().item())
+                a2_count_local = float(a2_active_mask.sum().item())
+            else:
+                a2_sum_local = float(a2_rewards_t.sum().item())
+                a2_count_local = float(a2_rewards_t.numel())
+            a2_reward_global = (
+                a2_sum_local / a2_count_local if a2_count_local > 0 else float("nan")
+            )
         else:
             a1_reward_global = float("nan")
             a2_reward_global = float("nan")
+            a2_sum_local = 0.0
+            a2_count_local = 0.0
         if _dist_is_initialized():
             import torch as _torch
 
@@ -2039,7 +2046,8 @@ class SelfReflectionGRPOTrainer:
                     resp_reward_global,
                     fb_reward_global,
                     a1_reward_global if not math.isnan(a1_reward_global) else 0.0,
-                    a2_reward_global if not math.isnan(a2_reward_global) else 0.0,
+                    a2_sum_local,
+                    a2_count_local,
                 ],
                 device=self.device,
                 dtype=_torch.float32,
@@ -2050,7 +2058,16 @@ class SelfReflectionGRPOTrainer:
             fb_reward_global = float(vals[1].item()) / world_size
             if separate_turns:
                 a1_reward_global = float(vals[2].item()) / world_size
-                a2_reward_global = float(vals[3].item()) / world_size
+                # Globally-correct mean = sum_across_ranks / count_across_ranks
+                # (NOT the average of per-rank means, which would skew when
+                # gate rates differ across ranks).
+                a2_sum_global = float(vals[3].item())
+                a2_count_global = float(vals[4].item())
+                a2_reward_global = (
+                    a2_sum_global / a2_count_global
+                    if a2_count_global > 0
+                    else float("nan")
+                )
 
         return SelfReflectionTrainStepResult(
             loss=(total_resp_loss + total_fb_loss + total_kl_loss) / num_inner,
@@ -2211,6 +2228,7 @@ class SelfReflectionGRPOTrainer:
         images: list[Any],
         completion_token_ids: Optional[list[Optional[list[int]]]] = None,
         completion_logprobs: Optional[list[Optional[list[float]]]] = None,
+        sampling_temperature: float = 1.0,
     ) -> dict:
         """Pre-compute chat-template strings and token lengths for a trajectory batch.
 
@@ -2218,26 +2236,36 @@ class SelfReflectionGRPOTrainer:
         apply_chat_template + per-sequence tokenizer calls are not repeated on
         every inner epoch mini-batch forward pass.
 
-        When ``self.config.rollout.use_vllm_native_loss`` is True AND the
-        rollout engine provided ``completion_token_ids``, the pretok dict is
-        configured for the **native-token** path: ``full_lens`` is computed
-        from ``prompt_lens + len(vllm_completion_ids)`` rather than from
+        When the rollout engine provided ``completion_token_ids`` for every
+        trajectory in the batch, the pretok dict is configured for the
+        **native-token** path: ``full_lens`` is computed from
+        ``prompt_lens + len(vllm_completion_ids)`` rather than from
         retokenizing the full text, and the forward pass assembles
         ``input_ids = prompt_ids ++ vllm_completion_ids`` directly — bypassing
         the lossy ``apply_chat_template + tokenize`` round-trip on the
-        completion text (audit Bug 2). Otherwise the legacy retokenize path
-        is used and the Bug 2 length-mismatch warning is logged for telemetry.
+        completion text (audit Bug 2). This is the only path supported under
+        ``--use_vllm``; mixed batches where any trajectory lacks
+        ``completion_token_ids`` will not enable the native flag and the
+        forward pass will raise.
 
         Args:
             messages_list: N full message lists (prompt + assistant completion)
             images: N PIL Images (one per sequence, may be None)
-            completion_token_ids: Optional N-list of actual completion token
-                ids emitted by the rollout engine. Required for the native
-                path; used for the Bug 2 diagnostic in legacy mode.
-            completion_logprobs: Optional N-list of per-token sampled logprobs
-                aligned with ``completion_token_ids``. Stored on the pretok
-                dict so the trainer can use them as ``old_lp`` directly,
-                skipping one HF forward pass per step.
+            completion_token_ids: N-list of actual completion token ids
+                emitted by the rollout engine. Required for the native path.
+            completion_logprobs: N-list of per-token sampled logprobs aligned
+                with ``completion_token_ids``. Stored on the pretok dict so
+                the trainer can use them as ``old_lp`` directly, skipping one
+                HF forward pass per step.
+            sampling_temperature: Temperature the rollout engine used at
+                sample time for these trajectories. vLLM's per-step logprobs
+                live on ``log_softmax(logits / T)``, so the HF forward pass
+                that computes ``new_lp`` / ``ref_lp`` MUST apply the same
+                divisor to keep the PPO ratio ``exp(new_lp - old_lp) = 1`` at
+                step 0 (before any policy update). A1/F1 use T=1.0 (no-op
+                divisor); A2 typically uses T=0.7 in the active YAMLs and
+                this is the value that previously caused a systematic ratio
+                bias on A2 tokens.
 
         Returns:
             dict with keys:
@@ -2251,8 +2279,12 @@ class SelfReflectionGRPOTrainer:
                 completion_token_ids: same list as the argument (or None)
                 completion_logprobs: same list as the argument (or None)
                 native_path: bool — True iff every trajectory has a non-None
-                    completion_token_ids AND ``use_vllm_native_loss`` is on.
-                    The forward pass uses this flag to pick the assembly mode.
+                    completion_token_ids. The forward pass uses this flag to
+                    pick the assembly mode.
+                sampling_temperature: float — vLLM sampling temperature for
+                    this set, plumbed into the HF forward as a log-softmax
+                    divisor so old_lp (vLLM) and new_lp/ref_lp (HF) sit on
+                    the same distribution.
         """
         has_image = any(img is not None for img in images)
         full_texts: list[str] = []
@@ -2277,18 +2309,18 @@ class SelfReflectionGRPOTrainer:
         )
         prompt_lens = [len(ids) for ids in prompt_enc["input_ids"]]
 
-        # Decide path. Native path requires (a) the feature flag and (b) every
-        # trajectory carrying a non-None completion_token_ids. Tolerate
-        # ``self.config`` being absent on minimal stubs used in tests by
-        # walking the attribute chain defensively.
-        rollout_cfg = getattr(getattr(self, "config", None), "rollout", None)
-        native_loss = bool(getattr(rollout_cfg, "use_vllm_native_loss", False))
+        # Decide path. Native path requires every trajectory to carry a
+        # non-None completion_token_ids list. When any trajectory lacks one
+        # (e.g. a mixed HF-fallback batch in tests), the legacy retokenize
+        # path is used. Under ``--use_vllm`` the production rollout always
+        # emits completion_token_ids end-to-end, so the legacy branch below
+        # exists only for test stubs and is not exercised in real training.
         all_have_ids = (
             completion_token_ids is not None
             and len(completion_token_ids) == len(prompt_lens)
             and all(c is not None for c in completion_token_ids)
         )
-        native_path = native_loss and all_have_ids
+        native_path = all_have_ids
 
         if native_path:
             # Defense: vLLM samples from the full vocabulary, including the
@@ -2359,45 +2391,18 @@ class SelfReflectionGRPOTrainer:
             # len(completion_ids).
             full_lens = [pl + len(c) for pl, c in zip(prompt_lens, completion_token_ids)]
         else:
-            # Legacy retokenize path: full_lens reflect what
-            # ``apply_chat_template + tokenize`` actually produces for the
-            # full text (which may differ from len(prompt) + len(completion)
-            # due to non-bijective BPE round-trips on the completion text).
+            # Legacy retokenize fallback. Reached only when a trajectory
+            # lacks ``completion_token_ids`` (test stubs / future rollout
+            # paths that don't emit ids). Production vLLM and HF rollouts
+            # always emit token_ids, so the native_path branch above is the
+            # only path exercised in real training. ``full_lens`` here
+            # reflects what ``apply_chat_template + tokenize`` produces for
+            # the full text, which may differ from len(prompt) +
+            # len(completion) due to non-bijective BPE round-trips.
             full_enc = self.processor.tokenizer(
                 full_texts, padding=False, return_attention_mask=False
             )
             full_lens = [len(ids) for ids in full_enc["input_ids"]]
-
-            # Bug 2 diagnostic: when the rollout engine provided actual
-            # completion token ids, compare against the retokenized completion
-            # span. A mismatch means apply_chat_template + tokenize is producing
-            # a different label sequence than what vLLM actually sampled — the
-            # GRPO ratio is then computed against the wrong sequence, silently
-            # corrupting old/ref/new log-prob alignment. Setting
-            # ``use_vllm_native_loss=True`` makes the mismatch impossible by
-            # construction (which is why the warning only fires in the legacy
-            # path).
-            if completion_token_ids is not None and any(
-                c is not None for c in completion_token_ids
-            ):
-                mismatches = 0
-                sampled_examples: list[tuple[int, int, int]] = []
-                for i, comp_ids in enumerate(completion_token_ids):
-                    if comp_ids is None:
-                        continue
-                    retok_len = full_lens[i] - prompt_lens[i]
-                    vllm_len = len(comp_ids)
-                    if retok_len != vllm_len:
-                        mismatches += 1
-                        if len(sampled_examples) < 3:
-                            sampled_examples.append((i, retok_len, vllm_len))
-                if mismatches > 0:
-                    logger.warning(
-                        "[Bug 2] retokenize/vllm token-id length mismatch on "
-                        f"{mismatches}/{len(completion_token_ids)} trajectories "
-                        f"(examples idx,retok,vllm: {sampled_examples}). "
-                        "Set --use_vllm_native_loss to fix structurally."
-                    )
 
         return {
             "full_texts": full_texts,
@@ -2408,6 +2413,7 @@ class SelfReflectionGRPOTrainer:
             "completion_token_ids": completion_token_ids,
             "completion_logprobs": completion_logprobs,
             "native_path": native_path,
+            "sampling_temperature": float(sampling_temperature),
         }
 
     def _routed_forward_multi(
@@ -2532,6 +2538,16 @@ class SelfReflectionGRPOTrainer:
         all_imgs: list[Any] = []
         all_completion_ids: list[Optional[list[int]]] = []
         set_sizes: list[int] = []
+        # Per-trajectory sampling temperature, expanded from each pretok's
+        # set-level value. vLLM returns logprobs computed on
+        # ``log_softmax(logits / T)``, so the HF forward below MUST divide
+        # ``shift_logits`` by the same ``T`` before its own ``log_softmax`` to
+        # keep ``old_lp`` (vLLM) and ``new_lp`` / ``ref_lp`` (HF) on the same
+        # distribution. A1 and F1 use T=1.0 (divisor is a no-op); A2 typically
+        # uses T=0.7. Without this divisor the PPO ratio
+        # ``exp(new_lp - old_lp)`` is biased ≠ 1 even at step 0 for A2 tokens
+        # — see the bug discussion in the commit that introduced this code.
+        per_traj_temperatures: list[float] = []
         # Native path requires every input pretok to be flagged native_path.
         # If any pretok is legacy, we fall back to the legacy retokenize
         # forward for the whole batch (avoids mixing assembly modes inside
@@ -2541,7 +2557,8 @@ class SelfReflectionGRPOTrainer:
         for pretok in pretok_list:
             _end = mb_end if mb_end is not None else len(pretok["full_texts"])
             sl = slice(mb_start, _end)
-            set_sizes.append(_end - mb_start)
+            size = _end - mb_start
+            set_sizes.append(size)
             all_full_texts.extend(pretok["full_texts"][sl])
             all_prompt_texts.extend(pretok.get("prompt_texts", pretok["full_texts"])[sl])
             all_prompt_lens.extend(pretok["prompt_lens"][sl])
@@ -2549,9 +2566,17 @@ class SelfReflectionGRPOTrainer:
             all_imgs.extend(pretok["images"][sl])
             comp_ids_list = pretok.get("completion_token_ids")
             if comp_ids_list is None:
-                all_completion_ids.extend([None] * (_end - mb_start))
+                all_completion_ids.extend([None] * size)
             else:
                 all_completion_ids.extend(comp_ids_list[sl])
+            # Default to 1.0 if the pretok was built without the field
+            # (legacy test stubs). 1.0 makes the divisor a no-op.
+            temp = float(pretok.get("sampling_temperature", 1.0))
+            if not (temp > 0.0):
+                raise ValueError(
+                    f"_forward_from_pretokenized_multi: sampling_temperature must be > 0, got {temp}"
+                )
+            per_traj_temperatures.extend([temp] * size)
 
         n = len(all_full_texts)
         has_image = any(img is not None for img in all_imgs)
@@ -2615,8 +2640,7 @@ class SelfReflectionGRPOTrainer:
             assert pad_token_id is not None, (
                 "Tokenizer has neither pad_token_id nor eos_token_id set — "
                 "cannot construct the native-path padded batch safely. "
-                "Either disable --use_vllm_native_loss or configure the "
-                "tokenizer with an explicit pad token."
+                "Configure the tokenizer with an explicit pad token."
             )
 
             unpadded_prompt_lens = prompt_attn.sum(dim=1).tolist()
@@ -2687,6 +2711,15 @@ class SelfReflectionGRPOTrainer:
             shift_logits = logits[i, real_prompt_start - 1 : -1, :]
             shift_labels = label_source[i, real_prompt_start:]
             shift_logits = torch.nan_to_num(shift_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Apply the per-turn sampling temperature divisor so HF new_lp lives on
+            # the same softmax-temperature distribution as vLLM's sample-time old_lp.
+            # Without this, the A2 PPO ratio is systematically biased (Bug #1):
+            # vLLM returns log softmax(logits / 0.7) at sample time, but HF computes
+            # log softmax(logits) here, so exp(new_lp − old_lp) ≠ 1 even at step 0.
+            # No-op for A1 / F1 (T=1.0).
+            temp_i = per_traj_temperatures[i]
+            if temp_i != 1.0:
+                shift_logits = shift_logits / temp_i
             lp = F.log_softmax(shift_logits, dim=-1)
             token_lp = lp.gather(1, shift_labels.unsqueeze(-1)).squeeze(-1)
             # Empty completion → empty tensor (NOT a fake [0.0] token). The

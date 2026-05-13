@@ -255,7 +255,6 @@ class TestBaselineA1Rollout:
             k_samples=2,
             batch_size=1,
             single_turn_a1=True,
-            use_think_answer_tags=True,
             a1_max_completion_length=64,
             temperature=1.0,
             top_p=0.9,

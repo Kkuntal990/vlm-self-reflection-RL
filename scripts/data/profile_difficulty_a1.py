@@ -78,16 +78,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max_samples", type=int, default=0, help="0 = all")
     parser.add_argument(
-        "--use_think_answer_tags",
-        action="store_true",
-        help="Match training A1 prompt by appending think+answer tag instruction",
-    )
-    parser.add_argument(
-        "--use_answer_tag_only",
-        action="store_true",
-        help="Match training A1 prompt by appending answer-tag-only instruction",
-    )
-    parser.add_argument(
         "--strict_answer_extraction",
         action="store_true",
         help="Require atomic answer inside <answer> tag (training-faithful when tags enabled)",
@@ -146,8 +136,6 @@ def _load_existing_indices(output_path: str) -> set[int]:
 def _build_a1_prompt_text(
     processor: Any,
     question: str,
-    use_think_answer_tags: bool,
-    use_answer_tag_only: bool,
 ) -> str:
     """Format A1 user message via the processor's chat template.
 
@@ -156,11 +144,7 @@ def _build_a1_prompt_text(
     """
     from vlm_grpo.prompts import build_initial_answer_prompt
 
-    msgs = build_initial_answer_prompt(
-        question=question,
-        use_think_answer_tags=use_think_answer_tags,
-        use_answer_tag_only=use_answer_tag_only,
-    )
+    msgs = build_initial_answer_prompt(question=question)
     return processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
@@ -256,8 +240,6 @@ def main() -> None:
                 prompt_text = _build_a1_prompt_text(
                     processor=processor,
                     question=s["question"],
-                    use_think_answer_tags=args.use_think_answer_tags,
-                    use_answer_tag_only=args.use_answer_tag_only,
                 )
                 vllm_inputs.append(
                     {

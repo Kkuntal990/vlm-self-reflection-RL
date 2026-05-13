@@ -25,10 +25,7 @@ from vlm_grpo.rewards.correctness import (
     compute_a2_correctness_reward,
 )
 from vlm_grpo.rewards.verifier import verify_answer
-from vlm_grpo.trajectory import (
-    extract_answer_from_text,
-    normalize_answer,
-)
+from vlm_grpo.trajectory import extract_answer_from_text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,95 +98,12 @@ def compute_feedback_format_reward(feedback_text: str) -> float:
     return 1.0 if verdict in ("CORRECT", "INCORRECT") else 0.0
 
 
-# Threshold for LLM format fallback (0-1 scale, 0.7 = score 7/10)
-_LLM_FORMAT_THRESHOLD: float = 0.7
-
-
-def _llm_format_fallback(
-    a2_text: str,
-    ground_truth: str,
-    answer_type: str,
-) -> float:
-    """LLM fallback for format check when deterministic check fails.
-
-    Only invoked when ground_truth is available and LLM judge is enabled.
-
-    Args:
-        a2_text: Raw A2 text
-        ground_truth: Ground truth answer
-        answer_type: Answer type string
-
-    Returns:
-        0.0 if LLM says format matches, -1.0 otherwise
-    """
-    if not ground_truth:
-        return -1.0
-
-    try:
-        from vlm_grpo.rewards.judge_llm import is_enabled, llm_format_judge
-
-        if not is_enabled():
-            return -1.0
-
-        score = llm_format_judge(a2_text.strip(), ground_truth, answer_type)
-        if score >= _LLM_FORMAT_THRESHOLD:
-            return 0.0
-        return -1.0
-    except Exception as e:
-        logger.warning(f"LLM format fallback failed: {e}")
-        return -1.0
-
-
-def _compute_refiner_format_reward(
-    a2_text: str,
-    answer_type: str,
-    ground_truth: str = "",
-    use_think_answer_tags: bool = False,
-    use_answer_tag_only: bool = False,
-) -> float:
-    """R_format for refiner: format compliance check.
-
-    Three modes:
-
-    **Think+Answer tag mode** (use_think_answer_tags=True):
-        Checks for <think>...</think><answer>...</answer> structure.
-        Then validates the inner answer content by type.
-        +0.5 fully compliant, -0.5 tags but bad inner, -1.0 tags missing.
-
-    **Answer-tag-only mode** (use_answer_tag_only=True):
-        Checks for <answer>...</answer> only (no <think> required).
-        Validates inner answer content by type.
-        +0.5 fully compliant, -0.5 tag but bad inner, -1.0 tag missing.
-
-    **Bare mode** (both False):
-        Original normalize-first pipeline.
-        0.0 when compliant, -1.0 when not.
-
-    Args:
-        a2_text: Raw A2 text from the refiner
-        answer_type: Expected answer type
-        ground_truth: Ground truth answer (for LLM format fallback)
-        use_think_answer_tags: Whether to check for <think>+<answer> tags
-        use_answer_tag_only: Whether to check for <answer> tag only
-
-    Returns:
-        Format reward score
-    """
-    if use_think_answer_tags:
-        return _compute_tag_format_reward(a2_text, answer_type, ground_truth)
-
-    if use_answer_tag_only:
-        return _compute_answer_tag_only_format_reward(a2_text, answer_type)
-
-    return _compute_bare_format_reward(a2_text, answer_type, ground_truth)
-
-
 def _compute_tag_format_reward(
     a2_text: str,
     answer_type: str,
     ground_truth: str = "",
 ) -> float:
-    """Format reward for A2 tag mode: structure + clean atomic inner.
+    """R_format for A1/A2: think+answer tag compliance check.
 
     Binary {0, +1}. Two conditions must both hold for +1:
       1. Both `<think>...</think>` and `<answer>...</answer>` present.
@@ -201,9 +115,11 @@ def _compute_tag_format_reward(
     but format reward demands the clean canonical form.
 
     Args:
-        a2_text: Raw A2 text.
-        answer_type: Expected answer type.
-        ground_truth: Ground truth (unused, kept for API compat).
+        a2_text: Raw A1 or A2 text (used by both turns).
+        answer_type: Expected answer type
+        ground_truth: Ground truth (unused, kept for API compat — older
+            callers passed this for an LLM-fallback path that has been
+            removed along with the non-tag mode).
 
     Returns:
         +1.0 if both tags present AND inner is a clean atomic answer.
@@ -241,88 +157,6 @@ def _is_clean_atomic_answer(inner: str, answer_type: str) -> bool:
             return False
     # Open-ended: any non-empty content counts as "clean"
     return bool(inner)
-
-
-def _compute_answer_tag_only_format_reward(
-    a2_text: str,
-    answer_type: str,
-) -> float:
-    """Format reward for `<answer>`-only mode: tag + clean atomic inner.
-
-    Binary {0, +1}. Same as `_compute_tag_format_reward` but only requires
-    `<answer>` (no `<think>`). Inner content must still be a clean atomic
-    answer for the expected type.
-
-    Args:
-        a2_text: Raw A2 text.
-        answer_type: Expected answer type.
-
-    Returns:
-        +1.0 if `<answer>` present AND inner is a clean atomic answer.
-         0.0 otherwise.
-    """
-    from vlm_grpo.trajectory import extract_from_answer_tags
-
-    if not re.search(r"<answer>", a2_text, re.IGNORECASE):
-        return 0.0
-    inner = extract_from_answer_tags(a2_text).strip()
-    if not inner:
-        return 0.0
-    if not _is_clean_atomic_answer(inner, answer_type):
-        return 0.0
-    return 1.0
-
-
-def _compute_bare_format_reward(
-    a2_text: str,
-    answer_type: str,
-    ground_truth: str = "",
-) -> float:
-    """Original format reward: normalize-first, penalty-only.
-
-    Args:
-        a2_text: Raw A2 text.
-        answer_type: Expected answer type.
-        ground_truth: Ground truth (for LLM fallback).
-
-    Returns:
-        0.0 if compliant, -1.0 if not.
-    """
-    normalized = normalize_answer(a2_text)
-
-    if not normalized:
-        return -1.0
-
-    if answer_type == "mcq":
-        if len(normalized) != 1 or normalized not in "abcdef":
-            return _llm_format_fallback(a2_text, ground_truth, answer_type)
-    elif answer_type == "yesno":
-        if normalized not in ("yes", "no"):
-            return _llm_format_fallback(a2_text, ground_truth, answer_type)
-    elif answer_type == "counting":
-        try:
-            int(normalized)
-        except ValueError:
-            return -1.0
-    elif answer_type == "numeric":
-        num_text = normalized.replace(",", "")
-        if "/" in num_text:
-            parts = num_text.split("/")
-            if len(parts) != 2:
-                return -1.0
-            try:
-                float(parts[0])
-                float(parts[1])
-            except ValueError:
-                return -1.0
-        else:
-            num_text = num_text.rstrip("%")
-            try:
-                float(num_text)
-            except ValueError:
-                return -1.0
-
-    return 0.0
 
 
 # =============================================================================
@@ -503,8 +337,6 @@ def compute_response_reward_breakdown(
     answer_type: str,
     choices: str,
     weights: Any,
-    use_think_answer_tags: bool = False,
-    use_answer_tag_only: bool = False,
     reward_shaping_alpha: float = 0.0,
 ) -> TrajectoryResponseRewardBreakdown:
     """Compute response reward for a single trajectory.
@@ -519,37 +351,31 @@ def compute_response_reward_breakdown(
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         choices: MCQ choices string
         weights: ResponseRewardWeights instance
-        use_think_answer_tags: Whether to check for tag format
 
     Returns:
         TrajectoryResponseRewardBreakdown with all component scores
     """
-    # In tag mode, strict extraction requires <answer> tag presence.
-    # Missing tag → extracted="" → MatchResult.is_correct=False naturally,
-    # so the correctness path handles "no extractable answer" without any
-    # special short-circuit. Format reward is independent and binary.
-    tag_mode = use_think_answer_tags or use_answer_tag_only
-
-    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=tag_mode)
+    # Tag-mode is the only supported extraction path: <answer> tag presence
+    # is required. Missing tag → extracted="" → MatchResult.is_correct=False
+    # naturally, so the correctness path handles "no extractable answer"
+    # without any special short-circuit. Format reward is independent and
+    # binary.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=True)
     a1_correct = a1_result.is_correct
 
-    a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=True)
     a2_correct = a2_result.is_correct
 
     # Format rewards — pure structural check (binary {0, +1}) per turn.
     # Both A1 and A2 are evaluated independently for tag presence + clean
     # atomic inner content. Symmetry across turns prevents the model from
     # learning "format only matters for A2".
-    r_a1_format = _compute_refiner_format_reward(
-        a1_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-    )
-    r_a2_format = _compute_refiner_format_reward(
-        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-    )
+    r_a1_format = _compute_tag_format_reward(a1_text, answer_type, ground_truth)
+    r_a2_format = _compute_tag_format_reward(a2_text, answer_type, ground_truth)
     a2_format_valid = r_a2_format > 0
 
     # Extract A2 for display (uses same strictness/tag-requirement as scoring)
-    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=tag_mode)
+    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=True)
 
     # A1 / A2 correctness rewards
     r_a1 = 1.0 if a1_correct else -1.0
@@ -822,8 +648,6 @@ def compute_pag_response_breakdown(
     answer_type: str,
     choices: str,
     weights: Any,
-    use_think_answer_tags: bool = False,
-    use_answer_tag_only: bool = False,
     pag_shaping_alpha: float = 1.0,
     gated: bool = False,
 ) -> PAGSegmentRewardBreakdown:
@@ -866,8 +690,6 @@ def compute_pag_response_breakdown(
             ``w_a2_correctness`` should be 0.9 and the format weights 0.1
             for PAG-faithful runs; the shaping bonus uses
             ``pag_shaping_alpha`` and is NOT controlled by ``w_no_regression``.
-        use_think_answer_tags: Forwarded to the format/extraction helpers.
-        use_answer_tag_only: Forwarded to the format/extraction helpers.
         pag_shaping_alpha: α coefficient on the b_y bonus.
         gated: Whether the selective-revision gate stopped this trajectory
             at F1 (i.e. F1 said CORRECT).
@@ -876,20 +698,12 @@ def compute_pag_response_breakdown(
         ``PAGSegmentRewardBreakdown`` with r_a1 and r_a2 as separate scalars
         (r_a2 = None when gated).
     """
-    tag_mode = use_think_answer_tags or use_answer_tag_only
-
-    # A1: binary correctness + binary format.
-    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=tag_mode)
+    # A1: binary correctness + binary format. Tag-mode strict extraction is
+    # the only supported path.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=True)
     a1_correct = a1_result.is_correct
     r_a1_corr_01 = 1.0 if a1_correct else 0.0
-    r_a1_fmt_01 = _compute_refiner_format_reward(
-        a1_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-    )
-    # Format reward range collapses to {0, 1} in tag-mode (active path); the
-    # bare-mode {-1, 0} branch is mapped to {0, 1} for the PAG composer so the
-    # convex combination stays in [0, 1].
-    if r_a1_fmt_01 < 0.0:
-        r_a1_fmt_01 = 0.0
+    r_a1_fmt_01 = _compute_tag_format_reward(a1_text, answer_type, ground_truth)
 
     r_a1 = r_a1_corr_01 * weights.w_a1_correctness + r_a1_fmt_01 * weights.w_a1_format
 
@@ -903,15 +717,11 @@ def compute_pag_response_breakdown(
         r_a2: float | None = None
         bonus = 0.0
     else:
-        a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
+        a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=True)
         a2_correct = a2_result.is_correct
         r_a2_corr_01 = 1.0 if a2_correct else 0.0
-        r_a2_fmt_01 = _compute_refiner_format_reward(
-            a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-        )
-        if r_a2_fmt_01 < 0.0:
-            r_a2_fmt_01 = 0.0
-        a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=tag_mode)
+        r_a2_fmt_01 = _compute_tag_format_reward(a2_text, answer_type, ground_truth)
+        a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=True)
         # Match legacy composer's threshold: > 0 → valid. Binary {0, 1} reward
         # makes the choice moot in practice, but `> 0` keeps the convention.
         a2_format_valid = r_a2_fmt_01 > 0
@@ -1073,18 +883,15 @@ _DOWNSTREAM_OPEN_RANGE = (-2.0, 2.0)
 _VERIFY_RANGE = (-1.0, 1.0)
 # format rewards (a1, a2, fb) are already binary {0, +1} in the active
 # multi-turn path (see ``_compute_tag_format_reward``,
-# ``_compute_answer_tag_only_format_reward``, ``compute_feedback_format_reward``)
-# so they need no rescaling. The bare-mode {-1, 0} branch is rescaled to
-# {0, 1} via ``_FORMAT_BARE_RANGE`` only when called.
-_FORMAT_BARE_RANGE = (-1.0, 0.0)
+# ``compute_feedback_format_reward``) so they need no rescaling.
 
 
 def _format_to_01(raw: float) -> float:
-    """Rescale a format reward to [0, 1].
+    """Clamp a format reward to [0, 1].
 
-    The active tag-mode and answer-tag-only paths already return {0, +1}, so
-    this is a no-op for them. The bare path returns {-1, 0}, which gets
-    rescaled to {0, 1}.
+    The think+answer tag-mode path already returns {0, +1}, so this is
+    effectively a no-op. Defensive bounds-check kept in case a future
+    helper emits a value outside [0, 1].
 
     Args:
         raw: Raw format reward.
@@ -1093,8 +900,7 @@ def _format_to_01(raw: float) -> float:
         Format reward in ``[0, 1]``.
     """
     if raw < 0.0:
-        return _to_unit(raw, _FORMAT_BARE_RANGE[0], _FORMAT_BARE_RANGE[1])
-    # Already binary {0, +1} from tag-mode paths.
+        return 0.0
     if raw > 1.0:
         return 1.0
     return raw
@@ -1181,27 +987,22 @@ def compute_a2_format_01(
     a2_text: str,
     answer_type: str,
     ground_truth: str = "",
-    use_think_answer_tags: bool = False,
-    use_answer_tag_only: bool = False,
 ) -> float:
     """[0, 1]-rescaled A2 format reward.
 
-    Reuses ``_compute_refiner_format_reward`` which returns {0, +1} in tag
-    modes (already in [0, 1]) and {-1, 0} in bare mode (needs rescaling).
+    Reuses ``_compute_tag_format_reward`` which already returns
+    {0, +1} (the only supported think+answer tag-mode path), so this is
+    effectively a clamp-to-[0, 1] pass-through.
 
     Args:
         a2_text: Raw A2 text from the refiner.
         answer_type: Expected answer type.
-        ground_truth: Ground truth (for LLM format fallback).
-        use_think_answer_tags: Whether to check for <think>+<answer> tags.
-        use_answer_tag_only: Whether to check for <answer> tag only.
+        ground_truth: Ground truth (unused, kept for API compat).
 
     Returns:
         Float in ``[0, 1]``.
     """
-    raw = _compute_refiner_format_reward(
-        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-    )
+    raw = _compute_tag_format_reward(a2_text, answer_type, ground_truth)
     return _format_to_01(raw)
 
 
@@ -1316,8 +1117,6 @@ def compute_response_reward_breakdown_01(
     answer_type: str,
     choices: str,
     weights: Any,
-    use_think_answer_tags: bool = False,
-    use_answer_tag_only: bool = False,
     reward_shaping_alpha: float = 0.0,
 ) -> TrajectoryResponseRewardBreakdown:
     """[0, 1]-rescaled response reward (parallel to
@@ -1337,8 +1136,6 @@ def compute_response_reward_breakdown_01(
             "counting").
         choices: MCQ choices string.
         weights: ResponseRewardWeights instance.
-        use_think_answer_tags: Whether to check for tag format.
-        use_answer_tag_only: Whether to check for <answer>-only format.
         reward_shaping_alpha: SCoRe-style shaped reward alpha (passed
             through but currently does NOT replace the inline transition
             values — the rescaled path uses the discrete RR/RW/WR/WW
@@ -1350,21 +1147,16 @@ def compute_response_reward_breakdown_01(
     """
     from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
 
-    tag_mode = use_think_answer_tags or use_answer_tag_only
-    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=tag_mode)
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=True)
     a1_correct = a1_result.is_correct
-    a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=True)
     a2_correct = a2_result.is_correct
 
-    r_a1_format = compute_a2_format_01(
-        a1_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-    )
-    r_a2_format = compute_a2_format_01(
-        a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
-    )
+    r_a1_format = compute_a2_format_01(a1_text, answer_type, ground_truth)
+    r_a2_format = compute_a2_format_01(a2_text, answer_type, ground_truth)
     a2_format_valid = r_a2_format > 0.5
 
-    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=tag_mode)
+    a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=True)
 
     # A1 / A2 correctness (rescaled to [0, 1])
     r_a1 = 1.0 if a1_correct else 0.0

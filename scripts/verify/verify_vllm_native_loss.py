@@ -48,7 +48,6 @@ import json
 import logging
 import statistics
 import sys
-from pathlib import Path
 from typing import Any
 
 logging.basicConfig(
@@ -68,9 +67,9 @@ logger = logging.getLogger("verify_vllm_native")
 # significant figures, so the IS-ratio bias from this drift is bounded
 # in magnitude by clip_range (0.2 in production runs); the policy gradient
 # is unaffected on the bulk of tokens that drive learning.
-DRIFT_MEAN_THRESHOLD = 5e-2       # mean |vllm_lp - hf_lp|
-DRIFT_P95_THRESHOLD = 2e-1        # 95p |vllm_lp - hf_lp|
-DRIFT_MAX_THRESHOLD = 6e-1        # max  |vllm_lp - hf_lp|
+DRIFT_MEAN_THRESHOLD = 5e-2  # mean |vllm_lp - hf_lp|
+DRIFT_P95_THRESHOLD = 2e-1  # 95p |vllm_lp - hf_lp|
+DRIFT_MAX_THRESHOLD = 6e-1  # max  |vllm_lp - hf_lp|
 # "label alignment off" detector threshold. Tightened from -1e-3 to
 # -1e-7: many legitimate ordinary tokens like ' (' or ')' or 'the' have
 # logprobs in [-1e-4, -1e-7] in confident contexts. A truly off-by-one
@@ -151,8 +150,8 @@ def resolve_image(sample: dict, image_base: str) -> Any:
 
 
 def build_a1_prompt_messages(question: str) -> list[dict]:
-    """Mirrors src/vlm_grpo/prompts.py:build_initial_answer_prompt with
-    use_think_answer_tags=True (matches the running training config)."""
+    """Mirrors src/vlm_grpo/prompts.py:build_initial_answer_prompt (which
+    always appends the think+answer tag instruction)."""
     instruction = (
         "The reasoning process MUST BE enclosed within <think> </think> tags. "
         "The final answer MUST BE put in <answer> </answer> tags."
@@ -262,9 +261,7 @@ def sample_vllm(llm, processor, samples, k_per_sample, max_new_tokens, temperatu
         for i, tok in enumerate(token_ids):
             step = comp.logprobs[i]
             if step is None or tok not in step:
-                raise RuntimeError(
-                    f"vLLM step {i} missing logprob for sampled token {tok}"
-                )
+                raise RuntimeError(f"vLLM step {i} missing logprob for sampled token {tok}")
             sampled_lps.append(float(step[tok].logprob))
         completions.append(
             {
@@ -412,13 +409,11 @@ def check_completion(comp_record, hf_record, retok_record) -> dict:
 
     # (G) Length consistency.
     if len(hf_lps) != n:
-        issues.append(
-            f"HF logprob length ({len(hf_lps)}) != vLLM completion length ({n})"
-        )
+        issues.append(f"HF logprob length ({len(hf_lps)}) != vLLM completion length ({n})")
     if hf_record["full_len"] - hf_record["prompt_len"] != n:
         issues.append(
             f"Assembled full_len-prompt_len ({hf_record['full_len']}-"
-            f"{hf_record['prompt_len']}={hf_record['full_len']-hf_record['prompt_len']}) "
+            f"{hf_record['prompt_len']}={hf_record['full_len'] - hf_record['prompt_len']}) "
             f"!= vLLM completion length ({n})"
         )
 
@@ -437,18 +432,11 @@ def check_completion(comp_record, hf_record, retok_record) -> dict:
         metrics["diff_p95"] = diffs_sorted[int(len(diffs_sorted) * 0.95)]
         metrics["diff_max"] = max(diffs)
         if metrics["diff_mean"] > DRIFT_MEAN_THRESHOLD:
-            issues.append(
-                f"engine drift mean {metrics['diff_mean']:.4f} > "
-                f"{DRIFT_MEAN_THRESHOLD}"
-            )
+            issues.append(f"engine drift mean {metrics['diff_mean']:.4f} > {DRIFT_MEAN_THRESHOLD}")
         if metrics["diff_p95"] > DRIFT_P95_THRESHOLD:
-            issues.append(
-                f"engine drift p95 {metrics['diff_p95']:.4f} > {DRIFT_P95_THRESHOLD}"
-            )
+            issues.append(f"engine drift p95 {metrics['diff_p95']:.4f} > {DRIFT_P95_THRESHOLD}")
         if metrics["diff_max"] > DRIFT_MAX_THRESHOLD:
-            issues.append(
-                f"engine drift max {metrics['diff_max']:.4f} > {DRIFT_MAX_THRESHOLD}"
-            )
+            issues.append(f"engine drift max {metrics['diff_max']:.4f} > {DRIFT_MAX_THRESHOLD}")
 
     # (F) Suspicious-too-clean logprobs (would suggest the gather is off
     # and we're picking up the prompt's own tokens, where logits assign
@@ -536,7 +524,7 @@ def main() -> int:
         m = result["metrics"]
         logger.info(
             f"[completion {c_idx}] vllm_len={len(comp['token_ids'])} "
-            f"hf_len={hf_record['full_len']-hf_record['prompt_len']} "
+            f"hf_len={hf_record['full_len'] - hf_record['prompt_len']} "
             f"diff_mean={m.get('diff_mean', float('nan')):.5f} "
             f"diff_p95={m.get('diff_p95', float('nan')):.5f} "
             f"diff_max={m.get('diff_max', float('nan')):.5f} "

@@ -85,10 +85,9 @@ def test_a2_format_01_with_tags():
         "<think>reasoning</think><answer>(A)</answer>",
         "mcq",
         ground_truth="(A)",
-        use_think_answer_tags=True,
     )
     assert valid == 1.0
-    no_tags = compute_a2_format_01("(A)", "mcq", ground_truth="(A)", use_think_answer_tags=True)
+    no_tags = compute_a2_format_01("(A)", "mcq", ground_truth="(A)")
     assert no_tags == 0.0
 
 
@@ -197,7 +196,6 @@ def test_response_breakdown_01_best_case_rr():
         answer_type="mcq",
         choices="(A) x\n(B) y",
         weights=weights,
-        use_think_answer_tags=True,
     )
     for v in bd.components.values():
         assert 0.0 <= v <= 1.0, f"component out of [0,1]: {v}"
@@ -228,7 +226,6 @@ def test_response_breakdown_01_wr_max():
         answer_type="mcq",
         choices="",
         weights=weights,
-        use_think_answer_tags=True,
     )
     assert bd.a1_correct is False
     assert bd.a2_correct is True
@@ -247,7 +244,6 @@ def test_response_breakdown_01_worst_case_rw_no_tags():
         answer_type="mcq",
         choices="",
         weights=weights,
-        use_think_answer_tags=True,
     )
     # In strict tag mode, missing tags → extracted=""; verify_answer marks
     # it incorrect. Both a1_correct and a2_correct False due to strict mode.
@@ -351,7 +347,6 @@ def test_raw_response_breakdown_unchanged():
         answer_type="mcq",
         choices="",
         weights=weights,
-        use_think_answer_tags=True,
     )
     # With tags + RR: a1_corr=+1, a2_corr=+1, a1_fmt=+1, a2_fmt=+1,
     # no_reg=+1 (RR for det). Inline raw values, NOT rescaled.
@@ -416,7 +411,6 @@ def test_total_reward_strictly_non_negative_in_rescaled_path():
             answer_type="mcq",
             choices="",
             weights=weights_resp,
-            use_think_answer_tags=True,
         )
         fb = compute_feedback_reward_breakdown_01(
             feedback_text=f1,

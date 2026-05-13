@@ -316,15 +316,18 @@ class TestPreprocessTrajectoryTextsTokenIds:
         assert pretok["completion_token_ids"] == completion_ids
 
 
-def _make_trainer_stub_with_native(use_vllm_native_loss: bool) -> Any:
-    """Trainer stub with config.rollout.use_vllm_native_loss configured."""
+def _make_trainer_stub_with_native() -> Any:
+    """Trainer stub for native-path tests.
+
+    The native path is now the only supported behavior under vLLM rollouts —
+    it activates automatically whenever every trajectory in the batch carries
+    a non-None ``completion_token_ids`` list. No feature flag gates it.
+    """
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
 
     stub = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
     stub.processor = _FakeProcessor()
-    stub.config = SimpleNamespace(
-        rollout=SimpleNamespace(use_vllm_native_loss=use_vllm_native_loss)
-    )
+    stub.config = SimpleNamespace(rollout=SimpleNamespace())
     return stub
 
 
@@ -334,16 +337,17 @@ def _make_trainer_stub_with_native(use_vllm_native_loss: bool) -> Any:
 
 
 class TestPretokNativePath:
-    """``use_vllm_native_loss=True`` makes Bug 2 structurally impossible.
+    """The native path makes Bug 2 structurally impossible.
 
     The trainer's forward pass assembles ``input_ids = prompt_ids ++
     vllm_completion_ids`` directly, so ``full_lens`` is computed as
     ``prompt_lens + len(completion_ids)`` rather than from a retokenize that
-    can disagree with vLLM's actual sampling boundary.
+    can disagree with vLLM's actual sampling boundary. Activated whenever all
+    trajectories carry completion_token_ids.
     """
 
     def test_native_path_full_lens_match_completion_ids(self) -> None:
-        trainer = _make_trainer_stub_with_native(use_vllm_native_loss=True)
+        trainer = _make_trainer_stub_with_native()
         msgs = [
             [{"role": "user", "content": "Q1?"}, {"role": "assistant", "content": "A1"}],
             [{"role": "user", "content": "Q2!"}, {"role": "assistant", "content": "A2"}],
@@ -366,25 +370,22 @@ class TestPretokNativePath:
             assert pretok["full_lens"][i] - pretok["prompt_lens"][i] == len(ids)
         assert pretok["completion_logprobs"] == completion_logprobs
 
-    def test_legacy_path_when_flag_off(self) -> None:
-        trainer = _make_trainer_stub_with_native(use_vllm_native_loss=False)
+    def test_legacy_path_when_ids_absent(self) -> None:
+        """No completion_token_ids → legacy retokenize fallback."""
+        trainer = _make_trainer_stub_with_native()
         msgs = [
             [{"role": "user", "content": "Q1?"}, {"role": "assistant", "content": "A1"}],
         ]
-        completion_ids = [[1, 2, 3, 4, 5]]
-        pretok = trainer._preprocess_trajectory_texts(
-            msgs, images=[None], completion_token_ids=completion_ids
-        )
+        pretok = trainer._preprocess_trajectory_texts(msgs, images=[None])
         assert pretok["native_path"] is False
         # Legacy: full_lens comes from retokenizing the full text via the
-        # toy tokenizer; lengths may NOT match completion_ids length. The
-        # important property is that the path is unchanged from before.
+        # toy tokenizer. The important property is that the path still works.
         assert "full_lens" in pretok and "prompt_lens" in pretok
 
     def test_legacy_when_any_completion_ids_none(self) -> None:
         """Native path requires ALL trajectories to carry token ids; falling
         back when any are None preserves correctness for mixed batches."""
-        trainer = _make_trainer_stub_with_native(use_vllm_native_loss=True)
+        trainer = _make_trainer_stub_with_native()
         msgs = [
             [{"role": "user", "content": "Q1?"}, {"role": "assistant", "content": "A1"}],
             [{"role": "user", "content": "Q2?"}, {"role": "assistant", "content": "A2"}],
@@ -476,7 +477,7 @@ class _StubProcessorWithVisionTokens:
         return "".join(parts)
 
 
-def _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss: bool) -> Any:
+def _make_native_trainer_stub_with_vision_tokens() -> Any:
     from vlm_grpo.critic_grpo import SelfReflectionGRPOTrainer
 
     stub = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
@@ -513,9 +514,7 @@ def _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss: bool) -> 
             return {"input_ids": ids}
 
     stub.processor.tokenizer = _CallableTokenizer()
-    stub.config = SimpleNamespace(
-        rollout=SimpleNamespace(use_vllm_native_loss=use_vllm_native_loss)
-    )
+    stub.config = SimpleNamespace(rollout=SimpleNamespace())
     return stub
 
 
@@ -525,7 +524,7 @@ class TestNativePathFiltersVisionTokens:
     image-pad count matching."""
 
     def test_image_pad_in_completion_is_filtered(self) -> None:
-        trainer = _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss=True)
+        trainer = _make_native_trainer_stub_with_vision_tokens()
         msgs = [
             [{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A"}],
         ]
@@ -555,7 +554,7 @@ class TestNativePathFiltersVisionTokens:
     def test_all_vision_tokens_filtered(self) -> None:
         """Every vision special token in the Qwen2.5-VL set must be filtered,
         not just image_pad. The model can theoretically sample any of them."""
-        trainer = _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss=True)
+        trainer = _make_native_trainer_stub_with_vision_tokens()
         msgs = [
             [{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A"}],
         ]
@@ -589,22 +588,15 @@ class TestNativePathFiltersVisionTokens:
         assert out_lps == [0.0, -2.0, -4.0, -6.0, -8.0, -10.0]
 
     def test_legacy_path_does_not_filter(self) -> None:
-        """When native loss is off, completions are used as text via the
-        legacy retokenize path; we must NOT reach into them."""
-        trainer = _make_native_trainer_stub_with_vision_tokens(use_vllm_native_loss=False)
+        """When completion_token_ids are absent, the legacy retokenize
+        fallback is used and the vision-token filter is not exercised."""
+        trainer = _make_native_trainer_stub_with_vision_tokens()
         msgs = [
             [{"role": "user", "content": "Q?"}, {"role": "assistant", "content": "A"}],
         ]
-        ids = [10, 151655, 11]
-        pretok = trainer._preprocess_trajectory_texts(
-            msgs,
-            images=[None],
-            completion_token_ids=[ids],
-        )
+        pretok = trainer._preprocess_trajectory_texts(msgs, images=[None])
         assert pretok["native_path"] is False
-        # Legacy path stores completion_token_ids verbatim (used only for
-        # the Bug 2 length diagnostic, not for assembling input_ids).
-        assert pretok["completion_token_ids"] == [ids]
+        assert pretok["completion_token_ids"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +712,7 @@ def _make_native_trainer_stub():
 
     stub = SelfReflectionGRPOTrainer.__new__(SelfReflectionGRPOTrainer)
     stub.processor = _StubProcessor()
-    stub.config = SimpleNamespace(rollout=SimpleNamespace(use_vllm_native_loss=True))
+    stub.config = SimpleNamespace(rollout=SimpleNamespace())
     # _forward_from_pretokenized_multi reads self.device for tensor placement.
     import torch
 

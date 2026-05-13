@@ -335,7 +335,6 @@ def test_multi_adapter_backward_routes_grad_to_each_adapters_text_lora() -> None
     """
     import torch
     import torch.nn as nn
-
     from peft import LoraConfig, get_peft_model
 
     from vlm_grpo.config import AdapterRoutingConfig
@@ -436,7 +435,6 @@ def test_multi_adapter_backward_falls_back_for_single_turn_a1() -> None:
     """
     import torch
     import torch.nn as nn
-
     from peft import LoraConfig, get_peft_model
 
     from vlm_grpo.config import AdapterRoutingConfig
@@ -517,7 +515,6 @@ def test_frozen_lora_patterns_overrides_adapter_trainable() -> None:
     ``--freeze_vision_tower`` set — exactly what happened in the prior runs.
     """
     import torch.nn as nn
-
     from peft import LoraConfig, get_peft_model
 
     from vlm_grpo.multi_adapter import _apply_trainable_flags
@@ -536,9 +533,7 @@ def test_frozen_lora_patterns_overrides_adapter_trainable() -> None:
             return {}
 
     model = M()
-    lora_cfg = LoraConfig(
-        r=4, lora_alpha=8, target_modules=["visual_merger_fc", "language_fc"]
-    )
+    lora_cfg = LoraConfig(r=4, lora_alpha=8, target_modules=["visual_merger_fc", "language_fc"])
     peft_model = get_peft_model(model, lora_cfg, adapter_name="response")
     peft_model.add_adapter("feedback", lora_cfg)
     for name, p in peft_model.named_parameters():
@@ -609,7 +604,6 @@ def test_frozen_lora_patterns_translate_to_exclude_modules_regex() -> None:
     import re
 
     import torch.nn as nn
-
     from peft import LoraConfig, get_peft_model
 
     class M(nn.Module):
@@ -630,9 +624,7 @@ def test_frozen_lora_patterns_translate_to_exclude_modules_regex() -> None:
     exclude_regex = "|".join(".*" + re.escape(p) + ".*" for p in frozen_patterns)
     assert exclude_regex == ".*visual.*"
 
-    cfg = LoraConfig(
-        r=4, lora_alpha=8, target_modules="all-linear", exclude_modules=exclude_regex
-    )
+    cfg = LoraConfig(r=4, lora_alpha=8, target_modules="all-linear", exclude_modules=exclude_regex)
     pm = get_peft_model(M(), cfg, adapter_name="response")
 
     # Every LoRA-wrapped module's name should NOT contain "visual".
@@ -654,7 +646,6 @@ def test_multi_adapter_backward_loss_scale() -> None:
     """
     import torch
     import torch.nn as nn
-
     from peft import LoraConfig, get_peft_model
 
     from vlm_grpo.config import AdapterRoutingConfig

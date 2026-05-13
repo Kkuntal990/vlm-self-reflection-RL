@@ -18,7 +18,6 @@ broader literature survey (LLaVA-Critic, Volcano, Critic-V, Critique-GRPO,
 MT-Bench, CriticGPT, etc.) — none use role-flipping for same-model critique.
 
 Env vars (override instruction text, not system prompts):
-    ANSWER_TAG_INSTRUCTION      — A1/A2 answer-tag-only instruction
     THINK_ANSWER_INSTRUCTION    — A1/A2 think+answer tag instruction
     F1_VERIFIER_INSTRUCTION     — F1 verifier instruction
 
@@ -30,12 +29,10 @@ Usage:
         build_prompt_with_completion,
     )
 
-    a1 = build_initial_answer_prompt("What color is the bear?",
-                                     use_answer_tag_only=True)
+    a1 = build_initial_answer_prompt("What color is the bear?")
     f1 = build_critic_prompt("What color is the bear?", "Gray")
     a2 = build_refiner_prompt("What color is the bear?", "Gray",
-                              "INCORRECT. The bear is brown.",
-                              use_answer_tag_only=True)
+                              "INCORRECT. The bear is brown.")
 """
 
 import os
@@ -61,11 +58,6 @@ def _prompt_from_env(env_var: str, default: str) -> str:
 # These are NOT system prompts — they are embedded in the user message
 # alongside the question / candidate / feedback. Qwen's chat template
 # provides the system prompt ("You are a helpful assistant.") by default.
-
-ANSWER_TAG_INSTRUCTION = _prompt_from_env(
-    "ANSWER_TAG_INSTRUCTION",
-    "Put your final answer inside <answer> tags. Example: <answer>(A)</answer>",
-)
 
 THINK_ANSWER_INSTRUCTION = _prompt_from_env(
     "THINK_ANSWER_INSTRUCTION",
@@ -128,27 +120,16 @@ def _user_message_with_image(text: str) -> list[dict]:
     ]
 
 
-def build_initial_answer_prompt(
-    question: str,
-    use_think_answer_tags: bool = False,
-    use_answer_tag_only: bool = False,
-) -> list[dict]:
-    """Build A1 prompt — single user turn with image + question (+ tag instruction).
+def build_initial_answer_prompt(question: str) -> list[dict]:
+    """Build A1 prompt — single user turn with image + question + think/answer tag instruction.
 
     Args:
         question: The visual question (cleaned, no <image> tag)
-        use_think_answer_tags: If True, append <think>+<answer> tag instruction
-        use_answer_tag_only: If True, append <answer>-only tag instruction
 
     Returns:
         One-element message list containing a single user turn.
     """
-    parts = [question]
-    if use_think_answer_tags:
-        parts.append(THINK_ANSWER_INSTRUCTION)
-    elif use_answer_tag_only:
-        parts.append(ANSWER_TAG_INSTRUCTION)
-    return _user_message_with_image("\n\n".join(parts))
+    return _user_message_with_image(f"{question}\n\n{THINK_ANSWER_INSTRUCTION}")
 
 
 def build_critic_prompt(
@@ -185,8 +166,6 @@ def build_refiner_prompt(
     feedback1: str,
     answer_type: str = "open",
     choices: str = "",
-    use_think_answer_tags: bool = False,
-    use_answer_tag_only: bool = False,
 ) -> list[dict]:
     """Build A2 prompt — single user turn with image + Q + prior A1 + F1 + tag instruction.
 
@@ -201,8 +180,6 @@ def build_refiner_prompt(
         feedback1: Raw feedback text (passed as-is)
         answer_type: Expected answer type (unused, kept for API compat)
         choices: Optional MCQ choices (unused, kept for API compat)
-        use_think_answer_tags: If True, append <think>+<answer> tag instruction
-        use_answer_tag_only: If True, append <answer>-only tag instruction
 
     Returns:
         One-element message list containing a single user turn.
@@ -211,22 +188,9 @@ def build_refiner_prompt(
         f"Question: {question}",
         f"Your previous answer: {answer1}",
         f"Feedback on your previous answer: {feedback1}",
+        "Re-examine the image and either correct your answer or keep "
+        "it if you believe it is right. " + THINK_ANSWER_INSTRUCTION,
     ]
-    if use_think_answer_tags:
-        parts.append(
-            "Re-examine the image and either correct your answer or keep "
-            "it if you believe it is right. " + THINK_ANSWER_INSTRUCTION
-        )
-    elif use_answer_tag_only:
-        parts.append(
-            "Re-examine the image and either correct your answer or keep "
-            "it if you believe it is right. " + ANSWER_TAG_INSTRUCTION
-        )
-    else:
-        parts.append(
-            "Re-examine the image and either correct your answer or keep "
-            "it if you believe it is right."
-        )
     return _user_message_with_image("\n\n".join(parts))
 
 

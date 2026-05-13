@@ -4,7 +4,6 @@ import pytest
 
 from vlm_grpo.config import FeedbackRewardWeights
 from vlm_grpo.prompts import (
-    ANSWER_TAG_INSTRUCTION,
     F1_VERIFIER_INSTRUCTION,
     THINK_ANSWER_INSTRUCTION,
     build_critic_prompt,
@@ -346,28 +345,22 @@ class TestPatternAStructure:
     """Confirm all three builders return single-user-turn, no system, no role-flip."""
 
     def test_a1_single_user_turn(self) -> None:
-        msgs = build_initial_answer_prompt("What color?", use_think_answer_tags=True)
+        msgs = build_initial_answer_prompt("What color?")
         assert len(msgs) == 1
         assert msgs[0]["role"] == "user"
         # No system message
         assert all(m["role"] != "system" for m in msgs)
 
     def test_a1_embeds_think_answer_instruction_in_user(self) -> None:
-        msgs = build_initial_answer_prompt("What color?", use_think_answer_tags=True)
+        msgs = build_initial_answer_prompt("What color?")
         text = msgs[0]["content"][-1]["text"]
         assert "What color?" in text
         assert THINK_ANSWER_INSTRUCTION in text
         assert "<think>" in text
         assert "<answer>" in text
 
-    def test_a1_answer_tag_only_still_works(self) -> None:
-        msgs = build_initial_answer_prompt("What color?", use_answer_tag_only=True)
-        text = msgs[0]["content"][-1]["text"]
-        assert ANSWER_TAG_INSTRUCTION in text
-        assert "<think>" not in text
-
     def test_a1_image_in_user(self) -> None:
-        msgs = build_initial_answer_prompt("What?", use_think_answer_tags=True)
+        msgs = build_initial_answer_prompt("What?")
         types = [c["type"] for c in msgs[0]["content"]]
         assert "image" in types
         assert types[0] == "image"  # image before text
@@ -388,9 +381,7 @@ class TestPatternAStructure:
         assert F1_VERIFIER_INSTRUCTION in text
 
     def test_a2_single_user_turn_flat(self) -> None:
-        msgs = build_refiner_prompt(
-            "What color?", "Blue", "INCORRECT. Brown.", use_think_answer_tags=True
-        )
+        msgs = build_refiner_prompt("What color?", "Blue", "INCORRECT. Brown.")
         assert len(msgs) == 1
         assert msgs[0]["role"] == "user"
         # No stacked assistant/user turns — A1 and F1 are embedded as text
@@ -398,9 +389,7 @@ class TestPatternAStructure:
         assert all(m["role"] != "system" for m in msgs)
 
     def test_a2_embeds_prior_context_in_user(self) -> None:
-        msgs = build_refiner_prompt(
-            "What color?", "Blue", "INCORRECT. Brown.", use_think_answer_tags=True
-        )
+        msgs = build_refiner_prompt("What color?", "Blue", "INCORRECT. Brown.")
         text = msgs[0]["content"][-1]["text"]
         assert "Question: What color?" in text
         assert "Your previous answer: Blue" in text
@@ -412,7 +401,7 @@ class TestCompletionAppend:
     """Test build_prompt_with_completion appends assistant turn correctly."""
 
     def test_appends_assistant(self) -> None:
-        prompt = build_initial_answer_prompt("What?", use_think_answer_tags=True)
+        prompt = build_initial_answer_prompt("What?")
         full = build_prompt_with_completion(prompt, "<answer>(A)</answer>")
         assert len(full) == 2
         assert full[-1]["role"] == "assistant"

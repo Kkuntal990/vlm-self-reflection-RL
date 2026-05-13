@@ -67,7 +67,6 @@ def test_wr_bonus_raw_breakdown_component(a1_text, a2_text, expected_wr_bonus):
         answer_type="mcq",
         choices="(A) (B)",
         weights=weights,
-        use_think_answer_tags=True,
     )
     assert breakdown.components["wr_bonus"] == expected_wr_bonus
 
@@ -91,7 +90,6 @@ def test_wr_bonus_rescaled_breakdown_component(a1_text, a2_text, expected_wr_bon
         answer_type="mcq",
         choices="(A) (B)",
         weights=weights,
-        use_think_answer_tags=True,
     )
     assert breakdown.components["wr_bonus"] == expected_wr_bonus
 
@@ -125,7 +123,6 @@ def test_wr_bonus_quadrant_table_rescaled(a1_text, a2_text, expected_total):
         answer_type="mcq",
         choices="(A) (B)",
         weights=weights,
-        use_think_answer_tags=True,
     )
     assert abs(breakdown.total_reward - expected_total) < 1e-9
 
@@ -151,12 +148,8 @@ def test_wr_bonus_disabled_by_default():
         w_no_regression=0.0,
         # w_wr_bonus defaults to 0.0
     )
-    rr = compute_response_reward_breakdown_01(
-        A_RIGHT, A_RIGHT, GT, "mcq", "(A) (B)", weights, use_think_answer_tags=True
-    )
-    wr = compute_response_reward_breakdown_01(
-        A_WRONG, A_RIGHT, GT, "mcq", "(A) (B)", weights, use_think_answer_tags=True
-    )
+    rr = compute_response_reward_breakdown_01(A_RIGHT, A_RIGHT, GT, "mcq", "(A) (B)", weights)
+    wr = compute_response_reward_breakdown_01(A_WRONG, A_RIGHT, GT, "mcq", "(A) (B)", weights)
     # Both end up with a2_correct=True → total=1.0 regardless of A1.
     assert rr.total_reward == wr.total_reward == 1.0
     # And the wr_bonus *component* still fires for WR — it's just

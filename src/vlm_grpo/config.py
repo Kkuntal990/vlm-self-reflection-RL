@@ -65,8 +65,6 @@ class RolloutConfig:
     top_p: float = 0.9
     a2_temperature: float = 1.0
     batch_size: int = 8
-    use_think_answer_tags: bool = False
-    use_answer_tag_only: bool = False
     reward_shaping_alpha: float = 0.0
     response_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
     feedback_alpha: float = -1.0  # -1 means "use reward_shaping_alpha"
@@ -82,20 +80,6 @@ class RolloutConfig:
     # ``compute_feedback_reward_breakdown_01`` in
     # ``src/vlm_grpo/rewards/composition.py``.
     use_rescaled_rewards: bool = False
-    # vLLM-native loss path (closes audit Bug 2 — vLLM <-> HF retokenize
-    # mismatch). When True AND the rollout engine emits per-token logprobs
-    # alongside token_ids:
-    #   1. The HF forward pass scores the EXACT tokens vLLM sampled
-    #      (manual assembly of input_ids = prompt_ids ++ vllm_completion_ids,
-    #      bypassing apply_chat_template + tokenize on completion text).
-    #   2. ``old_lp`` for the GRPO importance ratio is taken directly from
-    #      vLLM's sample-time logprobs, eliminating one HF forward pass per
-    #      step (~12% wall-clock speedup) and absorbing engine-level logit
-    #      drift into the IS correction.
-    # When False (default during migration): legacy retokenize-based path,
-    # bit-for-bit unchanged. Set to True after validating with the
-    # equivalence test in ``tests/test_vllm_token_passthrough.py``.
-    use_vllm_native_loss: bool = False
     # PAG-faithful arm (arXiv:2506.10406):
     #   - ``use_pag_segment_rewards`` switches to the binary {0, 1} per-segment
     #     reward composers in ``rewards/composition.py``. r_a1 and r_a2 are

@@ -196,8 +196,6 @@ def test_rollout_dataclass_fields_for_rollout_engine() -> None:
         a2_temperature=0.7,
         top_p=0.9,
         batch_size=2,
-        use_think_answer_tags=True,
-        use_answer_tag_only=False,
         reward_shaping_alpha=1.0,
         response_alpha=1.0,
         feedback_alpha=1.0,
@@ -207,7 +205,6 @@ def test_rollout_dataclass_fields_for_rollout_engine() -> None:
     assert rollout.temperature == 1.0
     assert rollout.feedback_temperature == 1.0
     assert rollout.a2_temperature == 0.7
-    assert rollout.use_think_answer_tags is True
     assert rollout.reward_shaping_alpha == 1.0
     assert rollout.response_alpha == 1.0
     assert rollout.feedback_alpha == 1.0

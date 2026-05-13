@@ -228,18 +228,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max_pixels", type=int, default=401408, help="Max pixels per image")
     parser.add_argument(
-        "--use_think_answer_tags",
-        action="store_true",
-        help="Use <think>...</think><answer>...</answer> tag format for A1/A2 generation. "
-        "Enables structured reasoning with format reward for tags.",
-    )
-    parser.add_argument(
-        "--use_answer_tag_only",
-        action="store_true",
-        help="Use <answer>...</answer> tag only (no <think>). Model reasons freely, "
-        "wraps final answer in <answer> tags for structured extraction.",
-    )
-    parser.add_argument(
         "--use_rescaled_rewards",
         action="store_true",
         help=(
@@ -253,23 +241,6 @@ def parse_args() -> argparse.Namespace:
             "magnitude across components — matches the design that worked in "
             "the single-turn baseline-a1 run. Ignored when --single_turn_a1 "
             "is also set (baseline path has its own [0, 1] reward)."
-        ),
-    )
-    parser.add_argument(
-        "--use_vllm_native_loss",
-        action="store_true",
-        help=(
-            "Close audit Bug 2 (vLLM ↔ HF retokenize mismatch). When set, "
-            "the HF forward pass that computes new_lp / ref_lp grades the "
-            "EXACT tokens vLLM sampled (manually assembles input_ids = "
-            "prompt_ids ++ vllm_completion_ids), and old_lp comes directly "
-            "from vLLM's sample-time logprobs (eliminates one HF forward "
-            "pass per step — ~12%% wall-clock speedup). Requires the rollout "
-            "engine to emit per-token logprobs (vLLM ≥ 0.12 with "
-            "SamplingParams(logprobs=1) — supplied automatically by the "
-            "VLLMRolloutEngine in this repo). When unset (default during "
-            "migration), the legacy retokenize-based path is used; the "
-            "[Bug 2] warning will continue to fire."
         ),
     )
     parser.add_argument(
@@ -609,14 +580,11 @@ def main() -> None:
         feedback_temperature=args.feedback_temperature,
         a2_temperature=args.a2_temperature,
         batch_size=args.per_device_train_batch_size,
-        use_think_answer_tags=args.use_think_answer_tags,
-        use_answer_tag_only=getattr(args, "use_answer_tag_only", False),
         reward_shaping_alpha=args.reward_shaping_alpha,
         response_alpha=args.response_alpha,
         feedback_alpha=args.feedback_alpha,
         single_turn_a1=args.single_turn_a1,
         use_rescaled_rewards=args.use_rescaled_rewards,
-        use_vllm_native_loss=getattr(args, "use_vllm_native_loss", False),
         use_pag_segment_rewards=getattr(args, "use_pag_segment_rewards", False),
         use_selective_revision=getattr(args, "use_selective_revision", False),
         pag_shaping_alpha=float(getattr(args, "pag_shaping_alpha", 1.0)),

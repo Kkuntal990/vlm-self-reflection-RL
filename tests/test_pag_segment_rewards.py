@@ -82,7 +82,6 @@ def test_pag_response_ungated_quadrants(a1_text, a2_text, a1_corr_01, a2_corr_01
         answer_type="mcq",
         choices="",
         weights=_pag_response_weights(),
-        use_think_answer_tags=True,
         pag_shaping_alpha=1.0,
         gated=False,
     )
@@ -111,7 +110,6 @@ def test_pag_response_gated_zeroes_a2():
         answer_type="mcq",
         choices="",
         weights=_pag_response_weights(),
-        use_think_answer_tags=True,
         pag_shaping_alpha=1.0,
         gated=True,
     )
@@ -141,7 +139,6 @@ def test_pag_response_alpha_zero_drops_shaping():
         answer_type="mcq",
         choices="",
         weights=_pag_response_weights(),
-        use_think_answer_tags=True,
         pag_shaping_alpha=0.0,
         gated=False,
     )
@@ -161,13 +158,12 @@ def test_pag_response_format_missing():
         answer_type="mcq",
         choices="",
         weights=_pag_response_weights(),
-        use_think_answer_tags=True,
         pag_shaping_alpha=1.0,
         gated=False,
     )
-    # tag_mode=True with missing tags → strict extraction returns "" → wrong.
-    # That, in turn, means a1_corr = 0 and r_a1 = 0 (correctness 0 × 0.9 +
-    # format 0 × 0.1).
+    # Strict tag-mode extraction (the only path) on missing tags returns
+    # "" → wrong. That, in turn, means a1_corr = 0 and r_a1 = 0
+    # (correctness 0 × 0.9 + format 0 × 0.1).
     assert bd.r_a1_corr == 0.0
     assert bd.a1_format == 0.0
     assert bd.r_a1 == pytest.approx(0.0)

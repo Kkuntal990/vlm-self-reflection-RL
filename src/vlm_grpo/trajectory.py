@@ -188,8 +188,10 @@ def extract_from_answer_tags(text: str) -> str:
     If <answer> tags are found, returns the inner content.
     If no tags found, returns the original text unchanged (fallback).
 
-    This enables a clean fallback: when use_think_answer_tags=False,
-    calling this function is a no-op since raw answers don't contain tags.
+    The training pipeline always emits the think/answer tag format, so
+    the fallback path is rarely hit in production — it exists only to
+    keep this parser robust against degenerate completions that drop
+    the tag entirely.
 
     Args:
         text: Raw model output, possibly containing <think> and <answer> tags.
