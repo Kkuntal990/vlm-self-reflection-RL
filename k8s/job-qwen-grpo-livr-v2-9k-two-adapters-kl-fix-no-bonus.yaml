@@ -72,10 +72,7 @@ spec:
             --adapter_routing_json "${ADAPTER_ROUTING_JSON}" \
             --ref_model_init_from_checkpoint "${REF_INIT_CHECKPOINT}" \
             --use_vllm \
-            --use_vllm_native_loss \
-            --use_think_answer_tags \
             --use_rescaled_rewards \
-            --use_dynamic_sampling \
             --use_gdpo_normalization \
             --vllm_gpu_memory_utilization ${VLLM_GPU_MEM:-0.40} \
             --max_samples ${MAX_SAMPLES:-0} \
@@ -94,29 +91,21 @@ spec:
             --num_train_epochs ${EPOCHS:-1} \
             --num_inner_epochs ${INNER_EPOCHS:-1} \
             --kl_coeff ${KL_COEFF:-0.001} \
-            --a1_kl_coeff ${A1_KL_COEFF:-2500.0} \
+            --a1_kl_coeff ${A1_KL_COEFF:-220.0} \
             --a2_kl_coeff ${A2_KL_COEFF:-220.0} \
             --fb_kl_coeff ${FB_KL_COEFF:-220.0} \
             --separate_turn_loss \
             --clip_range ${CLIP_RANGE:-0.2} \
-            --clip_high ${CLIP_HIGH:-0.28} \
+            --clip_high ${CLIP_HIGH:-0.2} \
             --loss_type ${LOSS_TYPE:-grpo} \
             --lora_r ${LORA_R:-16} \
             --lora_alpha ${LORA_ALPHA:-32} \
-            --max_pixels ${MAX_PIXELS:-401408} \
-            --min_pixels ${MIN_PIXELS:-200704} \
             --w_a1_correctness 0.0 \
             --w_a1_format ${W_A1_FORMAT:-0.05} \
             --w_a2_correctness ${W_A2_CORRECTNESS:-0.9} \
             --w_a2_format ${W_A2_FORMAT:-0.05} \
-            --w_no_regression 0.0 \
-            --w_wr_bonus ${W_WR_BONUS:-1.0} \
-            --w_downstream 0.0 \
             --w_verification_accuracy ${W_VERIFICATION_ACCURACY:-0.45} \
             --w_fb_format ${W_FB_FORMAT:-0.05} \
-            --reward_shaping_alpha ${REWARD_SHAPING_ALPHA:-1.0} \
-            --response_alpha ${RESPONSE_ALPHA:-1.0} \
-            --feedback_alpha ${FEEDBACK_ALPHA:-1.0} \
             --logging_steps ${LOGGING_STEPS:-10} \
             --save_steps ${SAVE_STEPS:-250} \
             --seed ${SEED:-42} \
@@ -158,7 +147,7 @@ spec:
         - name: KL_COEFF
           value: "0.001"
         - name: A1_KL_COEFF
-          value: "2500.0"
+          value: "220.0"
         - name: A2_KL_COEFF
           value: "220.0"
         - name: FB_KL_COEFF
@@ -171,7 +160,7 @@ spec:
         - name: CLIP_RANGE
           value: "0.2"
         - name: CLIP_HIGH
-          value: "0.28"
+          value: "0.2"
         - name: INNER_EPOCHS
           value: "1"
 
@@ -229,18 +218,6 @@ spec:
           value: |
             Re-examine the image and determine whether the candidate answer is correct or incorrect. The reasoning process MUST BE enclosed within <think> </think> tags. The final verdict MUST BE put in \boxed{} as either CORRECT or INCORRECT.
 
-        - name: MAX_PIXELS
-          value: "401408"
-        - name: MIN_PIXELS
-          value: "200704"
-
-        - name: REWARD_SHAPING_ALPHA
-          value: "1.0"
-        - name: RESPONSE_ALPHA
-          value: "1.0"
-        - name: FEEDBACK_ALPHA
-          value: "1.0"
-
         # === Response reward weights (no-bonus regime, convex sum = 1.0) ===
         - name: W_A1_FORMAT
           value: "0.05"
@@ -248,8 +225,6 @@ spec:
           value: "0.9"
         - name: W_A2_FORMAT
           value: "0.05"
-        - name: W_WR_BONUS
-          value: "0.0"
         # === Feedback reward weights (convex sum = 1.0) ===
         - name: W_VERIFICATION_ACCURACY
           value: "0.9"
