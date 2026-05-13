@@ -93,20 +93,42 @@ def _reduce_metrics_across_ranks(metrics: dict[str, float]) -> dict[str, float]:
     if not _dist_is_initialized():
         return metrics
 
-    import torch
+    import json
 
-    scalar_keys = [k for k, v in metrics.items() if isinstance(v, (int, float))]
-    if not scalar_keys:
-        return metrics
+    import torch
 
     world_size = torch.distributed.get_world_size()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Synchronize key set across ranks. If two ranks emit different keys
+    # (e.g., one rank's K-group was entirely gated and skipped an A2
+    # component while another rank's wasn't), packing per-rank tensors
+    # blindly would produce different-sized tensors and NCCL would
+    # deadlock on the size mismatch. We use rank 0's key set as the
+    # canonical schema and zero-fill missing keys on other ranks.
+    local_scalar_keys = sorted(k for k, v in metrics.items() if isinstance(v, (int, float)))
+    if torch.distributed.get_rank() == 0:
+        encoded = json.dumps(local_scalar_keys).encode("utf-8")
+        size_t = torch.tensor([len(encoded)], device=device, dtype=torch.long)
+    else:
+        encoded = b""
+        size_t = torch.tensor([0], device=device, dtype=torch.long)
+    torch.distributed.broadcast(size_t, src=0)
+    payload = torch.zeros(int(size_t.item()), device=device, dtype=torch.uint8)
+    if torch.distributed.get_rank() == 0:
+        payload[: len(encoded)] = torch.tensor(list(encoded), device=device, dtype=torch.uint8)
+    torch.distributed.broadcast(payload, src=0)
+    canonical_keys: list[str] = json.loads(bytes(payload.tolist()).decode("utf-8"))
+    if not canonical_keys:
+        return metrics
+
     values = torch.tensor(
-        [float(metrics[k]) for k in scalar_keys],
+        [float(metrics[k]) if k in metrics else 0.0 for k in canonical_keys],
         device=device,
         dtype=torch.float32,
     )
     torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+    scalar_keys = canonical_keys
 
     reduced = dict(metrics)
     for i, k in enumerate(scalar_keys):
@@ -1932,6 +1954,28 @@ class SelfReflectionGRPOTrainer:
         # attribute and skip A2 components for gated trajectories. A1 and
         # F1 components are valid for every trajectory (A1 always runs;
         # F1 always runs) and accumulate unconditionally.
+        # Pre-declare the full PAG component key set so every rank has the
+        # same keys in rollout_metrics regardless of trajectory mix. Without
+        # this, a rank where ALL K trajectories gated would not register the
+        # a2_correctness / a2_format / shaping_bonus keys at all, while a
+        # rank with at least one non-gated trajectory would — causing the
+        # per-rank tensor packed by _reduce_metrics_across_ranks to have
+        # different lengths, which deadlocks NCCL ALLREDUCE.
+        _resp_component_names = (
+            "a1_correctness",
+            "a1_format",
+            "a2_correctness",
+            "a2_format",
+            "shaping_bonus",
+            "no_regression",
+            "wr_bonus",
+        )
+        _fb_component_names = ("verification", "format", "downstream")
+        for name in _resp_component_names:
+            rollout_metrics.setdefault(f"sr/resp_{name}_mean", [])
+        for name in _fb_component_names:
+            rollout_metrics.setdefault(f"sr/fb_{name}_mean", [])
+
         _a2_component_keys = ("a2_correctness", "a2_format", "shaping_bonus")
         for result in rollout_results:
             if result.response_breakdowns:
@@ -1950,16 +1994,20 @@ class SelfReflectionGRPOTrainer:
                         key = f"sr/fb_{comp_name}_mean"
                         rollout_metrics.setdefault(key, [])
                         rollout_metrics[key].append(comp_val)
-        # Average the component lists
+        # Average the component lists. Empty lists (which occur on ranks
+        # where every trajectory was gated for a given A2 component) must
+        # collapse to a scalar so the cross-rank reduce sees the same key
+        # type on every rank — otherwise the all_reduce tensor sizes differ
+        # and NCCL deadlocks at 30 min watchdog timeout.
         for key in list(rollout_metrics.keys()):
             if key.startswith("sr/resp_") and key.endswith("_mean"):
                 val = rollout_metrics[key]
-                if isinstance(val, list) and val:
-                    rollout_metrics[key] = sum(val) / len(val)
+                if isinstance(val, list):
+                    rollout_metrics[key] = (sum(val) / len(val)) if val else 0.0
             if key.startswith("sr/fb_") and key.endswith("_mean"):
                 val = rollout_metrics[key]
-                if isinstance(val, list) and val:
-                    rollout_metrics[key] = sum(val) / len(val)
+                if isinstance(val, list):
+                    rollout_metrics[key] = (sum(val) / len(val)) if val else 0.0
 
         # Aggregate metrics across DDP ranks so rank 0 logs the cluster-wide
         # view (64 trajectories) instead of its local 16-trajectory slice.
