@@ -291,7 +291,7 @@ def compute_baseline_a1_reward_breakdown(
     """Compute the 2-component A1-only reward used by the single-turn baseline.
 
     This is the lone reward path when ``RolloutConfig.single_turn_a1=True``;
-    no F1 / A2 / no_regression / shaped-improvement components participate.
+    no F1 / A2 / shaped-improvement components participate.
 
     Args:
         a1_text: Raw A1 output text.
@@ -341,8 +341,8 @@ def compute_response_reward_breakdown(
 ) -> TrajectoryResponseRewardBreakdown:
     """Compute response reward for a single trajectory.
 
-    Evaluates answer quality: A1 correctness, A2 correctness,
-    no-regression, and format.
+    Evaluates answer quality: A1 correctness, A2 correctness, format,
+    and the optional additive WR bonus.
 
     Args:
         a1_text: Initial answer text
@@ -351,10 +351,13 @@ def compute_response_reward_breakdown(
         answer_type: Answer type ("mcq", "yesno", "numeric", "open")
         choices: MCQ choices string
         weights: ResponseRewardWeights instance
+        reward_shaping_alpha: Kept for API parity; unused in this path
+            since the transition / shaped reward component was deleted.
 
     Returns:
         TrajectoryResponseRewardBreakdown with all component scores
     """
+    del reward_shaping_alpha  # parity arg, no longer used here
     # Tag-mode is the only supported extraction path: <answer> tag presence
     # is required. Missing tag → extracted="" → MatchResult.is_correct=False
     # naturally, so the correctness path handles "no extractable answer"
@@ -384,31 +387,10 @@ def compute_response_reward_breakdown(
     else:
         r_a2 = 1.0 if a2_correct else -1.0
 
-    # No-regression / improvement reward for A2.
-    # When reward_shaping_alpha > 0: use shaped improvement term α*(R(A2)-R(A1)).
-    # This replaces transition-based no_regression with a continuous signal
-    # that reduces RR stabilization (less conservative A2) while amplifying
-    # WR/RW gradient. Use w_no_regression=1.0 when alpha > 0.
-    # When alpha = 0: fall back to transition-based no_regression.
-    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
-
-    if reward_shaping_alpha > 0:
-        r_no_reg = reward_shaping_alpha * (r_a2 - r_a1)
-    elif answer_type in DETERMINISTIC_TYPES:
-        if a1_correct:
-            r_no_reg = 1.0 if a2_correct else -2.0
-        else:
-            r_no_reg = 3.0 if a2_correct else 0.0
-    else:
-        if a1_correct:
-            r_no_reg = 1.0 if a2_correct else -3.0
-        else:
-            r_no_reg = 2.0 if a2_correct else 0.0
-
     # WR bonus: Bernoulli {0, 1} indicator that fires when A1 was wrong
     # and A2 corrected to right (the WR quadrant). Additive — does NOT
-    # penalise RW (unlike no_regression shaping). Off by default
-    # (w_wr_bonus=0.0). See ResponseRewardWeights docstring.
+    # penalise RW. Off by default (w_wr_bonus=0.0). See
+    # ResponseRewardWeights docstring.
     r_wr_bonus = 1.0 if (not a1_correct and a2_correct) else 0.0
 
     components = {
@@ -416,7 +398,6 @@ def compute_response_reward_breakdown(
         "a1_format": r_a1_format,
         "a2_correctness": r_a2,
         "a2_format": r_a2_format,
-        "no_regression": r_no_reg,
         "wr_bonus": r_wr_bonus,
     }
     weighted_components = {
@@ -424,7 +405,6 @@ def compute_response_reward_breakdown(
         "a1_format": r_a1_format * weights.w_a1_format,
         "a2_correctness": r_a2 * weights.w_a2_correctness,
         "a2_format": r_a2_format * weights.w_a2_format,
-        "no_regression": r_no_reg * weights.w_no_regression,
         "wr_bonus": r_wr_bonus * weights.w_wr_bonus,
     }
     total_reward = sum(weighted_components.values())
@@ -689,7 +669,7 @@ def compute_pag_response_breakdown(
         weights: ``ResponseRewardWeights`` instance. ``w_a1_correctness`` and
             ``w_a2_correctness`` should be 0.9 and the format weights 0.1
             for PAG-faithful runs; the shaping bonus uses
-            ``pag_shaping_alpha`` and is NOT controlled by ``w_no_regression``.
+            ``pag_shaping_alpha`` directly.
         pag_shaping_alpha: α coefficient on the b_y bonus.
         gated: Whether the selective-revision gate stopped this trajectory
             at F1 (i.e. F1 said CORRECT).
@@ -862,17 +842,13 @@ def _to_unit(x: float, lo: float, hi: float) -> float:
 # and ``compute_feedback_reward_breakdown``.
 #
 # These are inline values inside the existing breakdowns (NOT the values from
-# the standalone ``stability.compute_no_regression_reward`` /
-# ``feedback.compute_downstream_aware_reward`` functions, which differ).
+# the standalone ``feedback.compute_downstream_aware_reward`` function, which
+# differs).
 #
 # IMPORTANT: keep these in sync with the inline values if either function is
 # edited. See the per-component rationale in the docstrings below.
 _A1_CORR_RANGE = (-1.0, 1.0)
 _A2_CORR_RANGE = (-1.0, 1.0)
-# no_regression: deterministic det:{-2,+3}; open:{-3,+2}. Combined min/max
-# across both branches gives the safest unified rescale.
-_NO_REG_DET_RANGE = (-2.0, 3.0)
-_NO_REG_OPEN_RANGE = (-3.0, 2.0)
 # downstream (default, transition mode): deterministic det:{-1.5,+3};
 # open:{-2,+2}. After asymmetric gating (clamp to <=0 when verification
 # fails), the negative arm doesn't change, so the raw range bounds are still
@@ -938,49 +914,6 @@ def compute_a2_correctness_01(
         tolerance=tolerance,
     )
     return _to_unit(raw, _A2_CORR_RANGE[0], _A2_CORR_RANGE[1])
-
-
-def compute_no_regression_01(
-    a2_extracted: str,
-    ground_truth: str,
-    answer_type: str,
-    a1_is_correct: bool,
-    tolerance: float = 0.01,
-) -> float:
-    """[0, 1]-rescaled no-regression reward (matches the inline values in
-    ``compute_response_reward_breakdown``).
-
-    Inline raw values (NOT the stability.compute_no_regression_reward values):
-        Deterministic: RR=+1, RW=-2, WR=+3, WW=0  (range [-2, +3])
-        Open-ended:    RR=+1, RW=-3, WR=+2, WW=0  (range [-3, +2])
-
-    Args:
-        a2_extracted: Normalized extracted A2 answer.
-        ground_truth: Ground truth answer.
-        answer_type: Answer type ("mcq", "yesno", "numeric", "open",
-            "counting").
-        a1_is_correct: Whether A1 was correct.
-        tolerance: Numeric tolerance for comparison.
-
-    Returns:
-        Float in ``[0, 1]``.
-    """
-    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
-
-    a2_result = verify_answer(a2_extracted, ground_truth, answer_type, tolerance=tolerance)
-    a2_correct = a2_result.is_correct
-
-    if answer_type in DETERMINISTIC_TYPES:
-        if a1_is_correct:
-            raw = 1.0 if a2_correct else -2.0
-        else:
-            raw = 3.0 if a2_correct else 0.0
-        return _to_unit(raw, _NO_REG_DET_RANGE[0], _NO_REG_DET_RANGE[1])
-    if a1_is_correct:
-        raw = 1.0 if a2_correct else -3.0
-    else:
-        raw = 2.0 if a2_correct else 0.0
-    return _to_unit(raw, _NO_REG_OPEN_RANGE[0], _NO_REG_OPEN_RANGE[1])
 
 
 def compute_a2_format_01(
@@ -1123,10 +1056,7 @@ def compute_response_reward_breakdown_01(
     ``compute_response_reward_breakdown``).
 
     Each component is in [0, 1]; with ResponseRewardWeights summing to 1.0,
-    ``total_reward`` lands in [0, 1] (not [0, sum_of_weights] strictly,
-    because the inline ``no_regression`` raw values don't all reach the
-    upper bound from a given a1_correct branch — see
-    ``_NO_REG_DET_RANGE``).
+    ``total_reward`` lands in [0, 1].
 
     Args:
         a1_text: Initial answer text.
@@ -1136,16 +1066,14 @@ def compute_response_reward_breakdown_01(
             "counting").
         choices: MCQ choices string.
         weights: ResponseRewardWeights instance.
-        reward_shaping_alpha: SCoRe-style shaped reward alpha (passed
-            through but currently does NOT replace the inline transition
-            values — the rescaled path uses the discrete RR/RW/WR/WW
-            values, matching the ``alpha=0`` branch of the raw breakdown).
+        reward_shaping_alpha: Kept for API parity; the transition / shaped
+            reward component was deleted, so this argument is now unused.
 
     Returns:
         ``TrajectoryResponseRewardBreakdown`` with each ``components[k]`` in
         [0, 1] and ``weighted_components[k] = weight_k × component_k``.
     """
-    from vlm_grpo.rewards.verifier import DETERMINISTIC_TYPES
+    del reward_shaping_alpha  # parity arg, no longer used here
 
     a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=True)
     a1_correct = a1_result.is_correct
@@ -1165,28 +1093,6 @@ def compute_response_reward_breakdown_01(
     else:
         r_a2 = 1.0 if a2_correct else 0.0
 
-    # No-regression (rescaled). When alpha > 0, the inline raw path uses
-    # ``α * (r_a2_raw - r_a1_raw)`` with r_*_raw in {-1, +1}; we mirror
-    # that and rescale via the symmetric envelope.
-    if reward_shaping_alpha > 0:
-        r_a1_raw = 1.0 if a1_correct else -1.0
-        r_a2_raw = 1.0 if a2_correct else -1.0
-        raw_no_reg = reward_shaping_alpha * (r_a2_raw - r_a1_raw)
-        # range: [-2α, +2α]
-        r_no_reg = _to_unit(raw_no_reg, -2.0 * reward_shaping_alpha, 2.0 * reward_shaping_alpha)
-    elif answer_type in DETERMINISTIC_TYPES:
-        if a1_correct:
-            raw_no_reg = 1.0 if a2_correct else -2.0
-        else:
-            raw_no_reg = 3.0 if a2_correct else 0.0
-        r_no_reg = _to_unit(raw_no_reg, _NO_REG_DET_RANGE[0], _NO_REG_DET_RANGE[1])
-    else:
-        if a1_correct:
-            raw_no_reg = 1.0 if a2_correct else -3.0
-        else:
-            raw_no_reg = 2.0 if a2_correct else 0.0
-        r_no_reg = _to_unit(raw_no_reg, _NO_REG_OPEN_RANGE[0], _NO_REG_OPEN_RANGE[1])
-
     # WR bonus (rescaled path): same Bernoulli {0, 1} indicator. Already
     # in [0, 1] so no rescaling needed. Matches the raw path component.
     r_wr_bonus = 1.0 if (not a1_correct and a2_correct) else 0.0
@@ -1196,7 +1102,6 @@ def compute_response_reward_breakdown_01(
         "a1_format": r_a1_format,
         "a2_correctness": r_a2,
         "a2_format": r_a2_format,
-        "no_regression": r_no_reg,
         "wr_bonus": r_wr_bonus,
     }
     weighted_components = {
@@ -1204,7 +1109,6 @@ def compute_response_reward_breakdown_01(
         "a1_format": r_a1_format * weights.w_a1_format,
         "a2_correctness": r_a2 * weights.w_a2_correctness,
         "a2_format": r_a2_format * weights.w_a2_format,
-        "no_regression": r_no_reg * weights.w_no_regression,
         "wr_bonus": r_wr_bonus * weights.w_wr_bonus,
     }
     total_reward = sum(weighted_components.values())

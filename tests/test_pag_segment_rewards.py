@@ -28,16 +28,14 @@ F1_NO_BOX = "<think>no boxed verdict</think>"
 
 
 def _pag_response_weights() -> ResponseRewardWeights:
-    """User spec: 0.9 correctness + 0.1 format per turn, no_regression
-    + wr_bonus zeroed (the PAG composer ignores both and applies its
-    own shaping bonus via pag_shaping_alpha).
+    """User spec: 0.9 correctness + 0.1 format per turn, wr_bonus zeroed
+    (the PAG composer applies its own shaping bonus via pag_shaping_alpha).
     """
     return ResponseRewardWeights(
         w_a1_correctness=0.9,
         w_a1_format=0.1,
         w_a2_correctness=0.9,
         w_a2_format=0.1,
-        w_no_regression=0.0,
         w_wr_bonus=0.0,
     )
 

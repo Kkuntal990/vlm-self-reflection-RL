@@ -189,9 +189,9 @@ def test_two_heads_independent():
 # Test 6 — weight=0 component has no effect                                   #
 # --------------------------------------------------------------------------- #
 def test_weight_zero_component_has_no_effect():
-    """The simplified-rewards run sets no_regression and downstream weights
-    to 0. Even if those components have variance across the K-group, they
-    must not affect the final advantage.
+    """The simplified-rewards run sets the downstream weight to 0. Even if
+    that component has variance across the K-group, it must not affect the
+    final advantage.
     """
     trainer = _stub_trainer()
     components = torch.tensor(

@@ -712,7 +712,6 @@ class SelfReflectionGRPOTrainer:
                         "sr/resp_a1_format_mean",
                         "sr/resp_a2_correctness_mean",
                         "sr/resp_a2_format_mean",
-                        "sr/resp_no_regression_mean",
                         "sr/resp_shaping_bonus_mean",
                         "sr/resp_wr_bonus_mean",
                         "sr/fb_downstream_mean",
@@ -1153,7 +1152,6 @@ class SelfReflectionGRPOTrainer:
                 "a1_format",
                 "a2_correctness",
                 "a2_format",
-                "no_regression",
             ]
             fb_components_keys = ["downstream", "verification", "format"]
             resp_components_rows: list[list[float]] = []
@@ -1181,7 +1179,6 @@ class SelfReflectionGRPOTrainer:
                     rw.w_a1_format,
                     rw.w_a2_correctness,
                     rw.w_a2_format,
-                    rw.w_no_regression,
                 ],
                 dtype=resp_rewards_t.dtype,
                 device=self.device,
@@ -1201,11 +1198,10 @@ class SelfReflectionGRPOTrainer:
             a2_rewards_t = None
         elif separate_turns:
             # SCoRe-style: separate advantages for A1 and A2.
-            #   A1 reward = a1_correctness + a1_format       (turn-local signal)
-            #   A2 reward = a2_correctness + a2_format       (turn-local signal)
-            #             + no_regression                    (SCoRe shaping bonus α·(r_a2-r_a1))
-            # Matches Stage II (Eq. 4) of arXiv:2409.12917 where the shaping
-            # bonus α·(r_a2-r_a1) is added ONLY to the A2 reward, never A1.
+            #   A1 reward = a1_correctness + a1_format  (turn-local signal)
+            #   A2 reward = a2_correctness + a2_format  (turn-local signal)
+            # Transition-shaping is carried by the PAG path via
+            # ``pag_shaping_alpha · (r_a2_corr − r_a1_corr)`` (see use_pag branch).
             a1_rewards_list = []
             a2_rewards_list = []
             for result in rollout_results:
@@ -1213,11 +1209,9 @@ class SelfReflectionGRPOTrainer:
                     a1_r = rb.weighted_components.get(
                         "a1_correctness", 0.0
                     ) + rb.weighted_components.get("a1_format", 0.0)
-                    a2_r = (
-                        rb.weighted_components.get("a2_correctness", 0.0)
-                        + rb.weighted_components.get("a2_format", 0.0)
-                        + rb.weighted_components.get("no_regression", 0.0)
-                    )
+                    a2_r = rb.weighted_components.get(
+                        "a2_correctness", 0.0
+                    ) + rb.weighted_components.get("a2_format", 0.0)
                     a1_rewards_list.append(a1_r)
                     a2_rewards_list.append(a2_r)
             a1_rewards_t = torch.tensor(a1_rewards_list, device=self.device)
@@ -1958,7 +1952,6 @@ class SelfReflectionGRPOTrainer:
             "a2_correctness",
             "a2_format",
             "shaping_bonus",
-            "no_regression",
             "wr_bonus",
         )
         _fb_component_names = ("verification", "format", "downstream")

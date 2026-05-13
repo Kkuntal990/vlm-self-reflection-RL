@@ -3,8 +3,7 @@
 
 The WR bonus fires when A1 is wrong AND A2 is right (the "wrong→right"
 quadrant). It's an additive Bernoulli {0, 1} indicator multiplied by
-``w_wr_bonus``. Distinct from ``no_regression`` shaping, which also
-penalises RW; the WR bonus has no symmetric RW penalty.
+``w_wr_bonus`` — no symmetric RW penalty.
 
 Covers both the raw breakdown (``compute_response_reward_breakdown``)
 and the rescaled breakdown (``compute_response_reward_breakdown_01``)
@@ -38,7 +37,6 @@ def _weights_for_wr_bonus_job() -> ResponseRewardWeights:
         w_a1_format=0.05,
         w_a2_correctness=0.9,
         w_a2_format=0.05,
-        w_no_regression=0.0,
         w_wr_bonus=1.0,
     )
 
@@ -145,7 +143,6 @@ def test_wr_bonus_disabled_by_default():
         w_a1_format=0.0,
         w_a2_correctness=1.0,
         w_a2_format=0.0,
-        w_no_regression=0.0,
         # w_wr_bonus defaults to 0.0
     )
     rr = compute_response_reward_breakdown_01(A_RIGHT, A_RIGHT, GT, "mcq", "(A) (B)", weights)

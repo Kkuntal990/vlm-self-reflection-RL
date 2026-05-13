@@ -136,24 +136,16 @@ class ResponseRewardWeights:
                + w_a1_format       * R_a1_format
                + w_a2_correctness * R_a2_correct
                + w_a2_format       * R_a2_format
-               + w_no_regression  * R_no_regression
                + w_wr_bonus       * R_wr_bonus
 
-    Per-turn split convention: each turn carries a 0.9·corr + 0.1·fmt
-    sub-reward. With turn weight 0.3 each and no_regression 0.4, this
-    gives the defaults below (sum = 1.0).
-
     Weights must sum to 1.0 (convex combination). A `__post_init__`
-    warning fires otherwise. Raw α is applied inside R_no_regression,
-    so the *weighted* reward is not bounded by 1.0 — only the linear
-    combination is convex.
+    warning fires otherwise.
 
     Attributes:
         w_a1_correctness: Weight for A1 correctness  (0.9 × turn_weight)
         w_a1_format:      Weight for A1 format       (0.1 × turn_weight)
         w_a2_correctness: Weight for A2 correctness  (0.9 × turn_weight)
         w_a2_format:      Weight for A2 format       (0.1 × turn_weight)
-        w_no_regression:  Weight for transition / shaped reward
         w_wr_bonus:       Weight for an additive bonus that fires when
             A1 is wrong AND A2 is right (the WR quadrant). The component
             is a Bernoulli {0, 1} indicator, so the contribution to
@@ -164,11 +156,10 @@ class ResponseRewardWeights:
             existing experiments are unaffected.
     """
 
-    w_a1_correctness: float = 0.27
-    w_a1_format: float = 0.03
-    w_a2_correctness: float = 0.27
-    w_a2_format: float = 0.03
-    w_no_regression: float = 0.40
+    w_a1_correctness: float = 0.45
+    w_a1_format: float = 0.05
+    w_a2_correctness: float = 0.45
+    w_a2_format: float = 0.05
     w_wr_bonus: float = 0.0
 
     def __post_init__(self) -> None:

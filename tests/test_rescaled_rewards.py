@@ -9,7 +9,6 @@ regression guard ensuring the existing raw breakdown path is unchanged.
 
 from vlm_grpo.config import FeedbackRewardWeights, ResponseRewardWeights
 from vlm_grpo.rewards.composition import (
-    _NO_REG_DET_RANGE,
     _to_unit,
     compute_a2_correctness_01,
     compute_a2_format_01,
@@ -17,7 +16,6 @@ from vlm_grpo.rewards.composition import (
     compute_fb_format_01,
     compute_feedback_reward_breakdown,
     compute_feedback_reward_breakdown_01,
-    compute_no_regression_01,
     compute_response_reward_breakdown,
     compute_response_reward_breakdown_01,
     compute_verification_01,
@@ -63,20 +61,6 @@ def test_a2_correctness_01_mcq():
 def test_a2_correctness_01_yesno():
     assert compute_a2_correctness_01("yes", "yes", "yesno") == 1.0
     assert compute_a2_correctness_01("no", "yes", "yesno") == 0.0
-
-
-def test_no_regression_01_mcq_transitions():
-    # Inline values: RR=+1, RW=-2, WR=+3, WW=0  range [-2, +3]
-    rr = compute_no_regression_01("(A)", "(A)", "mcq", a1_is_correct=True)
-    rw = compute_no_regression_01("(B)", "(A)", "mcq", a1_is_correct=True)
-    wr = compute_no_regression_01("(A)", "(A)", "mcq", a1_is_correct=False)
-    ww = compute_no_regression_01("(B)", "(A)", "mcq", a1_is_correct=False)
-    # Map each to expected [0, 1]: (raw + 2) / 5
-    assert abs(rr - (1.0 + 2.0) / 5.0) < 1e-9  # 0.6
-    assert abs(rw - (-2.0 + 2.0) / 5.0) < 1e-9  # 0.0
-    assert abs(wr - (3.0 + 2.0) / 5.0) < 1e-9  # 1.0
-    assert abs(ww - (0.0 + 2.0) / 5.0) < 1e-9  # 0.4
-    assert wr > rr > ww > rw  # ordering preserved
 
 
 def test_a2_format_01_with_tags():
@@ -182,10 +166,8 @@ def test_fb_format_01_missing_structure():
 
 
 def test_response_breakdown_01_best_case_rr():
-    """RR + valid format. With weights 0.27/0.03/0.27/0.03/0.40, expected
-    total = 0.27*1 (a1_corr) + 0.03*1 (a1_fmt) + 0.27*1 (a2_corr) + 0.03*1
-    (a2_fmt) + 0.40 * (1+2)/5 (no_reg RR) = 0.27 + 0.03 + 0.27 + 0.03 + 0.24
-    = 0.84. All components in [0, 1]."""
+    """RR + valid format. All four live components (a1_corr, a1_fmt,
+    a2_corr, a2_fmt) hit 1.0; total = sum of their weights."""
     weights = ResponseRewardWeights()
     a1 = "<think>r</think><answer>(A)</answer>"
     a2 = "<think>r</think><answer>(A)</answer>"
@@ -202,20 +184,16 @@ def test_response_breakdown_01_best_case_rr():
     assert bd.a1_correct is True
     assert bd.a2_correct is True
     expected = (
-        0.27 * 1.0  # a1_corr
-        + 0.03 * 1.0  # a1_fmt
-        + 0.27 * 1.0  # a2_corr
-        + 0.03 * 1.0  # a2_fmt
-        + 0.40 * _to_unit(1.0, _NO_REG_DET_RANGE[0], _NO_REG_DET_RANGE[1])  # no_reg
+        weights.w_a1_correctness * 1.0
+        + weights.w_a1_format * 1.0
+        + weights.w_a2_correctness * 1.0
+        + weights.w_a2_format * 1.0
     )
     assert abs(bd.total_reward - expected) < 1e-6
 
 
 def test_response_breakdown_01_wr_max():
-    """WR + valid format = component-wise maximum: a2_corr=1, no_reg=1
-    (RR=+1 → 0.6, RW=-2 → 0, WR=+3 → 1.0). Total = 0.27+0.03+0.27+0+0.4*1
-    = 0.97. (a1_format on a wrong (B) answer with valid tags is still 1.0
-    since format check is type-agnostic.)"""
+    """WR + valid format: a2_corr=1, a1_corr=0; both format reads=1."""
     weights = ResponseRewardWeights()
     a1 = "<think>r</think><answer>(B)</answer>"  # wrong
     a2 = "<think>r</think><answer>(A)</answer>"  # right
@@ -229,7 +207,8 @@ def test_response_breakdown_01_wr_max():
     )
     assert bd.a1_correct is False
     assert bd.a2_correct is True
-    assert bd.components["no_regression"] == 1.0  # WR maps to 1.0
+    assert bd.components["a2_correctness"] == 1.0
+    assert bd.components["a1_correctness"] == 0.0
 
 
 def test_response_breakdown_01_worst_case_rw_no_tags():
@@ -320,13 +299,10 @@ def test_feedback_breakdown_01_asymmetric_gate():
     )
     assert bd.components["verification"] == 0.0
     # downstream gated to midpoint
-    expected_mid = _to_unit(0.0, _NO_REG_DET_RANGE[0], _NO_REG_DET_RANGE[1])
-    # ^ same span as deterministic downstream (-1.5, 3.0) is 4.5; mid raw=0
+    # span of deterministic downstream (-1.5, 3.0) is 4.5; mid raw=0
     # → (0+1.5)/4.5 = 1/3
     expected_dmid = (0.0 + 1.5) / 4.5
     assert abs(bd.components["downstream"] - expected_dmid) < 1e-6
-    # Just sanity: deterministic range has the same 0-mid as no_reg.
-    assert abs(expected_mid - (0.0 + 2.0) / 5.0) < 1e-9  # different ranges
 
 
 # ---------------------------------------------------------------------------
@@ -348,11 +324,10 @@ def test_raw_response_breakdown_unchanged():
         choices="",
         weights=weights,
     )
-    # With tags + RR: a1_corr=+1, a2_corr=+1, a1_fmt=+1, a2_fmt=+1,
-    # no_reg=+1 (RR for det). Inline raw values, NOT rescaled.
+    # With tags + RR: a1_corr=+1, a2_corr=+1, a1_fmt=+1, a2_fmt=+1.
+    # Inline raw values, NOT rescaled.
     assert bd.components["a1_correctness"] == 1.0
     assert bd.components["a2_correctness"] == 1.0
-    assert bd.components["no_regression"] == 1.0
     assert bd.components["a1_format"] == 1.0
     assert bd.components["a2_format"] == 1.0
 

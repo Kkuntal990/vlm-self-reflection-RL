@@ -63,7 +63,7 @@ r_response = w_a1_corr · R_a1_correctness
 - `R_a1_correctness`, `R_a2_correctness`: ±1 for deterministic types (MCQ / yesno / numeric); continuous `2·score − 1` for counting / open. SCoRe Stage I anchor¹ + standard GRPO outcome reward³
 - `R_a1_format`, `R_a2_format`: binary {0, +1}. +1 only when **both** `<think>...</think>` and `<answer>...</answer>` are present **and** the inner content is a clean atomic answer (MCQ letter / int / yes-no / parseable numeric). DeepSeek-R1⁴
 
-The `ResponseRewardWeights` dataclass still carries `w_no_regression` and `w_wr_bonus` fields (and the legacy `R_no_regression` / `R_wr_bonus` components remain in `composition.py`), but both active runs set them to 0 — they're vestigial and not documented further here. See `docs/rewards.md` and the git history for the legacy multi-turn-transition formulas.
+The `ResponseRewardWeights` dataclass still carries a `w_wr_bonus` field (and `R_wr_bonus` is in `composition.py`), but both active runs set it to 0 — vestigial. See `docs/rewards.md` and the git history for legacy formulas. (`R_no_regression` was deleted entirely — the PAG path now carries A1→A2 transition reward via `pag_shaping_alpha · (r_a2_corr − r_a1_corr)`.)
 
 **Feedback Reward** (drives F1 log-prob)
 

@@ -234,13 +234,13 @@ def parse_args() -> argparse.Namespace:
             "Use the per-component [0, 1]-rescaled multi-turn reward composition "
             "(`compute_response_reward_breakdown_01` / "
             "`compute_feedback_reward_breakdown_01`). Each reward component "
-            "(a2_correctness, no_regression, a2_format, downstream, verification, "
-            "fb_format) is normalized to [0, 1] from its raw range; with "
-            "weights summing to 1.0, resp_reward / fb_reward / total_reward "
-            "are all strictly non-negative. Equalizes per-unit-weight gradient "
-            "magnitude across components — matches the design that worked in "
-            "the single-turn baseline-a1 run. Ignored when --single_turn_a1 "
-            "is also set (baseline path has its own [0, 1] reward)."
+            "(a2_correctness, a2_format, downstream, verification, fb_format) "
+            "is normalized to [0, 1] from its raw range; with weights summing "
+            "to 1.0, resp_reward / fb_reward / total_reward are all strictly "
+            "non-negative. Equalizes per-unit-weight gradient magnitude across "
+            "components — matches the design that worked in the single-turn "
+            "baseline-a1 run. Ignored when --single_turn_a1 is also set "
+            "(baseline path has its own [0, 1] reward)."
         ),
     )
     parser.add_argument(
@@ -292,8 +292,8 @@ def parse_args() -> argparse.Namespace:
             "reward (0.9*correctness + 0.1*format by default). Used to isolate "
             "algorithm bugs from multi-turn / two-reward composition issues. "
             "When set, the --w_a1_correctness / --w_a1_format flags are interpreted "
-            "as the baseline weights; --w_a2_*, --w_no_regression and feedback "
-            "flags are ignored. KL is applied to A1 only."
+            "as the baseline weights; --w_a2_* and feedback flags are ignored. "
+            "KL is applied to A1 only."
         ),
     )
     parser.add_argument("--min_pixels", type=int, default=200704, help="Min pixels per image")
@@ -320,16 +320,14 @@ def parse_args() -> argparse.Namespace:
 
     # Response reward weights (must sum to 1.0)
     # Per-turn split: each turn carries 0.9·corr + 0.1·fmt sub-reward.
-    parser.add_argument("--w_a1_correctness", type=float, default=0.27)
-    parser.add_argument("--w_a1_format", type=float, default=0.03)
-    parser.add_argument("--w_a2_correctness", type=float, default=0.27)
-    parser.add_argument("--w_a2_format", type=float, default=0.03)
-    parser.add_argument("--w_no_regression", type=float, default=0.40)
+    parser.add_argument("--w_a1_correctness", type=float, default=0.45)
+    parser.add_argument("--w_a1_format", type=float, default=0.05)
+    parser.add_argument("--w_a2_correctness", type=float, default=0.45)
+    parser.add_argument("--w_a2_format", type=float, default=0.05)
     # WR-bonus: additive Bernoulli reward when A1 wrong AND A2 right.
     # Default 0 keeps existing experiments unaffected. Set to 1.0 to
     # promote refinement without penalising RW (Option 5 from the
-    # reward-design menu — distinct from no_regression shaping which
-    # also penalises RW).
+    # reward-design menu).
     parser.add_argument("--w_wr_bonus", type=float, default=0.0)
 
     # Feedback reward weights (must sum to 1.0)
@@ -549,7 +547,6 @@ def main() -> None:
         w_a1_format=args.w_a1_format,
         w_a2_correctness=args.w_a2_correctness,
         w_a2_format=args.w_a2_format,
-        w_no_regression=args.w_no_regression,
         w_wr_bonus=args.w_wr_bonus,
     )
     feedback_weights = FeedbackRewardWeights(

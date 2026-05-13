@@ -5,22 +5,24 @@ self-reflection GRPO pipeline. All values are taken from
 `src/vlm_grpo/rewards/composition.py` and `src/vlm_grpo/trajectory.py`;
 walkthrough numbers are reproduced by `uv run python -c "from vlm_grpo..."`.
 
-> **Vestigial components.** `R_no_regression`, `R_wr_bonus`, and
-> `R_downstream` (with its asymmetric verification gate) are still
-> implemented in `composition.py` and exercised by their unit tests, but
-> both active runs (`pag-faithful`, `kl-fix-no-bonus`) set
-> `w_no_regression = w_wr_bonus = w_downstream = 0`. Their walkthroughs
+> **Vestigial components.** `R_wr_bonus` and `R_downstream` (with its
+> asymmetric verification gate) are still implemented in `composition.py`
+> and exercised by their unit tests, but both active runs (`pag-faithful`,
+> `kl-fix-no-bonus`) set `w_wr_bonus = w_downstream = 0`. Their walkthroughs
 > are preserved below for historical context — refer to the git log if you
-> need to reactivate one. The live components in active runs are
-> `R_a1_correctness`, `R_a1_format`, `R_a2_correctness`, `R_a2_format`,
-> `R_verification`, `R_fb_format`, plus PAG segment rewards.
+> need to reactivate one. `R_no_regression` was **deleted entirely**; the
+> PAG path now carries A1→A2 transition reward via
+> `pag_shaping_alpha · (r_a2_corr − r_a1_corr)` added to A2 only. The live
+> components in active runs are `R_a1_correctness`, `R_a1_format`,
+> `R_a2_correctness`, `R_a2_format`, `R_verification`, `R_fb_format`, plus
+> the PAG shaping bonus.
 
 There are four reward modes in the code:
 
 - **Multi-turn (raw)** — `compute_response_reward_breakdown` /
   `compute_feedback_reward_breakdown`. Components in their natural ranges
-  (a1/a2 corr ±1, no_regression up to ±3, downstream up to ±3 or ±2α).
-  Not exercised by any current active run.
+  (a1/a2 corr ±1, downstream up to ±3 or ±2α). Not exercised by any
+  current active run.
 - **Multi-turn (rescaled)** — `compute_response_reward_breakdown_01` /
   `compute_feedback_reward_breakdown_01`, enabled via
   `--use_rescaled_rewards`. Each component is mapped to [0, 1] before
@@ -128,27 +130,6 @@ r_a1 = 1.0 if a1_result.is_correct else -1.0
 Same logic as `a1_correctness` but applied to A2. For deterministic types
 (MCQ/yesno/numeric) it's binary `±1`. For counting/open it's continuous
 `2·score − 1` based on the verifier's similarity score.
-
-### `no_regression` (transition reward, vestigial)
-
-> Vestigial in active runs (`w_no_regression=0`). Kept here for context.
-
-```python
-# reward_shaping_alpha=0 (transition table):
-if answer_type in DETERMINISTIC_TYPES:
-    if a1_correct:     r_nor = +1 if a2_correct else -2  # RR=+1 RW=-2
-    else:              r_nor = +3 if a2_correct else  0  # WR=+3 WW=0
-else:  # open/counting
-    if a1_correct:     r_nor = +1 if a2_correct else -3
-    else:              r_nor = +2 if a2_correct else  0
-
-# reward_shaping_alpha > 0 (SCoRe-style shaped, used when α env > 0):
-r_nor = α · (r_a2 − r_a1)
-```
-
-Asymmetric: WR (correction) > RR (stability) > WW (no change) > RW (regression).
-Encourages the model to fix wrong A1s, not to rewrite correct ones. The PAG path
-uses a similar α-shaping bonus on A2 only — see [PAG segment rewards](#pag-segment-rewards-use_pag_segment_rewards).
 
 ### `a2_format` ∈ {0, +1}  (binary, structural + clean inner)
 
