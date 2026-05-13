@@ -233,7 +233,7 @@ spec:
         - name: VLLM_GPU_MEM
           value: "0.40"
         - name: GIT_BRANCH
-          value: "pag-faithful"
+          value: "grpo-kl-ref-fix"
 
         - name: THINK_ANSWER_INSTRUCTION
           value: |
