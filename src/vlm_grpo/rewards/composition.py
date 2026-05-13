@@ -732,6 +732,292 @@ def compute_feedback_reward_breakdown(
 
 
 # =============================================================================
+# PAG-faithful per-segment binary rewards (arXiv:2506.10406)
+# =============================================================================
+#
+# Matches the binary {0, 1} per-segment reward placement implemented in PAG's
+# released code (``verl/workers/reward_manager/pag.py``):
+#
+#   reward_tensor[i, last_A1_tok]  =  R_y(A1)                            ∈ {0,1}
+#   reward_tensor[i, last_F1_tok]  =  R_v(F1, A1)                        ∈ {0,1}
+#   reward_tensor[i, last_A2_tok]  =  R_y(A2) + α·(R_y(A2) − R_y(A1))    ∈ ℝ
+#
+# Our GRPO scaffold uses one scalar per turn (broadcast to that turn's tokens
+# by the trainer's per-segment loss aggregation) rather than a per-token reward
+# tensor; the two are equivalent under γ=1 within-turn / γ=0 between-turn (PAG's
+# ``multiturn_mask``). The composer below emits ``r_a1`` and ``r_a2`` as
+# separate fields on the response breakdown, and the trainer (with
+# ``use_pag_segment_rewards=True``) reads them via the existing
+# ``separate_turn_loss=True`` per-segment K-group advantage path.
+#
+# Format reward kept at 0.1 weight as a small structural anchor — PAG has none
+# (their verdict uses a trailing-sentence regex), but our extraction is
+# ``\boxed{}``-based and benefits from a binary {0,1} format component to
+# discourage missing-tag F1 outputs. With weights summing to 1.0, the per-turn
+# reward stays in [0, 1] (A1 / F1) or [-α, 1+α] (A2 after shaping).
+
+
+@dataclass
+class PAGSegmentRewardBreakdown:
+    """Per-segment PAG-style breakdown (arXiv:2506.10406).
+
+    Unlike the legacy ``TrajectoryResponseRewardBreakdown`` (one pooled scalar
+    over A1 + A2), this breakdown carries r_a1 and r_a2 separately so the
+    trainer can drive two independent K-group baselines.
+
+    Attributes:
+        r_a1: A1's per-segment reward, ``w_a1_corr·R_a1_corr_01 +
+            w_a1_fmt·R_a1_fmt_01``. ∈ [0, 1] for convex weights.
+        r_a2: A2's per-segment reward, ``w_a2_corr·R_a2_corr_01 +
+            w_a2_fmt·R_a2_fmt_01 + α·(R_a2_corr_01 − R_a1_corr_01)``. ∈ ℝ.
+            None when the trajectory was gated (selective revision stopped
+            at F1) — signals downstream code to exclude this trajectory from
+            the A2 K-group baseline and from the A2 policy loss.
+        r_a1_corr: Raw binary correctness ∈ {0, 1} (used for diagnostics +
+            for the A2 shaping baseline; do not weight here, the weighted
+            value is already in r_a1).
+        r_a2_corr: Raw binary correctness ∈ {0, 1}.
+        a1_format: Raw binary {0, 1} format compliance for A1.
+        a2_format: Raw binary {0, 1} format compliance for A2.
+        a1_correct / a2_correct: Boolean correctness flags.
+        a2_extracted: Strict atomic extraction from ``<answer>`` tag for A2.
+        a2_format_valid: Whether A2 passed the format check.
+        gated: Whether the selective-revision gate stopped this trajectory
+            at F1 (i.e. F1 said ``CORRECT``). When True, A2 is empty and
+            r_a2 is None.
+        shaping_alpha: α used in b_y. Stored for diagnostics.
+        total_reward: Sum of segment rewards (skip-A2 → r_a1 only). Used
+            only for logging — the trainer reads r_a1 / r_a2 directly.
+        components / weighted_components: Compatibility dicts so the existing
+            metric-logger code (which iterates breakdown.components) works
+            unchanged. ``components`` holds raw values; ``weighted_components``
+            holds the weighted values that get summed.
+    """
+
+    r_a1: float
+    r_a2: float | None
+    r_a1_corr: float
+    r_a2_corr: float
+    a1_format: float
+    a2_format: float
+    a1_correct: bool
+    a2_correct: bool
+    a2_extracted: str
+    a2_format_valid: bool
+    gated: bool
+    shaping_alpha: float
+    total_reward: float
+    components: dict[str, float]
+    weighted_components: dict[str, float]
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+def compute_pag_response_breakdown(
+    a1_text: str,
+    a2_text: str,
+    ground_truth: str,
+    answer_type: str,
+    choices: str,
+    weights: Any,
+    use_think_answer_tags: bool = False,
+    use_answer_tag_only: bool = False,
+    pag_shaping_alpha: float = 1.0,
+    gated: bool = False,
+) -> PAGSegmentRewardBreakdown:
+    """Compute the PAG-style per-segment response reward for one trajectory.
+
+    Mirrors PAG's ``pag.py`` reward placement: r_a1 lives on the A1 segment,
+    r_a2 lives on the A2 segment with the shaping bonus baked in. Binary
+    correctness {0, 1} (mirrors PAG's ``first_result["acc"]`` / ``policy_result["acc"]``).
+
+    **Shaping bonus formulation.** This composer uses RAW BINARY correctness
+    for the b_y term (``bonus = α·(R_a2_corr_01 − R_a1_corr_01)``), matching
+    PAG's released code at ``verl/workers/reward_manager/pag.py``:
+
+        reward_value += self.rs_coef * (policy_result["acc"] - prev_acc)
+
+    where ``policy_result["acc"]`` and ``prev_acc`` are the binary
+    accuracies, NOT the full weighted segment rewards. The PAG paper's
+    Eq. (5) is written more abstractly as ``α·(R(ŷ_2) − R(ŷ_1))``, but the
+    released implementation is unambiguous: the bonus is over correctness
+    accuracies only, so the format component does NOT enter b_y. When both
+    A1 and A2 format pass (the common case in tag mode), this differs from
+    a "full weighted reward" formulation by exactly the
+    ``w_a2_correctness`` factor — at α=1 and 0.9/0.1 weights, that's an
+    11% larger WR/RW shaping signal than the full-reward formulation.
+    Intentional: match the released code, not the paper's abstract form.
+
+    When ``gated=True`` (F1 verdict said CORRECT in the selective-revision
+    rollout), A2 was not generated; r_a2 is set to None and the trajectory
+    contributes nothing to the A2 K-group baseline downstream.
+
+    Args:
+        a1_text: Initial answer text.
+        a2_text: Refined answer text (empty string when gated).
+        ground_truth: Ground truth answer.
+        answer_type: Answer type ("mcq", "yesno", "numeric", "open",
+            "counting").
+        choices: MCQ choices string (kept for API parity with the legacy
+            composers).
+        weights: ``ResponseRewardWeights`` instance. ``w_a1_correctness`` and
+            ``w_a2_correctness`` should be 0.9 and the format weights 0.1
+            for PAG-faithful runs; the shaping bonus uses
+            ``pag_shaping_alpha`` and is NOT controlled by ``w_no_regression``.
+        use_think_answer_tags: Forwarded to the format/extraction helpers.
+        use_answer_tag_only: Forwarded to the format/extraction helpers.
+        pag_shaping_alpha: α coefficient on the b_y bonus.
+        gated: Whether the selective-revision gate stopped this trajectory
+            at F1 (i.e. F1 said CORRECT).
+
+    Returns:
+        ``PAGSegmentRewardBreakdown`` with r_a1 and r_a2 as separate scalars
+        (r_a2 = None when gated).
+    """
+    tag_mode = use_think_answer_tags or use_answer_tag_only
+
+    # A1: binary correctness + binary format.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=tag_mode)
+    a1_correct = a1_result.is_correct
+    r_a1_corr_01 = 1.0 if a1_correct else 0.0
+    r_a1_fmt_01 = _compute_refiner_format_reward(
+        a1_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+    )
+    # Format reward range collapses to {0, 1} in tag-mode (active path); the
+    # bare-mode {-1, 0} branch is mapped to {0, 1} for the PAG composer so the
+    # convex combination stays in [0, 1].
+    if r_a1_fmt_01 < 0.0:
+        r_a1_fmt_01 = 0.0
+
+    r_a1 = r_a1_corr_01 * weights.w_a1_correctness + r_a1_fmt_01 * weights.w_a1_format
+
+    # A2: only compute when the trajectory was NOT gated.
+    if gated:
+        r_a2_corr_01 = 0.0
+        r_a2_fmt_01 = 0.0
+        a2_correct = False
+        a2_extracted = ""
+        a2_format_valid = False
+        r_a2: float | None = None
+        bonus = 0.0
+    else:
+        a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=tag_mode)
+        a2_correct = a2_result.is_correct
+        r_a2_corr_01 = 1.0 if a2_correct else 0.0
+        r_a2_fmt_01 = _compute_refiner_format_reward(
+            a2_text, answer_type, ground_truth, use_think_answer_tags, use_answer_tag_only
+        )
+        if r_a2_fmt_01 < 0.0:
+            r_a2_fmt_01 = 0.0
+        a2_extracted = extract_answer_from_text(a2_text, answer_type, choices, strict=tag_mode)
+        # Match legacy composer's threshold: > 0 → valid. Binary {0, 1} reward
+        # makes the choice moot in practice, but `> 0` keeps the convention.
+        a2_format_valid = r_a2_fmt_01 > 0
+        bonus = pag_shaping_alpha * (r_a2_corr_01 - r_a1_corr_01)
+        r_a2 = r_a2_corr_01 * weights.w_a2_correctness + r_a2_fmt_01 * weights.w_a2_format + bonus
+
+    # ``gated`` lives on the dataclass as its own field (see
+    # PAGSegmentRewardBreakdown); we do NOT smuggle it into ``components`` /
+    # ``weighted_components`` to avoid polluting the wandb component metric
+    # loop in critic_grpo.py with a non-reward value.
+    components = {
+        "a1_correctness": r_a1_corr_01,
+        "a1_format": r_a1_fmt_01,
+        "a2_correctness": r_a2_corr_01,
+        "a2_format": r_a2_fmt_01,
+        "shaping_bonus": bonus,
+    }
+    weighted_components = {
+        "a1_correctness": r_a1_corr_01 * weights.w_a1_correctness,
+        "a1_format": r_a1_fmt_01 * weights.w_a1_format,
+        "a2_correctness": r_a2_corr_01 * weights.w_a2_correctness,
+        "a2_format": r_a2_fmt_01 * weights.w_a2_format,
+        "shaping_bonus": bonus,
+    }
+    total_reward = r_a1 + (0.0 if r_a2 is None else r_a2)
+
+    return PAGSegmentRewardBreakdown(
+        r_a1=r_a1,
+        r_a2=r_a2,
+        r_a1_corr=r_a1_corr_01,
+        r_a2_corr=r_a2_corr_01,
+        a1_format=r_a1_fmt_01,
+        a2_format=r_a2_fmt_01,
+        a1_correct=a1_correct,
+        a2_correct=a2_correct,
+        a2_extracted=a2_extracted,
+        a2_format_valid=a2_format_valid,
+        gated=gated,
+        shaping_alpha=pag_shaping_alpha,
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+    )
+
+
+def compute_pag_feedback_breakdown(
+    feedback_text: str,
+    a1_text: str,
+    ground_truth: str,
+    answer_type: str,
+    weights: Any,
+) -> TrajectoryFeedbackRewardBreakdown:
+    """Compute the PAG-style binary feedback reward for one trajectory.
+
+    Matches PAG's ``pag.py`` verifier placement: R_v(F1, A1) ∈ {0, 1} where
+    1 means F1's verdict matches A1's actual correctness. NO downstream
+    component (PAG's turn-independent γ=0 means F1 sees no downstream signal).
+
+    Args:
+        feedback_text: F1 output text (with ``<think>...</think>`` and
+            ``\\boxed{CORRECT|INCORRECT}``).
+        a1_text: Initial answer text (needed to evaluate verdict correctness).
+        ground_truth: Ground truth answer.
+        answer_type: Answer type.
+        weights: ``FeedbackRewardWeights`` instance. ``w_verification_accuracy``
+            should be 0.9 and ``w_format`` 0.1 for PAG-faithful runs.
+            ``w_downstream`` is ignored — PAG has no downstream term.
+
+    Returns:
+        ``TrajectoryFeedbackRewardBreakdown`` with the binary verification +
+        format components and ``downstream`` recorded as 0.0 for logging.
+    """
+    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    a1_correct = a1_result.is_correct
+
+    # Binary verification reward: 1 if F1's boxed verdict matches A1's truth.
+    r_verification_pm = compute_verification_accuracy_reward(feedback_text, a1_correct)
+    r_verification_01 = 1.0 if r_verification_pm > 0 else 0.0
+
+    # Binary format reward (already {0, 1}).
+    r_fb_format = compute_feedback_format_reward(feedback_text)
+
+    components = {
+        "downstream": 0.0,
+        "verification": r_verification_01,
+        "format": r_fb_format,
+    }
+    weighted_components = {
+        # Downstream is zeroed in PAG (turn-independent γ=0). Even if a YAML
+        # accidentally sets w_downstream > 0, the PAG path emits a 0
+        # contribution to keep the reward composition bit-for-bit faithful to
+        # the paper.
+        "downstream": 0.0,
+        "verification": r_verification_01 * weights.w_verification_accuracy,
+        "format": r_fb_format * weights.w_format,
+    }
+    total_reward = sum(weighted_components.values())
+
+    return TrajectoryFeedbackRewardBreakdown(
+        total_reward=total_reward,
+        components=components,
+        weighted_components=weighted_components,
+    )
+
+
+# =============================================================================
 # Per-component [0, 1] rescaled rewards (used when
 # RolloutConfig.use_rescaled_rewards=True)
 # =============================================================================

@@ -96,6 +96,22 @@ class RolloutConfig:
     # bit-for-bit unchanged. Set to True after validating with the
     # equivalence test in ``tests/test_vllm_token_passthrough.py``.
     use_vllm_native_loss: bool = False
+    # PAG-faithful arm (arXiv:2506.10406):
+    #   - ``use_pag_segment_rewards`` switches to the binary {0, 1} per-segment
+    #     reward composers in ``rewards/composition.py``. r_a1 and r_a2 are
+    #     emitted as separate scalars; A2 carries the shaping bonus
+    #     ``α·(R(A2)−R(A1))``. F1 reward = w_verification·R_verification_01 +
+    #     w_format·R_fb_format. The trainer then drives the existing
+    #     ``separate_turn_loss=True`` per-segment advantage path.
+    #   - ``use_selective_revision`` activates the F1-verdict gate in the
+    #     rollout: when F1's ``\boxed{}`` extraction is ``CORRECT``, A2 is
+    #     emitted as an empty completion and excluded from the A2 K-group
+    #     baseline. ``WRONG`` / missing verdict → A2 generated as today.
+    #   - ``pag_shaping_alpha`` is α in b_y(ŷ_2)=α·(R(A2)−R(A1)). PAG sets 1.0.
+    # All three are off by default — legacy paths are bit-for-bit unchanged.
+    use_pag_segment_rewards: bool = False
+    use_selective_revision: bool = False
+    pag_shaping_alpha: float = 1.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

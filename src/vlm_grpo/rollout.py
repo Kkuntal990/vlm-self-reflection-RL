@@ -44,9 +44,12 @@ from vlm_grpo.rewards.composition import (
     compute_baseline_a1_reward_breakdown,
     compute_feedback_reward_breakdown,
     compute_feedback_reward_breakdown_01,
+    compute_pag_feedback_breakdown,
+    compute_pag_response_breakdown,
     compute_response_reward_breakdown,
     compute_response_reward_breakdown_01,
 )
+from vlm_grpo.trajectory import extract_from_boxed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +136,14 @@ class SelfReflectionRolloutResult:
     answer1_logprobs: list[Optional[list[float]]] = field(default_factory=list)
     feedback_logprobs: list[Optional[list[float]]] = field(default_factory=list)
     answer2_logprobs: list[Optional[list[float]]] = field(default_factory=list)
+    # Selective revision gate (PAG, arXiv:2506.10406): per-trajectory flag set
+    # by the rollout when F1's `\boxed{}` verdict is CORRECT — A2 was skipped
+    # (empty completion) and the trajectory must be excluded from the A2
+    # K-group baseline and the A2 policy loss. Length-K list (one per trajectory)
+    # matching the *_token_ids / answer1s / answer2s ordering. Empty list = the
+    # rollout did not use the gate (legacy path), in which case the trainer
+    # treats every trajectory as ungated.
+    gated_skip_a2: list[bool] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -350,6 +361,10 @@ def generate_self_reflection_rollout(
     all_a1_lps: list[Optional[list[float]]] = []
     all_f1_lps: list[Optional[list[float]]] = []
     all_a2_lps: list[Optional[list[float]]] = []
+    # Per-trajectory selective-revision flag (PAG, arXiv:2506.10406 §3.1):
+    # True iff F1's `\boxed{}` verdict was CORRECT and A2 was skipped.
+    # Length == n*k after the rollout loop completes.
+    all_gated: list[bool] = []
 
     with torch.no_grad():
         # Process in generation chunks to bound peak VRAM usage.
@@ -448,29 +463,76 @@ def generate_self_reflection_rollout(
             all_f1_ids.extend(chunk_f1_ids)
             all_f1_lps.extend(chunk_f1_lps)
 
-            # Step 3: Generate A2 for each trajectory.
-            a2_prompts = [
-                build_refiner_prompt(
-                    chunk_qs[i],
-                    chunk_a1s[i * k + j],
-                    chunk_f1s[i * k + j],
-                    use_think_answer_tags=use_tags,
-                    use_answer_tag_only=use_answer_only,
+            # Selective revision gate (PAG, arXiv:2506.10406 §3.1):
+            # When F1's `\boxed{}` verdict is CORRECT, A2 is NOT generated —
+            # the trajectory terminates at F1. WRONG / missing / unparseable
+            # verdict → A2 is generated as today. The gate decision is purely
+            # on F1's emitted text, NOT on ground truth (the model has to
+            # learn when to revise from its own verdict).
+            use_gate = bool(getattr(config, "use_selective_revision", False))
+            chunk_gated = [False] * (chunk_size * k)
+            if use_gate:
+                for idx in range(chunk_size * k):
+                    verdict = extract_from_boxed(chunk_f1s[idx]).upper().strip()
+                    # Only ``CORRECT`` triggers the gate. ``WRONG``,
+                    # ``INCORRECT``, anything else, or missing — proceed to A2.
+                    # This matches PAG's regex on the trailing sentence:
+                    # "The answer is correct" terminates; everything else
+                    # (including the parse failure path) does not.
+                    if verdict == "CORRECT":
+                        chunk_gated[idx] = True
+            all_gated.extend(chunk_gated)
+
+            # Step 3: Generate A2 for each trajectory (skip gated samples).
+            a2_prompts_active: list[list[dict]] = []
+            a2_imgs_active: list[Any] = []
+            a2_active_indices: list[int] = []
+            for idx in range(chunk_size * k):
+                if chunk_gated[idx]:
+                    continue
+                i = idx // k
+                j = idx % k
+                a2_prompts_active.append(
+                    build_refiner_prompt(
+                        chunk_qs[i],
+                        chunk_a1s[idx],
+                        chunk_f1s[idx],
+                        use_think_answer_tags=use_tags,
+                        use_answer_tag_only=use_answer_only,
+                    )
                 )
-                for i in range(chunk_size)
-                for j in range(k)
-            ]
+                a2_imgs_active.append(imgs_expanded[idx])
+                a2_active_indices.append(idx)
             if adapter_callback is not None:
                 adapter_callback("a2")
-            a2_outs = _gen(
-                a2_prompts,
-                imgs_expanded,
-                config.a2_max_completion_length,
-                config.a2_temperature,
-            )
-            chunk_a2s = [o["text"] for o in a2_outs]
-            chunk_a2_ids = [o.get("token_ids") for o in a2_outs]
-            chunk_a2_lps = [o.get("logprobs") for o in a2_outs]
+            if a2_prompts_active:
+                a2_outs_active = _gen(
+                    a2_prompts_active,
+                    a2_imgs_active,
+                    config.a2_max_completion_length,
+                    config.a2_temperature,
+                )
+            else:
+                a2_outs_active = []
+            # Re-expand A2 outputs back to length chunk_size*k, with empty
+            # completions for gated samples. The trainer's downstream loss
+            # aggregation already handles empty completions cleanly (post
+            # commit 95f091b: 0-token completion → empty tensor → sum/max_len
+            # contributes 0 to the loss).
+            chunk_a2s = [""] * (chunk_size * k)
+            chunk_a2_ids: list[Optional[list[int]]] = [None] * (chunk_size * k)
+            chunk_a2_lps: list[Optional[list[float]]] = [None] * (chunk_size * k)
+            for slot, out in zip(a2_active_indices, a2_outs_active):
+                chunk_a2s[slot] = out["text"]
+                chunk_a2_ids[slot] = out.get("token_ids")
+                chunk_a2_lps[slot] = out.get("logprobs")
+            # For gated samples, emit explicit empty token_ids / logprobs so
+            # downstream pretokenize / native-loss paths don't fall into the
+            # "missing" None branch and trigger a retokenize fallback.
+            for slot, was_gated in enumerate(chunk_gated):
+                if was_gated:
+                    chunk_a2_ids[slot] = []
+                    chunk_a2_lps[slot] = []
             all_a2s.extend(chunk_a2s)
             all_a2_ids.extend(chunk_a2_ids)
             all_a2_lps.extend(chunk_a2_lps)
@@ -519,42 +581,80 @@ def generate_self_reflection_rollout(
         )
 
         use_rescaled = getattr(config, "use_rescaled_rewards", False)
-        resp_fn = (
-            compute_response_reward_breakdown_01
-            if use_rescaled
-            else compute_response_reward_breakdown
-        )
-        fb_fn = (
-            compute_feedback_reward_breakdown_01
-            if use_rescaled
-            else compute_feedback_reward_breakdown
-        )
-        for a1, f1, a2 in zip(answer1s, feedbacks, answer2s):
-            resp_bd = resp_fn(
-                a1_text=a1,
-                a2_text=a2,
-                ground_truth=ground_truths[i],
-                answer_type=answer_types[i],
-                choices=choices_list[i],
-                weights=response_weights,
-                use_think_answer_tags=config.use_think_answer_tags,
-                use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
-                reward_shaping_alpha=_get_response_alpha(config),
+        use_pag = bool(getattr(config, "use_pag_segment_rewards", False))
+        # ``all_gated`` is populated unconditionally during the rollout loop
+        # (all-False when --use_selective_revision is off), so this slice is
+        # always defined and matches the trajectory ordering exactly.
+        traj_gated = all_gated[traj_slice]
+        if use_pag:
+            # PAG-faithful arm: per-segment binary rewards. r_a1 and r_a2 are
+            # carried separately on the breakdown; the trainer's
+            # ``separate_turn_loss`` path consumes them via independent K-group
+            # baselines. ``response_rewards`` stores the *sum* (r_a1 + r_a2)
+            # purely for logging/metric symmetry with legacy runs — the loss
+            # path does NOT pool A1 and A2 advantages.
+            pag_alpha = float(getattr(config, "pag_shaping_alpha", 1.0))
+            for a1, f1, a2, gated in zip(answer1s, feedbacks, answer2s, traj_gated):
+                resp_bd = compute_pag_response_breakdown(
+                    a1_text=a1,
+                    a2_text=a2,
+                    ground_truth=ground_truths[i],
+                    answer_type=answer_types[i],
+                    choices=choices_list[i],
+                    weights=response_weights,
+                    use_think_answer_tags=config.use_think_answer_tags,
+                    use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
+                    pag_shaping_alpha=pag_alpha,
+                    gated=gated,
+                )
+                fb_bd = compute_pag_feedback_breakdown(
+                    feedback_text=f1,
+                    a1_text=a1,
+                    ground_truth=ground_truths[i],
+                    answer_type=answer_types[i],
+                    weights=feedback_weights,
+                )
+                result.response_rewards.append(resp_bd.total_reward)
+                result.feedback_rewards.append(fb_bd.total_reward)
+                result.response_breakdowns.append(resp_bd)
+                result.feedback_breakdowns.append(fb_bd)
+        else:
+            resp_fn = (
+                compute_response_reward_breakdown_01
+                if use_rescaled
+                else compute_response_reward_breakdown
             )
-            fb_bd = fb_fn(
-                feedback_text=f1,
-                a1_text=a1,
-                a2_text=a2,
-                ground_truth=ground_truths[i],
-                answer_type=answer_types[i],
-                choices=choices_list[i],
-                weights=feedback_weights,
-                reward_shaping_alpha=_get_feedback_alpha(config),
+            fb_fn = (
+                compute_feedback_reward_breakdown_01
+                if use_rescaled
+                else compute_feedback_reward_breakdown
             )
-            result.response_rewards.append(resp_bd.total_reward)
-            result.feedback_rewards.append(fb_bd.total_reward)
-            result.response_breakdowns.append(resp_bd)
-            result.feedback_breakdowns.append(fb_bd)
+            for a1, f1, a2 in zip(answer1s, feedbacks, answer2s):
+                resp_bd = resp_fn(
+                    a1_text=a1,
+                    a2_text=a2,
+                    ground_truth=ground_truths[i],
+                    answer_type=answer_types[i],
+                    choices=choices_list[i],
+                    weights=response_weights,
+                    use_think_answer_tags=config.use_think_answer_tags,
+                    use_answer_tag_only=getattr(config, "use_answer_tag_only", False),
+                    reward_shaping_alpha=_get_response_alpha(config),
+                )
+                fb_bd = fb_fn(
+                    feedback_text=f1,
+                    a1_text=a1,
+                    a2_text=a2,
+                    ground_truth=ground_truths[i],
+                    answer_type=answer_types[i],
+                    choices=choices_list[i],
+                    weights=feedback_weights,
+                    reward_shaping_alpha=_get_feedback_alpha(config),
+                )
+                result.response_rewards.append(resp_bd.total_reward)
+                result.feedback_rewards.append(fb_bd.total_reward)
+                result.response_breakdowns.append(resp_bd)
+                result.feedback_breakdowns.append(fb_bd)
 
         result.answer1s = list(answer1s)
         result.feedbacks = list(feedbacks)
@@ -565,6 +665,7 @@ def generate_self_reflection_rollout(
         result.answer1_logprobs = list(answer1_lps)
         result.feedback_logprobs = list(feedback_lps)
         result.answer2_logprobs = list(answer2_lps)
+        result.gated_skip_a2 = list(traj_gated)
         results.append(result)
 
     return results
@@ -825,6 +926,7 @@ def compute_self_reflection_metrics(
 
     total = 0
     a1_correct_count = 0
+    gated_count = 0
     rr_count = 0
     rw_count = 0
     wr_count = 0
@@ -846,16 +948,28 @@ def compute_self_reflection_metrics(
             if resp_bd.a1_correct:
                 a1_correct_count += 1
 
-            if resp_bd.a1_correct:
-                if resp_bd.a2_correct:
-                    rr_count += 1
-                else:
-                    rw_count += 1
+            # Selective revision (PAG, arXiv:2506.10406): when F1's verdict
+            # said CORRECT, A2 was never generated. ``a2_correct`` is forced
+            # to False by ``compute_pag_response_breakdown`` for these
+            # trajectories. Treating them as RW/WW transitions would inflate
+            # the regression rates, so route them to their own ``gated_rate``
+            # bucket and exclude from RR/WR/RW/WW. The aggregate
+            # ``a2_accuracy`` likewise counts only non-gated trajectories
+            # (gated A2 was never tested, so its accuracy is undefined).
+            is_gated = bool(getattr(resp_bd, "gated", False))
+            if is_gated:
+                gated_count += 1
             else:
-                if resp_bd.a2_correct:
-                    wr_count += 1
+                if resp_bd.a1_correct:
+                    if resp_bd.a2_correct:
+                        rr_count += 1
+                    else:
+                        rw_count += 1
                 else:
-                    ww_count += 1
+                    if resp_bd.a2_correct:
+                        wr_count += 1
+                    else:
+                        ww_count += 1
 
             # Binary format reward: 0 means tags missing, +1 means present.
             if resp_bd.components.get("a2_format", 1.0) == 0.0:
@@ -865,14 +979,20 @@ def compute_self_reflection_metrics(
 
     a2_correct_count = rr_count + wr_count
     n = max(total, 1)
+    # Denominator for transition rates: only non-gated trajectories actually
+    # underwent an A1 → A2 transition. When ``gated_count`` is 0 (legacy
+    # path / gate disabled) this collapses to ``n`` and the rates match the
+    # historical definitions exactly.
+    n_transitions = max(total - gated_count, 1)
     return {
         "sr/total_trajectories": float(total),
         "sr/a1_accuracy": a1_correct_count / n,
-        "sr/a2_accuracy": a2_correct_count / n,
-        "sr/rr_rate": rr_count / n,
-        "sr/rw_rate": rw_count / n,
-        "sr/wr_rate": wr_count / n,
-        "sr/ww_rate": ww_count / n,
+        "sr/a2_accuracy": a2_correct_count / max(total - gated_count, 1),
+        "sr/rr_rate": rr_count / n_transitions,
+        "sr/rw_rate": rw_count / n_transitions,
+        "sr/wr_rate": wr_count / n_transitions,
+        "sr/ww_rate": ww_count / n_transitions,
+        "sr/gated_rate": gated_count / n,
         "sr/response_reward_mean": resp_reward_sum / n,
         "sr/feedback_reward_mean": fb_reward_sum / n,
         "sr/a2_format_violation_rate": a2_fmt_violation_count / n,

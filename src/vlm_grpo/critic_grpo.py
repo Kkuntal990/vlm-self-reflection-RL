@@ -1034,8 +1034,64 @@ class SelfReflectionGRPOTrainer:
         loss_type = getattr(self.config, "loss_type", "grpo")
         separate_turns = getattr(self.config, "separate_turn_loss", False)
         use_gdpo = getattr(self.config, "use_gdpo_normalization", False)
+        use_pag = bool(getattr(self.config.rollout, "use_pag_segment_rewards", False))
 
-        if use_gdpo:
+        # PAG-faithful arm: per-segment binary rewards from
+        # ``PAGSegmentRewardBreakdown``. ``r_a1`` and ``r_a2`` are read
+        # directly (not from the weighted_components sum). Gated trajectories
+        # (F1 said CORRECT → A2 skipped) carry r_a2=None; they're excluded
+        # from the A2 K-group baseline and their A2 advantage is forced to 0.
+        # Always supersedes use_gdpo / separate_turn_loss when enabled.
+        if use_pag:
+            a1_rewards_list: list[float] = []
+            a2_rewards_list: list[float] = []
+            a2_active_mask_list: list[bool] = []
+            for result in rollout_results:
+                # Tolerate legacy (non-PAG) breakdowns landing here — the
+                # rollout path is supposed to emit PAGSegmentRewardBreakdown
+                # when use_pag_segment_rewards is on, but a stray dispatch
+                # would silently produce garbage advantages otherwise.
+                for rb in result.response_breakdowns:
+                    if not hasattr(rb, "r_a1"):
+                        raise TypeError(
+                            "use_pag_segment_rewards=True but the rollout "
+                            "produced a non-PAG response breakdown "
+                            f"({type(rb).__name__}); check that rollout.py "
+                            "routes to compute_pag_response_breakdown."
+                        )
+                    a1_rewards_list.append(float(rb.r_a1))
+                    if rb.r_a2 is None or rb.gated:
+                        # Gated: zero placeholder, masked out below.
+                        a2_rewards_list.append(0.0)
+                        a2_active_mask_list.append(False)
+                    else:
+                        a2_rewards_list.append(float(rb.r_a2))
+                        a2_active_mask_list.append(True)
+            a1_rewards_t = torch.tensor(a1_rewards_list, device=self.device)
+            a2_rewards_t = torch.tensor(a2_rewards_list, device=self.device)
+            a2_active_mask = torch.tensor(a2_active_mask_list, dtype=torch.bool, device=self.device)
+
+            # A1 K-group baseline: standard mean subtraction across the full
+            # K-group (every trajectory generates A1).
+            a1_advantages = self._compute_group_advantages(a1_rewards_t, k, loss_type=loss_type)
+            # A2 K-group baseline: mean only over the trajectories that
+            # actually generated A2 (i.e. those NOT gated by F1). Gated
+            # samples get advantage = 0 (no A2 loss contribution).
+            a2_advantages = self._compute_pag_a2_advantages(
+                a2_rewards_t, a2_active_mask, k, loss_type=loss_type
+            )
+            # F1's reward is already per-segment (binary verdict + format).
+            # Use the existing K-group baseline path — no skipping needed
+            # since F1 is generated unconditionally.
+            fb_advantages = self._compute_group_advantages(fb_rewards_t, k, loss_type=loss_type)
+            # Joint resp_advantages kept only for the abs/zero-adv logging
+            # block at the end of train_step. The actual policy loss path
+            # (separate_turns=True branch) reads a1_advantages and
+            # a2_advantages directly.
+            resp_advantages = self._compute_group_advantages(resp_rewards_t, k, loss_type=loss_type)
+            # Force the per-segment loss path on for the PAG arm.
+            separate_turns = True
+        elif use_gdpo:
             # GDPO (Liu 2026, arXiv:2601.05242, Eqs. 4-7): per-component
             # K-group normalize, weighted sum, then batch-renormalize.
             # We assemble the per-component matrix from the breakdowns and
@@ -1432,8 +1488,8 @@ class SelfReflectionGRPOTrainer:
                 "both, decide whether accumulation runs across inner epochs or "
                 "outer steps and gate the zero_grad/step calls accordingly."
             )
-        is_cycle_start = (self.global_step % grad_acc == 0)
-        is_cycle_end = ((self.global_step + 1) % grad_acc == 0)
+        is_cycle_start = self.global_step % grad_acc == 0
+        is_cycle_end = (self.global_step + 1) % grad_acc == 0
         loss_scale = 1.0 / grad_acc
 
         # Step 5: Inner optimization epochs -- use pre-tokenized data to skip
@@ -2614,6 +2670,90 @@ class SelfReflectionGRPOTrainer:
 
         return advantages
 
+    def _compute_pag_a2_advantages(
+        self,
+        rewards: Any,
+        active_mask: Any,
+        k: int,
+        loss_type: str = "grpo",
+    ) -> Any:
+        """Per-segment K-group baseline for the PAG A2 turn.
+
+        Mirrors ``_compute_group_advantages`` but the K-group mean/std are
+        computed ONLY over trajectories where ``active_mask=True`` (i.e. the
+        selective-revision gate did NOT stop the trajectory at F1). Gated
+        trajectories receive advantage = 0 — combined with their empty A2
+        completion this contributes zero to the A2 policy loss.
+
+        Args:
+            rewards: Tensor of all A2 rewards (shape [N*K]). Entries for
+                gated trajectories are placeholders (0.0) and are ignored
+                by the baseline computation.
+            active_mask: Boolean tensor of shape [N*K], True iff the
+                trajectory generated A2 (NOT gated).
+            k: K-group size.
+            loss_type: ``"grpo"`` for mean+std, ``"dr_grpo"`` for mean only.
+
+        Returns:
+            Tensor of advantages, shape [N*K]. Gated positions = 0.
+        """
+        import torch
+
+        n_total = len(rewards)
+        n_groups = n_total // k
+        advantages = torch.zeros_like(rewards)
+
+        for i in range(n_groups):
+            start = i * k
+            end = start + k
+            group = rewards[start:end]
+            mask = active_mask[start:end]
+            n_active = int(mask.sum().item())
+            if n_active == 0:
+                # Every trajectory in this group gated out at F1. No A2
+                # gradient signal — leave advantages at zero.
+                continue
+            active_vals = group[mask]
+            mean = active_vals.mean()
+            if loss_type == "dr_grpo":
+                # Subtract mean; gated positions stay at zero advantage
+                # (their placeholder reward 0.0 would otherwise produce a
+                # spurious negative advantage of -mean if we let it through).
+                adv = group - mean
+            else:
+                # Population std over active members. n_active=1 → std=0;
+                # mirror the legacy "std<=0 → advantage 0" behaviour.
+                std = active_vals.std(correction=0) if n_active > 1 else torch.zeros_like(mean)
+                if std.item() > 0:
+                    adv = (group - mean) / (std + 1e-8)
+                else:
+                    adv = torch.zeros_like(group)
+            # Force gated positions to 0 regardless of how the active-mean
+            # subtraction lands on their placeholder reward.
+            advantages[start:end] = torch.where(mask, adv, torch.zeros_like(adv))
+
+        # Handle ragged tail (n_total % k != 0). Same logic.
+        remaining = n_total - n_groups * k
+        if remaining > 0:
+            start = n_groups * k
+            group = rewards[start:]
+            mask = active_mask[start:]
+            n_active = int(mask.sum().item())
+            if n_active > 0:
+                active_vals = group[mask]
+                mean = active_vals.mean()
+                if loss_type == "dr_grpo":
+                    adv = group - mean
+                else:
+                    std = active_vals.std(correction=0) if n_active > 1 else torch.zeros_like(mean)
+                    if std.item() > 0:
+                        adv = (group - mean) / (std + 1e-8)
+                    else:
+                        adv = torch.zeros_like(group)
+                advantages[start:] = torch.where(mask, adv, torch.zeros_like(adv))
+
+        return advantages
+
     def _compute_gdpo_advantages(
         self,
         components: Any,  # tensor of shape [N*K, n_components]
@@ -2818,10 +2958,7 @@ class SelfReflectionGRPOTrainer:
         # ``mb_response_loss is None and mb_feedback_loss is None`` covers the
         # ``single_turn_a1`` baseline, which leaves the per-adapter
         # accumulators untouched and only fills ``mb_loss`` (with A1-only loss).
-        if (
-            not self._routing.enabled
-            or (mb_response_loss is None and mb_feedback_loss is None)
-        ):
+        if not self._routing.enabled or (mb_response_loss is None and mb_feedback_loss is None):
             if mb_loss is not None:
                 (mb_loss * loss_scale).backward()
             return

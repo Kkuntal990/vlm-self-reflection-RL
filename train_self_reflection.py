@@ -273,6 +273,46 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--use_pag_segment_rewards",
+        action="store_true",
+        help=(
+            "PAG-faithful arm (arXiv:2506.10406). Switches the reward composer "
+            "to per-segment binary {0,1} rewards: r_a1 = w_a1_corr·R_a1_corr_01 + "
+            "w_a1_fmt·R_a1_fmt; r_a2 = w_a2_corr·R_a2_corr_01 + w_a2_fmt·R_a2_fmt + "
+            "α·(R_a2_corr_01 − R_a1_corr_01). r_a1 and r_a2 drive INDEPENDENT "
+            "K-group baselines in the trainer (separate_turn_loss path is "
+            "forced on). Feedback head emits R_v ∈ {0,1} (verdict matches A1 "
+            "truth) + format only; the downstream component is zeroed to "
+            "match PAG's turn-independent γ=0 design. See also "
+            "--use_selective_revision and --pag_shaping_alpha."
+        ),
+    )
+    parser.add_argument(
+        "--use_selective_revision",
+        action="store_true",
+        help=(
+            "PAG-style selective revision gate (arXiv:2506.10406 §3.1). After "
+            "F1 generation, extract the `\\boxed{}` verdict. CORRECT → A2 is "
+            "NOT generated (trajectory terminates at F1, A2 completion is "
+            "empty, A2 is excluded from the A2 K-group baseline and "
+            "contributes 0 to the A2 policy loss). WRONG / missing / "
+            "unparseable → A2 is generated as usual. Independent of "
+            "--use_pag_segment_rewards (the gate can be tested in isolation)."
+        ),
+    )
+    parser.add_argument(
+        "--pag_shaping_alpha",
+        type=float,
+        default=1.0,
+        help=(
+            "α coefficient on b_y(ŷ_2) = α·(R_a2_corr_01 − R_a1_corr_01), the "
+            "PAG shaping bonus added ONLY to A2's per-segment reward (NOT to "
+            "A1, NOT to F1). PAG paper uses 1.0; their ablation found α=5 "
+            "and α=10 gave no further improvement. Only used when "
+            "--use_pag_segment_rewards is set."
+        ),
+    )
+    parser.add_argument(
         "--single_turn_a1",
         action="store_true",
         help=(
@@ -577,6 +617,9 @@ def main() -> None:
         single_turn_a1=args.single_turn_a1,
         use_rescaled_rewards=args.use_rescaled_rewards,
         use_vllm_native_loss=getattr(args, "use_vllm_native_loss", False),
+        use_pag_segment_rewards=getattr(args, "use_pag_segment_rewards", False),
+        use_selective_revision=getattr(args, "use_selective_revision", False),
+        pag_shaping_alpha=float(getattr(args, "pag_shaping_alpha", 1.0)),
     )
     config = SelfReflectionConfig(
         model_id=args.model_id,
