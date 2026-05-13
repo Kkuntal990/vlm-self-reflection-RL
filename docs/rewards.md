@@ -5,22 +5,40 @@ self-reflection GRPO pipeline. All values are taken from
 `src/vlm_grpo/rewards/composition.py` and `src/vlm_grpo/trajectory.py`;
 walkthrough numbers are reproduced by `uv run python -c "from vlm_grpo..."`.
 
-There are three reward modes in the code:
+> **Vestigial components.** `R_no_regression`, `R_wr_bonus`, and
+> `R_downstream` (with its asymmetric verification gate) are still
+> implemented in `composition.py` and exercised by their unit tests, but
+> both active runs (`pag-faithful`, `kl-fix-no-bonus`) set
+> `w_no_regression = w_wr_bonus = w_downstream = 0`. Their walkthroughs
+> are preserved below for historical context — refer to the git log if you
+> need to reactivate one. The live components in active runs are
+> `R_a1_correctness`, `R_a1_format`, `R_a2_correctness`, `R_a2_format`,
+> `R_verification`, `R_fb_format`, plus PAG segment rewards.
+
+There are four reward modes in the code:
 
 - **Multi-turn (raw)** — `compute_response_reward_breakdown` /
   `compute_feedback_reward_breakdown`. Components in their natural ranges
-  (a1/a2 corr ±1, no_regression up to ±3, downstream up to ±3 or ±2α). All
-  walkthrough tables below describe this mode.
+  (a1/a2 corr ±1, no_regression up to ±3, downstream up to ±3 or ±2α).
+  Not exercised by any current active run.
 - **Multi-turn (rescaled)** — `compute_response_reward_breakdown_01` /
   `compute_feedback_reward_breakdown_01`, enabled via
   `--use_rescaled_rewards`. Each component is mapped to [0, 1] before
-  weighting so per-unit-weight gradient magnitude is equalised. Used by all
-  recent `frozen-a1-mt-*` runs except `frozen-a1-mt-full-raw`. See
-  [Rescaled mode](#rescaled-mode-use_rescaled_rewards).
+  weighting so per-unit-weight gradient magnitude is equalised. Used by
+  the active `kl-fix-no-bonus` run.
+- **PAG segment rewards** — `compute_pag_response_breakdown` /
+  `compute_pag_feedback_breakdown`, enabled via
+  `--use_pag_segment_rewards`. Per-segment binary {0, 1} rewards with an
+  α shaping bonus on A2; the trainer reads `r_a1` and `r_a2` as separate
+  scalars rather than one pooled reward, and the selective-revision gate
+  (`--use_selective_revision`) sets `r_a2=None` for trajectories whose F1
+  emits `\boxed{CORRECT}`. Used by the active `pag-faithful` run. See
+  [PAG segment rewards](#pag-segment-rewards-use_pag_segment_rewards).
 - **Single-turn A1 baseline** — `compute_baseline_a1_reward_breakdown`,
   enabled via `--single_turn_a1`. F1 + A2 are skipped, reward is
   `0.9·R_a1_correct_01 + 0.1·R_a1_format_01` ∈ [0, 1]. Used by
-  `job-qwen-grpo-livr-v2-9k-baseline-a1.yaml`.
+  `job-qwen-grpo-livr-v2-9k-baseline-a1.yaml` (the run that produced the
+  baseline-A1 ckpt-1000 init both active runs use).
 
 ## Two-trajectory design
 
@@ -55,32 +73,22 @@ r_response = w_a1_corr · r_a1_correctness
            + w_a1_fmt  · r_a1_format
            + w_a2_corr · r_a2_correctness
            + w_a2_fmt  · r_a2_format
-           + w_nor     · r_no_regression
+           + w_nor     · r_no_regression        # vestigial — see top-of-doc note
+           + w_wr      · r_wr_bonus             # vestigial — see top-of-doc note
 ```
 
-**Code defaults** (`ResponseRewardWeights`): per-turn sub-reward split is
-0.9·corr + 0.1·fmt for both A1 and A2, turn weight 0.3 each, no_regression 0.4:
+**Active YAML weights** (legacy multi-turn path used by `kl-fix-no-bonus`
+in rescaled mode; PAG path is documented separately below):
 
-| weight | code default |
+| weight | `kl-fix-no-bonus` |
 |---|---:|
-| `w_a1_correctness` | 0.27 |
-| `w_a1_format` | 0.03 |
-| `w_a2_correctness` | 0.27 |
-| `w_a2_format` | 0.03 |
-| `w_no_regression` | 0.40 |
+| `w_a1_correctness` | 0.00 |
+| `w_a1_format` | 0.05 |
+| `w_a2_correctness` | 0.90 |
+| `w_a2_format` | 0.05 |
+| `w_no_regression` | 0.00 |
+| `w_wr_bonus` | 0.00 |
 | **sum** | **1.00** |
-
-**Active YAML overrides** (all `frozen-a1-mt-*` runs freeze A1 → zero
-A1 weights and shift mass to A2 + no_regression):
-
-| weight | full (`mt`, `r01`, `full`, `full-raw`) | simplified (`full-simple`, `gdpo`, `gdpo-warmup`, `vanilla-warmup`, `vanilla-tokid`) |
-|---|---:|---:|
-| `w_a1_correctness` | 0.00 | 0.00 |
-| `w_a1_format` | 0.00 | 0.00 |
-| `w_a2_correctness` | 0.45 | 0.45 |
-| `w_a2_format` | 0.05 | 0.05 |
-| `w_no_regression` | 0.50 | 0.00 |
-| **sum** | **1.00** | **0.50** (intentional — `_validate_weight_sum` warning fires) |
 
 ### Turn decoupling: `separate_turn_loss=True` (SCoRe convention)
 
@@ -121,7 +129,9 @@ Same logic as `a1_correctness` but applied to A2. For deterministic types
 (MCQ/yesno/numeric) it's binary `±1`. For counting/open it's continuous
 `2·score − 1` based on the verifier's similarity score.
 
-### `no_regression` (transition reward)
+### `no_regression` (transition reward, vestigial)
+
+> Vestigial in active runs (`w_no_regression=0`). Kept here for context.
 
 ```python
 # reward_shaping_alpha=0 (transition table):
@@ -137,7 +147,8 @@ r_nor = α · (r_a2 − r_a1)
 ```
 
 Asymmetric: WR (correction) > RR (stability) > WW (no change) > RW (regression).
-Encourages the model to fix wrong A1s, not to rewrite correct ones.
+Encourages the model to fix wrong A1s, not to rewrite correct ones. The PAG path
+uses a similar α-shaping bonus on A2 only — see [PAG segment rewards](#pag-segment-rewards-use_pag_segment_rewards).
 
 ### `a2_format` ∈ {0, +1}  (binary, structural + clean inner)
 
@@ -176,20 +187,19 @@ format just rewards compliance.
 ## Feedback reward components
 
 ```
-r_feedback = w_ds · r_downstream_gated
+r_feedback = w_ds  · r_downstream_gated        # vestigial — see top-of-doc note
            + w_ver · r_verification
            + w_fmt · r_format
 ```
 
-**Code defaults** (`FeedbackRewardWeights`): `w_ds=0.45, w_ver=0.45,
-w_fmt=0.1` (sum = 1.0). Active YAML overrides:
+**Active YAML weights**:
 
-| weight | full | simplified |
+| weight | `pag-faithful` | `kl-fix-no-bonus` |
 |---|---:|---:|
-| `w_downstream` | 0.45 | 0.00 |
-| `w_verification_accuracy` | 0.45 | 0.45 |
-| `w_fb_format` | 0.10 | 0.05 |
-| **sum** | **1.00** | **0.50** (warning fires; intentional) |
+| `w_downstream` | 0.00 (ignored on PAG path) | 0.00 |
+| `w_verification_accuracy` | 0.90 | 0.90 |
+| `w_fb_format` | 0.10 | 0.10 |
+| **sum** | **1.00** | **1.00** |
 
 ### `verification` ∈ {−1, +1}
 
@@ -214,10 +224,14 @@ Verdict is extracted **only** from `\boxed{...}`. No keyword fallback on
 | `Plain INCORRECT prose` | any | **−1** (no `\boxed{}`) |
 | `\boxed{INCORRECT}` (no `<think>`) | A1 wrong | **+1** (verdict still extractable) |
 
-### `downstream` (asymmetric gate by verification)
+### `downstream` (asymmetric gate by verification, vestigial)
+
+> Vestigial in active runs (`w_downstream=0`; PAG path zeroes it
+> unconditionally). Kept here for context — the asymmetric gate logic is
+> still in `compute_feedback_reward_breakdown` if it gets re-enabled.
 
 ```python
-# Shaped reward (active runs use α=1; α=5 was the v10 setting):
+# Shaped reward (α=1 was the active value historically; α=5 was the v10 setting):
 r_a1 = 1.0 if a1_correct else -1.0
 r_a2 = 1.0 if a2_correct else -1.0
 r_downstream = r_a2 + α · (r_a2 − r_a1)
@@ -231,8 +245,8 @@ else:
     r_downstream_gated = min(r_downstream, 0.0)
 ```
 
-α=1 is the active value across all `frozen-a1-mt-*` runs (SCoRe paper
-default). α=5 is shown in some older walkthroughs and produces a wider
+α=1 was the active value across the `frozen-a1-mt-*` runs (SCoRe paper
+default). α=5 appears in some older walkthroughs and produces a wider
 ±(1+2α)=±11 envelope; α=1 produces ±3.
 
 Two properties the asymmetric gate enforces:
@@ -281,12 +295,16 @@ def compute_feedback_format_reward(feedback_text):
 
 ## Reward landscape — totals across scenarios
 
-Computed with **active full-mode YAML weights** (`w_a1_corr=0, w_a1_fmt=0,
-w_a2_corr=0.45, w_a2_fmt=0.05, w_no_reg=0.50` for response;
-`w_ds=0.45, w_ver=0.45, w_fmt=0.1` for feedback), deterministic MCQ,
-`α_response=1`, `α_feedback=1`, raw (un-rescaled) breakdown. With α=1, the
-shaped no_regression and downstream values are tighter than the α=0 transition
-table (no_regression ∈ {−2, 0, +2}; downstream ∈ {−3, −1, +1, +3}).
+> **Historical** — tables below use the legacy full-mode YAML weights
+> (`w_no_reg=0.50, w_downstream=0.45`) that no active run uses. Kept as a
+> reference for the shape of the asymmetric quadrant table.
+
+Computed with `w_a1_corr=0, w_a1_fmt=0, w_a2_corr=0.45, w_a2_fmt=0.05,
+w_no_reg=0.50` for response; `w_ds=0.45, w_ver=0.45, w_fmt=0.1` for
+feedback, deterministic MCQ, `α_response=1`, `α_feedback=1`, raw
+(un-rescaled) breakdown. With α=1, the shaped no_regression and
+downstream values are tighter than the α=0 transition table
+(no_regression ∈ {−2, 0, +2}; downstream ∈ {−3, −1, +1, +3}).
 
 ### Response reward (A1 frozen → a1 weights = 0, α=1)
 
@@ -344,7 +362,64 @@ The asymmetric downstream gate becomes `min(value, midpoint)` where
 total reward lives in `[0, 1]` and the per-unit-weight gradient magnitude
 is comparable across components.
 
-## End-to-end walkthrough (raw mode, full-weight YAML, α=1)
+## PAG segment rewards (`--use_pag_segment_rewards`)
+
+Used by the active `pag-faithful` run. Returns a `PAGSegmentRewardBreakdown`
+from `compute_pag_response_breakdown` with `r_a1` and `r_a2` as **separate**
+scalars (not pooled into one response reward). The trainer drives two
+independent K-group baselines — A1 baseline over all K samples, A2 baseline
+over the non-gated subset only.
+
+```python
+# composition.py — compute_pag_response_breakdown
+r_a1_corr_01 = 1.0 if a1_correct else 0.0          # binary {0, 1}
+r_a1_fmt_01  = _compute_tag_format_reward(a1_text, ...)
+r_a1 = w_a1_corr · r_a1_corr_01 + w_a1_fmt · r_a1_fmt_01
+
+if gated:
+    r_a2 = None                                     # selective revision: no A2 generated
+else:
+    r_a2_corr_01 = 1.0 if a2_correct else 0.0
+    r_a2_fmt_01  = _compute_tag_format_reward(a2_text, ...)
+    bonus = pag_shaping_alpha · (r_a2_corr_01 − r_a1_corr_01)
+    r_a2 = w_a2_corr · r_a2_corr_01 + w_a2_fmt · r_a2_fmt_01 + bonus
+```
+
+The shaping bonus uses **raw binary accuracies** (not full weighted
+rewards), matching the released PAG implementation
+(`verl/workers/reward_manager/pag.py`):
+
+```python
+# PAG paper / released code:
+reward_value += self.rs_coef * (policy_result["acc"] - prev_acc)
+```
+
+At α=1.0 (paper default `rs_coef=1`) and 0.9/0.1 weights, `r_a2` lands in
+`[−1.0, +2.0]` (WR transition with format pass: `0.9 + 0.1 + 1·(1−0) = +2.0`;
+RW with format fail: `0 + 0 + 1·(0−1) = −1.0`). `r_a1` stays in `[0, 1]`
+since no shaping bonus is added.
+
+### Selective revision gate (`--use_selective_revision`)
+
+When F1 emits `\boxed{CORRECT}`, the rollout engine skips A2 entirely. The
+breakdown sets `gated=True`, `r_a2=None`, `a2_extracted=""`. Downstream:
+
+- The trainer's PAG branch **excludes** gated trajectories from the A2
+  K-group baseline (only the non-gated subset participates).
+- Gated trajectories receive A2 advantage = 0; their empty A2 completion
+  contributes 0 to the A2 policy loss via `sum/max_len`.
+- `reward/a2_mean` denominates over the non-gated subset only (Bug #3
+  fix in commit `c825376`). Naive `.mean()` over `N*K` previously
+  depressed the metric as the gate rate climbed.
+
+### PAG feedback
+
+`compute_pag_feedback_breakdown` is binary {0, 1} verification + format,
+no downstream. Matches PAG's turn-independent γ=0 setting: F1 sees no
+downstream signal. `w_downstream` is silently ignored on this path — even
+if a YAML sets it > 0, the breakdown emits 0.
+
+## End-to-end walkthrough (raw mode, legacy full-weight YAML, α=1)
 
 **Setup:** LIVR ArtStyle MCQ, GT=`(A)`, A1 wrong on first try, F1 honestly
 identifies error, A2 corrects. A1 is frozen so `w_a1_corr=w_a1_fmt=0`.
@@ -437,7 +512,6 @@ bd = compute_response_reward_breakdown(
     a1_text='<think>r</think><answer>(B)</answer>',
     a2_text='<think>r</think><answer>(A)</answer>',
     ground_truth='(A)', answer_type='mcq', choices='', weights=rw,
-    use_think_answer_tags=True,
     reward_shaping_alpha=1.0,
 )
 print('WR response:', bd.total_reward, bd.components)

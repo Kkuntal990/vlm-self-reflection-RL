@@ -95,7 +95,7 @@ across the training log.
 | A1/A2 climb monotonically, WR−RW trends positive | Healthy learning. |
 | A1/A2 climb then collapse back to baseline | **Training instability.** Often α too high (±4 spikes), or KL not anchoring. |
 | Flat throughout | No learning. Go to §1/§2. |
-| A2 systematically below A1 | Refiner hurting; check no_regression shape and feedback gate. |
+| A2 systematically below A1 | Refiner hurting; under PAG selective revision check `sr/sycophantic_gate_rate` — if F1 gates wrong A1s as CORRECT, A2 never gets a chance to recover. Also check `pag_shaping_alpha` and that the temperature-divisor fix (§5) is in place. |
 
 ## 5. vLLM weight sync
 
@@ -107,8 +107,12 @@ use stale weights and the policy effectively never changes.
 lazily.
 
 **Also**: capture vLLM's returned logprobs at sample time, compare with
-HF-path `old_lps` on the same tokens. Drift > 0.01 per token indicates
-kernel/precision mismatch that can blow up PPO ratios at iter 0.
+HF-path `new_lps` on the same tokens. Drift > 0.01 per token indicates
+kernel/precision mismatch — or, more commonly, a temperature mismatch
+between vLLM sampling and HF `log_softmax`. Run
+`scripts/verify/verify_temperature_consistency.py` to confirm the divisor
+is applied (Bug #1 fix); pre-fix, A2 PPO ratio drifts ~6.86× off 1.0 at
+step 0.
 
 ---
 
@@ -118,12 +122,14 @@ kernel/precision mismatch that can blow up PPO ratios at iter 0.
 |---|---|---|---|
 | **Dead LoRA** | LoRA-B norm = 0 | optimizer not stepping LoRA params | Check param-group construction, DDP sync |
 | **Toy updates** | Effective delta max abs < 1e-4 | LR too low for signal scale | Raise LR 5-10× |
-| **Signal starvation** | frac_zero_std > 0.5 | K too small or reward too discrete | Enable SSR, raise K, raise temperature |
-| **Shaped-reward spike domination** | RW/WR advantages dominate group, collapse after peak | α too high on binary rewards | α=1 (SCoRe paper default) |
+| **Signal starvation** | frac_zero_std > 0.5 | K too small or reward too discrete | Raise K, raise temperature; (DAPO `--use_dynamic_sampling` was the old SSR knob — now off in both active runs) |
+| **Shaped-reward spike domination** | RW/WR advantages dominate group, collapse after peak | α too high on binary rewards | α=1 (SCoRe paper / PAG default) |
 | **Length bias** | Short answers get more gradient than long reasoning | Per-sample loss mean | Use Dr.GRPO `sum / max_comp_len` |
-| **KL pinning** | kl_loss ≈ policy_loss in magnitude | KL coefficient too strong | Lower kl_coeff, or remove A1 KL anchor post-freeze |
+| **KL pinning** | kl_loss ≈ policy_loss in magnitude | KL coefficient too strong | Lower per-turn `*_kl_coeff` — uniform 220 across A1/A2/F1 is the current default; the legacy 2500× A1 anchor was tuned for anchor-only frozen-A1 mode and over-suppresses an actively-trained A1 |
 | **Dataset noise** | Best run plateaus well below 80% | GT labels wrong or ambiguous | Run per-task VLM oracle audit, drop low-trust tasks |
-| **vLLM drift** | Non-zero clip_frac at inner epoch 0 | vLLM rollout logprobs ≠ HF path | Add IS correction using vLLM logprobs |
+| **vLLM/HF logprob drift at iter 0** | Non-zero clip_frac at inner epoch 0; ratio ≠ 1 on synthetic step-0 batch | vLLM samples at T<1, HF `new_lp` was computed at T=1 — distributions mismatch | **Fixed** in commit `c825376`: HF forward divides `shift_logits` by per-turn `sampling_temperature` before `log_softmax`. Use `scripts/verify/verify_temperature_consistency.py` to confirm. |
+| **`reward/a2_mean` flat as gate rate climbs** | Headline metric drops even while conditional A2 quality improves | Naive `.mean()` over all N·K averages in `0.0` placeholders for gated trajectories | **Fixed** in commit `c825376`: denominate over `a2_active_mask` (PAG); cross-rank reduce sums and counts separately. Check `sr/r_a2_mean` (always correct) against `reward/a2_mean`; they should now agree. |
+| **F1 sycophancy collapse** | `sr/sycophantic_gate_rate` climbs while `sr/verification_accuracy` stalls or drops | Under selective revision + `w_downstream=0`, F1 pays no cost for emitting `\boxed{CORRECT}` indiscriminately | Architectural — reintroduce a calibration signal (e.g. `w_downstream>0`, or a verdict-mismatch penalty on F1). Tracked under the "literature pivots" section of `CLAUDE.md`. |
 
 ---
 
@@ -132,10 +138,14 @@ kernel/precision mismatch that can blow up PPO ratios at iter 0.
 Drop these at every step:
 
 - `reward/resp_mean`, `reward/fb_mean` — aggregate
-- `reward/a1_mean`, `reward/a2_mean` — per-turn (needs `separate_turn_loss=True`)
-- `sr/rw_rate`, `sr/wr_rate` — self-correction rates (target: WR > RW)
+- `reward/a1_mean`, `reward/a2_mean` — per-turn (needs `separate_turn_loss=True`; under PAG, `a2_mean` is denominated over non-gated trajectories only)
+- `sr/r_a1_mean`, `sr/r_a2_mean`, `sr/r_f1_mean` — PAG segment rewards
+- `sr/effective_accuracy` — A1 for gated rows, A2 for non-gated (the inference-time final answer)
+- `sr/gated_rate`, `sr/productive_gate_rate`, `sr/sycophantic_gate_rate` — gate quality
+- `sr/rw_rate`, `sr/wr_rate` — self-correction rates among non-gated (target: WR > RW)
+- `sr/f1_correct_verdict_precision`, `sr/f1_wrong_verdict_precision` — F1 calibration
 - `grpo/frac_reward_zero_std`, `grpo/frac_fb_zero_std` — keep < 0.3
-- `grpo/resp_adv_abs_mean`, `grpo/fb_adv_abs_mean` — advantage magnitude
+- `grpo/resp_adv_abs_mean`, `grpo/fb_adv_abs_mean` — advantage **magnitude** (mean of `|adv|`), NOT signed mean. Healthy K-group baselining produces `|adv|` around `E|Z|` for a binary-reward distribution (~0.5–0.9); the centered signed mean is ~0 by construction.
 - `grpo/clip_frac` — fraction of tokens hitting PPO clip (keep < 0.2)
 - `grpo/grad_norm` — per-step gradient norm (should be non-zero and stable)
 - `grpo/entropy` — policy entropy (watch for collapse to 0)
@@ -175,3 +185,5 @@ python scripts/ops/lora_delta.py <out>/checkpoint-<N>/adapter_model.safetensors 
 - **If a1 and a2 track identically, the refiner isn't refining — look at feedback reward structure.**
 - **If WR-RW is persistently negative, feedback is actively harmful — check the verdict/gate logic.**
 - **Don't trust mean reward curves alone; they sum over heterogeneous outcomes. Per-window accuracy is more informative.**
+- **`resp_adv` in the inner-epoch log is `mean(|adv|)`, not `mean(adv)`. A value of 0.7 is centered K-group baselining producing healthy magnitudes, not "uncentered advantages." Look at the variable name carefully.**
+- **Under PAG, `reward/a2_mean` and `sr/r_a2_mean` are now both denominated over non-gated trajectories and should agree. If they don't, the metric path is broken.**
