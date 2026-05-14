@@ -2819,7 +2819,7 @@ class SelfReflectionGRPOTrainer:
                 advantages[start:end] = group - mean
             else:
                 std = group.std()
-                if std > 0:
+                if std > 1e-8:
                     advantages[start:end] = (group - mean) / (std + 1e-8)
                 else:
                     advantages[start:end] = 0.0
@@ -2834,7 +2834,7 @@ class SelfReflectionGRPOTrainer:
                 advantages[start:] = group - mean
             else:
                 std = group.std()
-                if std > 0:
+                if std > 1e-8:
                     advantages[start:] = (group - mean) / (std + 1e-8)
 
         return advantages
@@ -2890,10 +2890,12 @@ class SelfReflectionGRPOTrainer:
                 # spurious negative advantage of -mean if we let it through).
                 adv = group - mean
             else:
-                # Population std over active members. n_active=1 → std=0;
-                # mirror the legacy "std<=0 → advantage 0" behaviour.
-                std = active_vals.std(correction=0) if n_active > 1 else torch.zeros_like(mean)
-                if std.item() > 0:
+                # Bessel sample std (ddof=1) over active members — matches
+                # TRL GRPOTrainer, PAG verl reference, and the A1 baseline
+                # in _compute_group_advantages. n_active=1 → std=0; mirrors
+                # the legacy "std<=0 → advantage 0" behaviour.
+                std = active_vals.std() if n_active > 1 else torch.zeros_like(mean)
+                if std > 1e-8:
                     adv = (group - mean) / (std + 1e-8)
                 else:
                     adv = torch.zeros_like(group)

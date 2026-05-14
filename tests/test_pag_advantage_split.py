@@ -92,9 +92,10 @@ def test_pag_a2_advantage_single_active_yields_zero():
 
 
 def test_pag_a2_advantage_grpo_with_std_division():
-    """Standard GRPO mode (mean + std). With 3 active samples of
-    {0, 1, 2}: mean=1, std=sqrt(2/3). Advantages: -1/std, 0, +1/std.
-    Gated entry stays at zero.
+    """Standard GRPO mode (mean + Bessel sample std, ddof=1). With 3 active
+    samples of {0, 1, 2}: mean=1, std=sqrt(1)=1.0. Advantages: -1, 0, +1.
+    Gated entry stays at zero. Uses default `.std()` (ddof=1) to match TRL
+    GRPOTrainer + PAG verl reference.
     """
     trainer = _make_trainer()
     rewards = torch.tensor([0.0, 1.0, 2.0, 0.0])
@@ -104,7 +105,7 @@ def test_pag_a2_advantage_grpo_with_std_division():
 
     active_vals = rewards[active]
     mean = active_vals.mean()
-    std = active_vals.std(correction=0)
+    std = active_vals.std()  # ddof=1 (Bessel sample std)
     expected_0 = (rewards[0] - mean) / (std + 1e-8)
     expected_1 = (rewards[1] - mean) / (std + 1e-8)
     expected_2 = (rewards[2] - mean) / (std + 1e-8)
