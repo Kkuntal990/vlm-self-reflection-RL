@@ -934,6 +934,14 @@ def compute_self_reflection_metrics(
     sycophantic_gate_count = 0
     honest_wrong_count = 0
     spurious_wrong_count = 0  # not gated AND A1 was actually correct (F1 wrongly demanded revision)
+    # Diagnostic: how often does the LIBERAL (no-tag) A1-correctness
+    # extractor disagree with the STRICT (tag-required) judgement used
+    # by the reward? High disagreement = the policy frequently emits
+    # right-letter prose without ``<answer>`` tags. ``denom`` skips
+    # breakdowns whose feedback path didn't record the liberal flag
+    # (e.g. single-turn-A1 stubs).
+    strict_liberal_a1_disagree_count = 0
+    strict_liberal_a1_compared_count = 0
 
     for r in results:
         for resp_bd, fb_bd in zip(r.response_breakdowns, r.feedback_breakdowns):
@@ -977,6 +985,19 @@ def compute_self_reflection_metrics(
                 a2_fmt_violation_count += 1
             if fb_bd.components.get("format", 1.0) == 0.0:
                 fb_fmt_violation_count += 1
+
+            # Strict-vs-liberal A1 truth divergence (diagnostic).
+            # ``resp_bd.a1_correct`` is the strict judgement used by the
+            # reward; ``fb_bd.liberal_a1_correct`` is the same A1 text
+            # judged without requiring the ``<answer>`` tag. The two
+            # disagree whenever A1 emitted right-letter prose but no
+            # tag (strict wrong, liberal right) or rare punctuation
+            # edge cases (strict right, liberal wrong).
+            liberal_a1 = getattr(fb_bd, "liberal_a1_correct", None)
+            if liberal_a1 is not None:
+                strict_liberal_a1_compared_count += 1
+                if bool(resp_bd.a1_correct) != bool(liberal_a1):
+                    strict_liberal_a1_disagree_count += 1
 
             # Per-segment PAG accumulators. ``r_a1``, ``r_a2`` exist only
             # on ``PAGSegmentRewardBreakdown``; legacy breakdowns skip
@@ -1022,6 +1043,15 @@ def compute_self_reflection_metrics(
         if gated_count > 0
         else a2_fmt_violation_count / n,
         "sr/fb_format_violation_rate": fb_fmt_violation_count / n,
+        # Strict-vs-liberal A1 truth disagreement rate. Denominator skips
+        # trajectories whose feedback breakdown didn't carry the liberal
+        # flag (single-turn-A1 baseline stubs). NaN when nothing was
+        # compared so wandb plots an obvious gap rather than a misleading 0.
+        "sr/strict_liberal_a1_disagree_rate": (
+            strict_liberal_a1_disagree_count / strict_liberal_a1_compared_count
+            if strict_liberal_a1_compared_count > 0
+            else float("nan")
+        ),
     }
 
     if is_pag_path:

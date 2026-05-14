@@ -131,7 +131,7 @@ class TestFeedbackBreakdown:
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>The red dot is on the spout, not the handle.</think> \\boxed{INCORRECT}",
             a1_text="ZZZ_WRONG",
-            a2_text="A",
+            a2_text="<answer>(A)</answer>",
             ground_truth="A",
             answer_type="mcq",
             choices="(A) (B) (C) (D)",
@@ -152,8 +152,8 @@ class TestFeedbackBreakdown:
         """F1 says <think>...</think>\\boxed{CORRECT} (honest on RR)."""
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>Image supports (A).</think> \\boxed{CORRECT}",
-            a1_text="A",
-            a2_text="A",
+            a1_text="<answer>(A)</answer>",
+            a2_text="<answer>(A)</answer>",
             ground_truth="A",
             answer_type="mcq",
             choices="(A) (B) (C) (D)",
@@ -174,7 +174,7 @@ class TestFeedbackBreakdown:
         bd = compute_feedback_reward_breakdown(
             feedback_text="INCORRECT. Should be (A).",
             a1_text="ZZZ_WRONG",
-            a2_text="A",
+            a2_text="<answer>(A)</answer>",
             ground_truth="A",
             answer_type="mcq",
             choices="(A) (B) (C) (D)",
@@ -192,7 +192,7 @@ class TestFeedbackBreakdown:
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>reasoning</think> INCORRECT",
             a1_text="ZZZ_WRONG",
-            a2_text="A",
+            a2_text="<answer>(A)</answer>",
             ground_truth="A",
             answer_type="mcq",
             choices="(A) (B) (C) (D)",
@@ -209,7 +209,7 @@ class TestFeedbackBreakdown:
         bd = compute_feedback_reward_breakdown(
             feedback_text="\\boxed{INCORRECT}",
             a1_text="ZZZ_WRONG",
-            a2_text="A",
+            a2_text="<answer>(A)</answer>",
             ground_truth="A",
             answer_type="mcq",
             choices="(A) (B) (C) (D)",
@@ -256,7 +256,7 @@ class TestFeedbackBreakdown:
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>(B) looks right.</think> \\boxed{CORRECT}",
             a1_text="ZZZ_WRONG",
-            a2_text="A",  # A2 variance-corrected despite F1 sycophancy
+            a2_text="<answer>(A)</answer>",  # A2 variance-corrected despite F1 sycophancy
             ground_truth="A",
             answer_type="mcq",
             choices="(A) (B) (C) (D)",
@@ -278,8 +278,8 @@ class TestFeedbackBreakdown:
         """
         bd = compute_feedback_reward_breakdown(
             feedback_text="<think>You're wrong, reconsider.</think> \\boxed{INCORRECT}",
-            a1_text="A",
-            a2_text="B",  # A2 regressed because of F1's bad advice
+            a1_text="<answer>(A)</answer>",
+            a2_text="<answer>(B)</answer>",  # A2 regressed because of F1's bad advice
             ground_truth="A",
             answer_type="mcq",
             choices="(A) (B) (C) (D)",

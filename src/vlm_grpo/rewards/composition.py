@@ -199,11 +199,23 @@ class TrajectoryFeedbackRewardBreakdown:
         total_reward: Weighted sum of feedback components
         components: Dict mapping component name to raw reward value
         weighted_components: Dict mapping component name to weighted value
+        liberal_a1_correct: Diagnostic field. Set to the value of
+            ``verify_answer(a1_text, ..., strict=False).is_correct`` —
+            the LIBERAL judgement of A1 correctness (extracts answer
+            letters from prose, no tag required). The reward itself uses
+            the STRICT judgement (``strict=True``); this field exists so
+            the metrics aggregator can emit a
+            ``sr/strict_liberal_a1_disagree_rate`` wandb signal without
+            re-running the verifier. ``None`` when the breakdown was
+            built via a path that doesn't carry the diagnostic
+            (e.g. the empty/stub breakdown for the single-turn A1
+            baseline path).
     """
 
     total_reward: float
     components: dict[str, float]
     weighted_components: dict[str, float]
+    liberal_a1_correct: bool | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -450,11 +462,18 @@ def compute_feedback_reward_breakdown(
     Returns:
         TrajectoryFeedbackRewardBreakdown with all component scores
     """
-    # Verify A1 and A2 ONCE (downstream needs both)
-    a1_result = verify_answer(a1_text, ground_truth, answer_type)
-    a2_result = verify_answer(a2_text, ground_truth, answer_type)
+    # Verify A1 and A2 ONCE (downstream needs both).
+    # ``strict=True`` matches the response-side contract: missing or malformed
+    # ``<answer>`` tag → empty extraction → wrong. F1's verification reward is
+    # then checked against the SAME A1 truth the response head sees, removing
+    # the strict/non-strict signal asymmetry between the two heads.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=True)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type, strict=True)
     a1_correct = a1_result.is_correct
     a2_correct = a2_result.is_correct
+    # Diagnostic: also run the liberal extractor so the metrics aggregator
+    # can log how often the two criteria disagree on the same A1 text.
+    liberal_a1_correct = verify_answer(a1_text, ground_truth, answer_type).is_correct
 
     # No short-circuit on missing F1 format tags. Missing `\boxed{}` is
     # handled naturally:
@@ -534,6 +553,7 @@ def compute_feedback_reward_breakdown(
         total_reward=total_reward,
         components=components,
         weighted_components=weighted_components,
+        liberal_a1_correct=liberal_a1_correct,
     )
 
 
@@ -774,8 +794,12 @@ def compute_pag_feedback_breakdown(
         ``TrajectoryFeedbackRewardBreakdown`` with the binary verification +
         format components and ``downstream`` recorded as 0.0 for logging.
     """
-    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    # ``strict=True`` matches the response-side contract so F1's verification
+    # reward is anchored to the same A1 truth the response head sees.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=True)
     a1_correct = a1_result.is_correct
+    # Diagnostic: liberal extractor's view of A1 for the divergence metric.
+    liberal_a1_correct = verify_answer(a1_text, ground_truth, answer_type).is_correct
 
     # Binary verification reward: 1 if F1's boxed verdict matches A1's truth.
     r_verification_pm = compute_verification_accuracy_reward(feedback_text, a1_correct)
@@ -804,6 +828,7 @@ def compute_pag_feedback_breakdown(
         total_reward=total_reward,
         components=components,
         weighted_components=weighted_components,
+        liberal_a1_correct=liberal_a1_correct,
     )
 
 
@@ -978,8 +1003,10 @@ def compute_downstream_01(
         # K-group baseline still varies meaningfully.
         return _to_unit(0.0, _DOWNSTREAM_DET_RANGE[0], _DOWNSTREAM_DET_RANGE[1])
 
-    a1_result = verify_answer(a1_text, ground_truth, answer_type, tolerance=tolerance)
-    a2_result = verify_answer(a2_text, ground_truth, answer_type, tolerance=tolerance)
+    # ``strict=True`` matches the response-side contract (see
+    # ``compute_response_reward_breakdown``): missing ``<answer>`` tag → wrong.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, tolerance=tolerance, strict=True)
+    a2_result = verify_answer(a2_text, ground_truth, answer_type, tolerance=tolerance, strict=True)
     a1_correct = a1_result.is_correct
     a2_correct = a2_result.is_correct
 
@@ -1160,8 +1187,12 @@ def compute_feedback_reward_breakdown_01(
         ``TrajectoryFeedbackRewardBreakdown`` with each ``components[k]`` in
         [0, 1] and ``weighted_components[k] = weight_k × component_k``.
     """
-    a1_result = verify_answer(a1_text, ground_truth, answer_type)
+    # ``strict=True`` matches the baseline response-side contract so F1's
+    # verification reward sees the same A1 truth as the response head.
+    a1_result = verify_answer(a1_text, ground_truth, answer_type, strict=True)
     a1_correct = a1_result.is_correct
+    # Diagnostic: liberal extractor's view of A1 for the divergence metric.
+    liberal_a1_correct = verify_answer(a1_text, ground_truth, answer_type).is_correct
 
     r_verification = compute_verification_01(feedback_text, a1_correct)
     r_fb_format = compute_fb_format_01(feedback_text)
@@ -1208,4 +1239,5 @@ def compute_feedback_reward_breakdown_01(
         total_reward=total_reward,
         components=components,
         weighted_components=weighted_components,
+        liberal_a1_correct=liberal_a1_correct,
     )

@@ -82,29 +82,29 @@ def test_downstream_01_mcq_transitions():
     f1_incorrect = "<think>off</think>\\boxed{INCORRECT}"
     rr = compute_downstream_01(
         feedback_text=f1_correct,
-        a1_text="(A)",
-        a2_text="(A)",
+        a1_text="<answer>(A)</answer>",
+        a2_text="<answer>(A)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
     )
     rw = compute_downstream_01(
         feedback_text=f1_incorrect,
-        a1_text="(A)",
-        a2_text="(B)",
+        a1_text="<answer>(A)</answer>",
+        a2_text="<answer>(B)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
     )
     wr = compute_downstream_01(
         feedback_text=f1_incorrect,
-        a1_text="(B)",
-        a2_text="(A)",
+        a1_text="<answer>(B)</answer>",
+        a2_text="<answer>(A)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
     )
     ww = compute_downstream_01(
         feedback_text=f1_incorrect,
-        a1_text="(B)",
-        a2_text="(C)",
+        a1_text="<answer>(B)</answer>",
+        a2_text="<answer>(C)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
     )
@@ -122,8 +122,8 @@ def test_downstream_01_empty_feedback():
     """Empty F1 → mid of deterministic range (raw=0 rescaled)."""
     val = compute_downstream_01(
         feedback_text="",
-        a1_text="(A)",
-        a2_text="(A)",
+        a1_text="<answer>(A)</answer>",
+        a2_text="<answer>(A)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
     )
@@ -241,8 +241,8 @@ def test_feedback_breakdown_01_max_total_is_one():
     f1 = "<think>The answer is (A) which matches.</think>\nVerdict: \\boxed{CORRECT}"
     bd = compute_feedback_reward_breakdown_01(
         feedback_text=f1,
-        a1_text="(A)",
-        a2_text="(A)",
+        a1_text="<answer>(A)</answer>",
+        a2_text="<answer>(A)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
         choices="",
@@ -265,8 +265,8 @@ def test_feedback_breakdown_01_worst_case_zero():
     weights = FeedbackRewardWeights()
     bd = compute_feedback_reward_breakdown_01(
         feedback_text="",
-        a1_text="(B)",
-        a2_text="(C)",
+        a1_text="<answer>(B)</answer>",
+        a2_text="<answer>(C)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
         choices="",
@@ -290,8 +290,8 @@ def test_feedback_breakdown_01_asymmetric_gate():
     f1 = "<think>looks right</think>\\boxed{CORRECT}"
     bd = compute_feedback_reward_breakdown_01(
         feedback_text=f1,
-        a1_text="(B)",  # wrong
-        a2_text="(A)",  # right (WR)
+        a1_text="<answer>(B)</answer>",  # wrong
+        a2_text="<answer>(A)</answer>",  # right (WR)
         ground_truth="(A)",
         answer_type="mcq",
         choices="",
@@ -339,8 +339,8 @@ def test_raw_feedback_breakdown_unchanged():
     f1 = "<think>checks</think>\nVerdict: \\boxed{CORRECT}"
     bd = compute_feedback_reward_breakdown(
         feedback_text=f1,
-        a1_text="(A)",
-        a2_text="(A)",
+        a1_text="<answer>(A)</answer>",
+        a2_text="<answer>(A)</answer>",
         ground_truth="(A)",
         answer_type="mcq",
         choices="",
