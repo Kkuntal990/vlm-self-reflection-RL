@@ -389,12 +389,29 @@ class TestPatternAStructure:
         assert all(m["role"] != "system" for m in msgs)
 
     def test_a2_embeds_prior_context_in_user(self) -> None:
+        # Pass a properly-formatted F1 text so verdict extraction lands.
+        f1 = "<think>The candidate is wrong; the color appears brown.</think>\n\\boxed{INCORRECT}"
+        msgs = build_refiner_prompt("What color?", "Blue", f1)
+        text = msgs[0]["content"][-1]["text"]
+        assert "Question: What color?" in text
+        assert "Your previous answer: Blue" in text
+        # Verdict is now hoisted to its own line, not buried inside a
+        # "Feedback on your previous answer:" block.
+        assert "Verifier verdict: \\boxed{INCORRECT}" in text
+        assert "Verifier reasoning:" in text
+        assert THINK_ANSWER_INSTRUCTION in text
+
+    def test_a2_malformed_f1_falls_back_to_raw_text(self) -> None:
+        # F1 with no boxed verdict — A2 should still get the raw text so no
+        # information is lost.
         msgs = build_refiner_prompt("What color?", "Blue", "INCORRECT. Brown.")
         text = msgs[0]["content"][-1]["text"]
         assert "Question: What color?" in text
         assert "Your previous answer: Blue" in text
-        assert "Feedback on your previous answer: INCORRECT. Brown." in text
-        assert THINK_ANSWER_INSTRUCTION in text
+        # Verdict line falls back to MALFORMED when no \boxed{} found.
+        assert "Verifier verdict: \\boxed{MALFORMED}" in text
+        # Raw F1 text appears as the reasoning (no \boxed found, no <think> found).
+        assert "INCORRECT. Brown." in text
 
 
 class TestCompletionAppend:

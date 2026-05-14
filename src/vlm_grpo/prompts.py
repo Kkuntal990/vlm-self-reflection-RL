@@ -36,6 +36,7 @@ Usage:
 """
 
 import os
+import re
 
 
 def _prompt_from_env(env_var: str, default: str) -> str:
@@ -72,6 +73,59 @@ F1_VERIFIER_INSTRUCTION = _prompt_from_env(
     "<think> </think> tags. The final verdict MUST BE put in \\boxed{} as "
     "either CORRECT or INCORRECT.",
 )
+
+# F1 role prefix prepended to the critic user message. Empty default keeps
+# legacy YAMLs unchanged; new YAMLs set this env var explicitly to engage
+# the verifier-role framing (literature: PAG arXiv:2506.10406 "model
+# collapse" mitigation via role separation; Critic-V arXiv:2411.18203).
+F1_ROLE_PREFIX = _prompt_from_env("F1_ROLE_PREFIX", "")
+
+# A2 role prefix prepended to the refiner user message. Same role-isolation
+# rationale as F1_ROLE_PREFIX. Empty default = legacy behaviour.
+A2_ROLE_PREFIX = _prompt_from_env("A2_ROLE_PREFIX", "")
+
+# A2 reviser instruction text (appears AFTER the verdict-hoisted feedback
+# block and BEFORE THINK_ANSWER_INSTRUCTION). Defaults to the legacy
+# permissive wording; new YAMLs override with deterministic "re-examine
+# independently" wording for both selective-revision and no-gate variants.
+A2_REVISER_INSTRUCTION = _prompt_from_env(
+    "A2_REVISER_INSTRUCTION",
+    "Re-examine the image and either correct your answer or keep it if you believe it is right.",
+)
+
+
+# =============================================================================
+# F1 verdict extraction (used by A2 prompt builder to hoist verdict to top)
+# =============================================================================
+
+_BOXED_VERDICT_RE = re.compile(r"\\boxed\{\s*(CORRECT|INCORRECT)\s*\}", re.IGNORECASE)
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def extract_f1_verdict_and_reasoning(feedback_text: str) -> tuple[str, str]:
+    """Extract the F1 verdict and reasoning from raw F1 text.
+
+    The F1 model emits free-form text that ends with `\\boxed{CORRECT}` or
+    `\\boxed{INCORRECT}` after a `<think>...</think>` block. To make the
+    verdict salient to the A2 refiner (literature: Huang 2023 arXiv:2310.01798,
+    Kamoi TACL 2024 arXiv:2406.01297 identify feedback salience as the
+    refiner-side bottleneck), we extract both pieces and hoist them.
+
+    Args:
+        feedback_text: Raw F1 text as emitted by the model.
+
+    Returns:
+        ``(verdict, reasoning)`` where ``verdict`` is one of
+        ``"CORRECT"`` / ``"INCORRECT"`` / ``"MALFORMED"`` (case preserved
+        as uppercase) and ``reasoning`` is the contents of the first
+        ``<think>...</think>`` block, or the full feedback text if no
+        ``<think>`` block is found.
+    """
+    m = _BOXED_VERDICT_RE.search(feedback_text)
+    verdict = m.group(1).upper() if m else "MALFORMED"
+    t = _THINK_BLOCK_RE.search(feedback_text)
+    reasoning = t.group(1).strip() if t else feedback_text.strip()
+    return verdict, reasoning
 
 
 # =============================================================================
@@ -145,6 +199,10 @@ def build_critic_prompt(
     user message (per LLaVA-Critic-R1, LLaVA-Critic, Volcano, Critic-V,
     Critique-GRPO, CriticGPT convention).
 
+    When ``F1_ROLE_PREFIX`` env var is set, the role-prefix string is
+    prepended to the user message to combat the same-weight in-loop role
+    confusion documented in PAG (arXiv:2506.10406 "model collapse").
+
     Args:
         question: The visual question (cleaned, no <image> tag)
         answer1: The initial answer to verify
@@ -156,8 +214,17 @@ def build_critic_prompt(
     Returns:
         One-element message list containing a single user turn.
     """
-    text = f"Question: {question}\nCandidate answer: {answer1}\n\n{F1_VERIFIER_INSTRUCTION}"
-    return _user_message_with_image(text)
+    parts: list[str] = []
+    if F1_ROLE_PREFIX:
+        parts.append(F1_ROLE_PREFIX)
+    parts.extend(
+        [
+            f"Question: {question}",
+            f"Candidate answer: {answer1}",
+            F1_VERIFIER_INSTRUCTION,
+        ]
+    )
+    return _user_message_with_image("\n\n".join(parts))
 
 
 def build_refiner_prompt(
@@ -174,23 +241,39 @@ def build_refiner_prompt(
     Critique-GRPO's refinement template (arXiv:2506.03106) and avoids the
     stacked-conversation tag-leakage pathway.
 
+    The F1 verdict (``\\boxed{CORRECT|INCORRECT}``) and reasoning are
+    extracted from ``feedback1`` and hoisted to the top of the feedback
+    block. This makes the verdict salient to the refiner (literature: Huang
+    2023 arXiv:2310.01798, Kamoi TACL 2024 arXiv:2406.01297). When the
+    F1 text is malformed (no ``\\boxed{}`` parseable), the full raw F1
+    text is shown as the reasoning (legacy fallback).
+
+    When ``A2_ROLE_PREFIX`` env var is set, the role-prefix string is
+    prepended (role-isolation per PAG arXiv:2506.10406).
+    ``A2_REVISER_INSTRUCTION`` overrides the default "either correct or
+    keep" wording — new variants set it to a deterministic "independently
+    determine" wording that works for both selective-revision (gate ON)
+    and no-gate setups.
+
     Args:
         question: The visual question (cleaned, no <image> tag)
         answer1: The initial answer being refined
-        feedback1: Raw feedback text (passed as-is)
+        feedback1: Raw F1 text (verdict + reasoning extracted internally)
         answer_type: Expected answer type (unused, kept for API compat)
         choices: Optional MCQ choices (unused, kept for API compat)
 
     Returns:
         One-element message list containing a single user turn.
     """
-    parts = [
-        f"Question: {question}",
-        f"Your previous answer: {answer1}",
-        f"Feedback on your previous answer: {feedback1}",
-        "Re-examine the image and either correct your answer or keep "
-        "it if you believe it is right. " + THINK_ANSWER_INSTRUCTION,
-    ]
+    verdict, reasoning = extract_f1_verdict_and_reasoning(feedback1)
+    parts: list[str] = []
+    if A2_ROLE_PREFIX:
+        parts.append(A2_ROLE_PREFIX)
+    parts.append(f"Question: {question}")
+    parts.append(f"Verifier verdict: \\boxed{{{verdict}}}")
+    parts.append(f"Verifier reasoning: {reasoning}")
+    parts.append(f"Your previous answer: {answer1}")
+    parts.append(A2_REVISER_INSTRUCTION + " " + THINK_ANSWER_INSTRUCTION)
     return _user_message_with_image("\n\n".join(parts))
 
 
