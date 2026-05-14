@@ -82,6 +82,20 @@ class VLLMRolloutEngine:
                 ``max_model_len`` so chunked prefill does not engage for any
                 in-budget prompt.
         """
+        # Apply the vLLM 0.12.x sleep-mode fragmentation backport BEFORE
+        # importing LLM. The patch removes the hard assert against
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in
+        # CuMemAllocator.__init__ and wraps use_memory_pool to toggle
+        # expandable_segments off only inside the cumem pool context.
+        # Mirrors vLLM PR #40812 (which shipped in 0.20.1; we can't bump
+        # there without rebuilding the docker image on CUDA 13).
+        #
+        # No-op on vLLM 0.20.1+ (detected via source-string match) and
+        # opt-out-able via VLM_GRPO_DISABLE_VLLM_CUMEM_PATCH=1.
+        from vlm_grpo._vllm_cumem_patch import apply as _apply_cumem_patch
+
+        _apply_cumem_patch()
+
         from vllm import LLM
 
         # Required for external_launcher mode -- prevents vLLM from spawning

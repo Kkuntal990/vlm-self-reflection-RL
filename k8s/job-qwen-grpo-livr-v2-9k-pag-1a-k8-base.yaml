@@ -291,8 +291,17 @@ spec:
 
         - name: PYTHONUNBUFFERED
           value: "1"
+        # Enable PyTorch's expandable_segments allocator. Required to
+        # actually benefit from the vLLM PR #40812 backport applied at
+        # process start (src/vlm_grpo/_vllm_cumem_patch.py). Without
+        # this env var the patch is a no-op — the cumem pool toggle
+        # only does something when expandable_segments is enabled
+        # outside the pool. With both in place, PyTorch's outer
+        # caching allocator can grow / coalesce regions across
+        # sleep/wake cycles so cumem fragmentation no longer creeps
+        # upward step-by-step.
         - name: PYTORCH_CUDA_ALLOC_CONF
-          value: ""
+          value: "expandable_segments:True"
         - name: NCCL_TIMEOUT
           value: "1800"
         - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
