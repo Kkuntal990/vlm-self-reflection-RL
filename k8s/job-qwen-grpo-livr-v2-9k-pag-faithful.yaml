@@ -196,13 +196,13 @@ spec:
         - name: MAX_SAMPLES
           value: "0"
         - name: MAX_COMPLETION_LENGTH
-          value: "386"
+          value: "512"
         - name: A1_MAX_COMPLETION
-          value: "386"
+          value: "512"
         - name: F1_MAX_COMPLETION
-          value: "386"
+          value: "512"
         - name: A2_MAX_COMPLETION
-          value: "386"
+          value: "512"
         - name: TEMPERATURE
           value: "1.0"
         - name: FEEDBACK_TEMPERATURE
@@ -231,12 +231,13 @@ spec:
           value: "128"
 
         - name: VLLM_GPU_MEM
-          # Lowered from 0.40 after step-17 OOM at cumem_allocator.cpp:112
-          # (vLLM 0.12 known issue: repeated sleep/wake cycles fragment the
-          # KV cache pool over many hundreds of cycles; 0.30 gives more
-          # headroom for the fragmentation cushion). Each turn is 3 wakes
-          # × 17 steps × 4 ranks ≈ 200+ cycles before the previous crash.
-          value: "0.30"
+          # 0.30 was the prior tight-fit value; with the audit landed (Bug #1
+          # temperature divisor + single-adapter r=64 on F1 backward + 512-tok
+          # completions) memory pressure rose ~1.5 GiB above what 0.30 fit.
+          # 0.25 frees ~4 GiB for training; vLLM still has 20 GB for KV cache.
+          # NOTE: do NOT switch to PYTORCH_ALLOC_CONF=expandable_segments:True
+          # — incompatible with vLLM sleep-mode (commit eefeb7c, c65eeb8).
+          value: "0.25"
         - name: GIT_BRANCH
           value: "grpo-kl-ref-fix"
 
