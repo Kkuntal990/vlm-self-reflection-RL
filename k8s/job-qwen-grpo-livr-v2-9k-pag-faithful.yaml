@@ -214,10 +214,16 @@ spec:
           value: "1e-5"
         - name: LR_WARMUP_STEPS
           value: "56"
+        # batch=1, grad_acc=16 → effective batch = 1×16×4 = 64 (unchanged).
+        # Halving per-device micro-batch frees ~50% of activation memory at
+        # backward peak — needed after 512-tok completions + single-adapter
+        # r=64 on F1 + Bug #1 temperature divisor pushed the prior batch=2
+        # config over the OOM cliff (~670 MiB short at VLLM_GPU_MEM=0.25).
+        # Per-step wallclock ~15% slower since vLLM rollout dominates anyway.
         - name: BATCH_SIZE
-          value: "2"
+          value: "1"
         - name: GRAD_ACC
-          value: "8"
+          value: "16"
         - name: EPOCHS
           value: "1"
         - name: NUM_GPUS
