@@ -361,14 +361,17 @@ def parse_args() -> argparse.Namespace:
         "--ref_model_init_from_checkpoint",
         type=str,
         default="",
-        help="Path to checkpoint dir whose LoRA adapter weights are merged into a "
-        "second frozen copy of the base model, used as the KL reference distribution. "
-        "When set, the trainer's per-turn KL anchors against THIS checkpoint instead "
-        "of the raw base model. Required whenever you initialize a trainable adapter "
-        "from a checkpoint (e.g. baseline-A1 ckpt-1000 as the starting point for "
-        "frozen-a1-mt runs) — otherwise the default ``disable_adapter_layers()`` ref "
-        "path anchors to the raw base model and pulls A1 away from the init "
-        "distribution. Costs one extra forward-pass model copy on each rank.",
+        help="Path to checkpoint dir whose LoRA adapter weights are loaded as a "
+        "FROZEN second adapter (name='kl_ref') on the policy model, used as the KL "
+        "reference distribution. The trainer swaps to this adapter before each KL "
+        "ref forward and restores the previous active adapter after. Base weights "
+        "are shared with the policy — per-rank memory cost is one extra LoRA "
+        "(~50 MB) instead of a full 7B base (~15 GB). Required whenever you "
+        "initialize the trainable adapter from a checkpoint (e.g. baseline-A1 "
+        "ckpt-1000) — otherwise the ``disable_adapter_layers()`` ref path anchors "
+        "to the raw base model and pulls A1 away from its init distribution. "
+        "Prior behaviour (load a second full base) was rolled back here for the "
+        "memory regression it caused — see commit history for details.",
     )
 
     # Multi-adapter routing
@@ -856,49 +859,61 @@ def main() -> None:
             )
             accelerator.wait_for_everyone()
 
-    # Load frozen KL reference model (separate copy of base + checkpoint LoRA merged in).
+    # Load the KL reference adapter as a frozen second LoRA on the POLICY
+    # model. Replaces the prior duplicate-base-model approach (commit b4ea57a),
+    # which fixed the KL semantics but cost ~15 GB / rank — once layered with
+    # the single-adapter pivot (r=64), the max_completion 386→512 bump, and the
+    # Bug #1 logits-tensor allocation, A100 80GB ran out of room for the
+    # original batch=2, max_completion=386 working config.
     #
-    # Without this, the trainer's KL-ref pass falls back to
-    # ``unwrapped_model.disable_adapter_layers()`` (see critic_grpo.py:1331), which
-    # produces RAW BASE MODEL log-probs as the KL target — wrong whenever the
-    # trainable adapter was initialized from a checkpoint (e.g. baseline-A1
-    # ckpt-1000). A1 then drifts from its init distribution toward the raw base
-    # model, dragging A2 with it through the shared LoRA. See the KL-audit notes
-    # in the experiments log for the full diagnosis.
+    # New behaviour: ``model.load_adapter(ckpt, "kl_ref", is_trainable=False)``
+    # adds a frozen second LoRA. Base weights are shared with the policy.
+    # The trainer swaps to "kl_ref" before each KL forward and restores the
+    # previous active adapter on exit. Per-rank cost: ~50 MB.
+    #
+    # Without this flag, the trainer's KL-ref path falls back to
+    # ``unwrapped_model.disable_adapter_layers()``, which produces RAW BASE
+    # MODEL log-probs as the KL target — wrong whenever the trainable adapter
+    # was initialized from a checkpoint (baseline-A1 ckpt-1000), pulling A1
+    # away from its init distribution.
     ref_model: object | None = None
+    kl_ref_adapter_name: str | None = None
     if args.ref_model_init_from_checkpoint:
         logger.info(
-            f"Loading frozen KL reference model: base={args.model_id}, "
-            f"LoRA={args.ref_model_init_from_checkpoint} (will be merged into base)."
+            "Loading frozen KL reference adapter on the policy model: "
+            f"LoRA={args.ref_model_init_from_checkpoint} → adapter name 'kl_ref' "
+            "(shared base, frozen)."
         )
-        from peft import PeftModel
-
-        if model_type == "qwen2vl":
-            ref_base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                args.model_id,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="sdpa",
-            ).to(accelerator.device)
-        else:
-            from transformers import AutoModelForVision2Seq
-
-            ref_base = AutoModelForVision2Seq.from_pretrained(
-                args.model_id,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="sdpa",
-            ).to(accelerator.device)
-
-        ref_with_lora = PeftModel.from_pretrained(
-            ref_base,
+        # ``load_adapter`` adds the adapter without changing the active one,
+        # so the policy adapter (default / "shared" / "response") stays
+        # active and trainable. ``is_trainable=False`` sets the kl_ref params
+        # to ``requires_grad=False`` at load time; PEFT's ``set_adapter``
+        # may flip the flag transiently when we activate kl_ref for the
+        # ref forward, but that forward runs inside ``torch.no_grad()`` so
+        # no gradient accumulates. Switching back to the policy adapter
+        # restores ``requires_grad=False`` on kl_ref.
+        model.load_adapter(
             args.ref_model_init_from_checkpoint,
+            adapter_name="kl_ref",
             is_trainable=False,
         )
-        ref_model = ref_with_lora.merge_and_unload()
-        for p in ref_model.parameters():
-            p.requires_grad = False
-        ref_model.eval()
+        kl_ref_adapter_name = "kl_ref"
+        # Surface the choice on the config so the trainer's ref-forward
+        # dispatch picks the adapter-swap branch (see
+        # ``SelfReflectionGRPOTrainer.kl_ref_adapter_name``).
+        config.kl_ref_adapter_name = kl_ref_adapter_name
+        # Defensive: force requires_grad=False on every kl_ref LoRA param
+        # in case PEFT's load_adapter ever returns with them trainable.
+        n_frozen = 0
+        for name, p in model.named_parameters():
+            if ".lora_A.kl_ref." in name or ".lora_B.kl_ref." in name:
+                if p.requires_grad:
+                    p.requires_grad = False
+                n_frozen += 1
         logger.info(
-            "Frozen KL reference model ready (LoRA merged; all params requires_grad=False)."
+            f"KL reference adapter 'kl_ref' loaded ({n_frozen} LoRA params, "
+            "all frozen). Memory cost: ~50 MB / rank vs. ~15 GB for the prior "
+            "duplicate-base approach."
         )
 
         if accelerator.num_processes > 1:

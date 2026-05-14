@@ -497,6 +497,16 @@ class SelfReflectionConfig:
     a1_kl_coeff: float = 1.0
     a2_kl_coeff: float = 1.0
     fb_kl_coeff: float = 1.0
+    # Name of a frozen LoRA adapter on the POLICY model used as the KL
+    # reference distribution. When set, the trainer swaps to this adapter
+    # before each KL ref forward and restores the previous adapter after.
+    # The base weights are shared with the policy, so the per-rank memory
+    # cost is one extra LoRA (~50 MB) instead of a full 7B base (~15 GB).
+    # Loaded from train_self_reflection.py via PEFT's ``load_adapter``.
+    # Mutually exclusive with the legacy ``ref_model`` argument passed to
+    # ``SelfReflectionGRPOTrainer.__init__``; the trainer asserts at most
+    # one is set.
+    kl_ref_adapter_name: str | None = None
     separate_turn_loss: bool = False
     # DAPO Dynamic Sampling (arXiv:2503.14476 §3.2): drop K-groups whose
     # rewards are zero-variance (advantage=0, gradient=0). The policy update

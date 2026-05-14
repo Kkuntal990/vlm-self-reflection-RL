@@ -392,6 +392,17 @@ class SelfReflectionGRPOTrainer:
 
         self.model = model
         self.ref_model = ref_model
+        # Name of a frozen LoRA adapter on the policy model to use as KL
+        # reference. When non-None, ref forwards swap to this adapter
+        # instead of running through a separate ``ref_model`` copy of the
+        # base. Mutually exclusive with ``ref_model``.
+        self.kl_ref_adapter_name: str | None = getattr(config, "kl_ref_adapter_name", None)
+        if self.ref_model is not None and self.kl_ref_adapter_name is not None:
+            raise ValueError(
+                "ref_model and kl_ref_adapter_name are mutually exclusive — "
+                "pick one. The shared-base adapter path "
+                "(kl_ref_adapter_name) is preferred."
+            )
         self.processor = processor
         self.config = config
         self.accelerator = accelerator
@@ -1427,15 +1438,36 @@ class SelfReflectionGRPOTrainer:
                         old_fb_lps_list += fb_lps
 
             # Ref log-probs: only needed when kl_coeff > 0.
-            # Three cases:
-            #   1. separate ref_model provided: use it directly (non-PEFT path).
-            #   2. otherwise: disable adapter layers; KL anchors against base model.
-            # The adapter state MUST be restored to enabled before leaving this
-            # block — downstream code (training forward, vLLM sync, checkpoint
-            # save) assumes "default" is active.
+            # Three cases, checked in this priority order:
+            #   1. ``kl_ref_adapter_name`` is set: a frozen LoRA adapter on
+            #      the POLICY model carries the ref distribution. Swap to it
+            #      before the forward and restore the previous active
+            #      adapter after. Shares the base model with the policy →
+            #      ~15 GB / rank saved vs. a duplicate base.
+            #   2. ``ref_model`` is provided: use it directly (legacy
+            #      duplicate-base path, kept for non-PEFT setups).
+            #   3. otherwise: disable adapter layers on the policy; KL
+            #      anchors against the RAW BASE distribution (no init
+            #      checkpoint signal).
+            # The adapter state MUST be restored before leaving this block —
+            # downstream code (training forward, vLLM sync, checkpoint save)
+            # assumes the policy adapter is active.
             if self.config.kl_coeff > 0:
-                if self.ref_model is None:
+                prev_active_for_kl_ref: list[str] | None = None
+                used_disable_adapters = False
+                if self.kl_ref_adapter_name is not None:
+                    active = getattr(unwrapped_model, "active_adapters", None)
+                    if isinstance(active, list):
+                        prev_active_for_kl_ref = list(active)
+                    elif isinstance(active, str):
+                        prev_active_for_kl_ref = [active]
+                    else:
+                        prev_active_for_kl_ref = ["default"]
+                    self._set_active_adapter(unwrapped_model, self.kl_ref_adapter_name)
+                    ref_m = unwrapped_model
+                elif self.ref_model is None:
                     unwrapped_model.disable_adapter_layers()
+                    used_disable_adapters = True
                     ref_m = unwrapped_model
                 else:
                     ref_m = self.ref_model
@@ -1456,8 +1488,21 @@ class SelfReflectionGRPOTrainer:
                             ref_a2_lps_list += a2_lps
                             ref_fb_lps_list += fb_lps
                 finally:
-                    if self.ref_model is None:
+                    if used_disable_adapters:
                         unwrapped_model.enable_adapter_layers()
+                    elif prev_active_for_kl_ref is not None:
+                        # Restore whichever adapter was active before the
+                        # KL ref swap. In single-adapter mode this is
+                        # "default"; in multi-adapter mode it's whatever
+                        # the per-turn router last set.
+                        if len(prev_active_for_kl_ref) == 1:
+                            self._set_active_adapter(unwrapped_model, prev_active_for_kl_ref[0])
+                        else:
+                            # PEFT supports a list of active adapters;
+                            # restore them all via set_adapter.
+                            unwrapped_model.set_adapter(prev_active_for_kl_ref)
+                            if self._routing.enabled:
+                                self._enforce_trainable_grad_flags(unwrapped_model)
 
             # Per-token log-probs: keep as lists of variable-length tensors.
             if single_turn_a1:
@@ -2023,9 +2068,7 @@ class SelfReflectionGRPOTrainer:
             else:
                 a2_sum_local = float(a2_rewards_t.sum().item())
                 a2_count_local = float(a2_rewards_t.numel())
-            a2_reward_global = (
-                a2_sum_local / a2_count_local if a2_count_local > 0 else float("nan")
-            )
+            a2_reward_global = a2_sum_local / a2_count_local if a2_count_local > 0 else float("nan")
         else:
             a1_reward_global = float("nan")
             a2_reward_global = float("nan")
@@ -2057,9 +2100,7 @@ class SelfReflectionGRPOTrainer:
                 a2_sum_global = float(vals[3].item())
                 a2_count_global = float(vals[4].item())
                 a2_reward_global = (
-                    a2_sum_global / a2_count_global
-                    if a2_count_global > 0
-                    else float("nan")
+                    a2_sum_global / a2_count_global if a2_count_global > 0 else float("nan")
                 )
 
         return SelfReflectionTrainStepResult(

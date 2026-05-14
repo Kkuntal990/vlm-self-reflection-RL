@@ -57,6 +57,7 @@ class VLLMRolloutEngine:
         tensor_parallel_size: int = 1,
         enforce_eager: bool = True,
         seed: int = 0,
+        max_num_batched_tokens: int | None = None,
     ) -> None:
         """Initialize the vLLM rollout engine.
 
@@ -72,6 +73,14 @@ class VLLMRolloutEngine:
             tensor_parallel_size: Number of GPUs for tensor parallelism
             enforce_eager: Disable CUDA graphs to save memory
             seed: Random seed for sampling (use process rank for diversity)
+            max_num_batched_tokens: vLLM scheduler batched-prefill budget. When
+                a single prompt exceeds this, chunked prefill engages, which
+                has been observed to drop per-step logprob dicts for tokens in
+                intermediate chunks (the sampled-token key may be absent),
+                triggering the ``0.0`` sentinel in ``generate_batch`` and
+                biasing the PPO ratio. Default ``None`` resolves to
+                ``max_model_len`` so chunked prefill does not engage for any
+                in-budget prompt.
         """
         from vllm import LLM
 
@@ -85,6 +94,12 @@ class VLLMRolloutEngine:
         self.processor = processor
         self.model_id = model_id
         self.gpu_memory_utilization = gpu_memory_utilization
+        # Counters exposed for wandb logging in the trainer. Reset by callers.
+        self.logprob_sentinel_count: int = 0
+        self.logprob_token_count: int = 0
+
+        if max_num_batched_tokens is None:
+            max_num_batched_tokens = max_model_len
 
         logger.info(f"Initializing vLLM engine (sleep mode enabled): {model_id}")
         self.llm = LLM(
@@ -102,12 +117,14 @@ class VLLMRolloutEngine:
             enable_sleep_mode=True,
             dtype="bfloat16",
             seed=seed,
-            max_num_batched_tokens=4096,
+            max_num_batched_tokens=max_num_batched_tokens,
             mm_processor_cache_gb=0,
         )
         logger.info(
             f"vLLM engine ready: gpu_mem={gpu_memory_utilization}, "
-            f"max_len={max_model_len}, tp={tensor_parallel_size}"
+            f"max_len={max_model_len}, "
+            f"max_batched_tokens={max_num_batched_tokens}, "
+            f"tp={tensor_parallel_size}"
         )
 
     def sleep(self) -> None:
@@ -253,23 +270,33 @@ class VLLMRolloutEngine:
 
         outputs = self.llm.generate(vllm_inputs, sampling_params)
         results: list[dict] = []
+        # Per-call sentinel accounting. The original comment claimed
+        # ``None`` entries "should not occur with logprobs>=1", but in
+        # vLLM 0.12.x with chunked prefill engaged (any prompt longer
+        # than ``max_num_batched_tokens``) the sampled token can be
+        # absent from intermediate-chunk dicts. When that happens the
+        # 0.0 fallback gives ``old_lp = 0`` and biases
+        # ``exp(new_lp - old_lp)`` strongly downward (for typical
+        # new_lp around -2, that is a ~7.4x attenuation of the PPO
+        # surrogate gradient on those tokens). The fallback stays so
+        # the rollout never crashes, but we now (a) count firings and
+        # (b) warn loudly. The accompanying default of
+        # ``max_num_batched_tokens=max_model_len`` should keep this at
+        # zero unless prompts exceed the model's context.
+        sentinel_this_call = 0
+        tokens_this_call = 0
         for out in outputs:
             comp = out.outputs[0]
             token_ids = list(comp.token_ids)
-            # comp.logprobs is list[dict[int, Logprob] | None] aligned with
-            # token_ids. Each dict maps a candidate token id to a Logprob
-            # object with a ``.logprob`` attribute. The sampled token is
-            # guaranteed to be a key (vLLM always includes it). ``None``
-            # entries should not occur with logprobs>=1, but we defend
-            # against them by emitting 0.0 (treated as no-op IS weight by
-            # the trainer's exp(new_lp - old_lp) ratio).
             sampled_logprobs: list[float] = []
             for i, tok_id in enumerate(token_ids):
                 step_lp = comp.logprobs[i] if comp.logprobs is not None else None
                 if step_lp is None or tok_id not in step_lp:
+                    sentinel_this_call += 1
                     sampled_logprobs.append(0.0)
                 else:
                     sampled_logprobs.append(float(step_lp[tok_id].logprob))
+            tokens_this_call += len(token_ids)
             results.append(
                 {
                     "text": comp.text,
@@ -277,4 +304,20 @@ class VLLMRolloutEngine:
                     "logprobs": sampled_logprobs,
                 }
             )
+
+        self.logprob_sentinel_count += sentinel_this_call
+        self.logprob_token_count += tokens_this_call
+
+        if sentinel_this_call > 0:
+            rate = sentinel_this_call / max(tokens_this_call, 1)
+            logger.warning(
+                "vLLM logprob sentinel fired %d / %d completion tokens (%.2f%%). "
+                "old_lp=0.0 biases the PPO ratio. If non-zero in production, "
+                "raise max_num_batched_tokens (currently passed at engine init) "
+                "or investigate why vLLM is dropping sampled-token logprobs.",
+                sentinel_this_call,
+                tokens_this_call,
+                100.0 * rate,
+            )
+
         return results

@@ -183,13 +183,13 @@ spec:
         - name: MAX_SAMPLES
           value: "0"
         - name: MAX_COMPLETION_LENGTH
-          value: "512"
+          value: "384"
         - name: A1_MAX_COMPLETION
-          value: "512"
+          value: "384"
         - name: F1_MAX_COMPLETION
-          value: "512"
+          value: "384"
         - name: A2_MAX_COMPLETION
-          value: "512"
+          value: "384"
         - name: TEMPERATURE
           value: "1.0"
         - name: FEEDBACK_TEMPERATURE
@@ -201,16 +201,16 @@ spec:
           value: "1e-5"
         - name: LR_WARMUP_STEPS
           value: "56"
-        # batch=1, grad_acc=16 → effective batch = 1×16×4 = 64 (unchanged).
-        # Halving per-device micro-batch frees ~50% of activation memory at
-        # backward peak — needed after 512-tok completions + single-adapter
-        # r=64 on F1 + Bug #1 temperature divisor pushed the prior batch=2
-        # config over the OOM cliff (~670 MiB short at VLLM_GPU_MEM=0.25).
-        # Per-step wallclock ~15% slower since vLLM rollout dominates anyway.
+        # batch=2, grad_acc=8 → effective batch = 2×8×4 = 64 (unchanged).
+        # Restored from the batch=1 / grad_acc=16 OOM-mitigation config after
+        # the shared-base KL ref refactor (commit landing this YAML change)
+        # freed ~15 GB / rank that the duplicate-base ref model was holding.
+        # max_completion 512 → 384 also reverted (matches the originally
+        # working config). Mirrors pag-faithful.yaml so the A/B stays paired.
         - name: BATCH_SIZE
-          value: "1"
+          value: "2"
         - name: GRAD_ACC
-          value: "16"
+          value: "8"
         - name: EPOCHS
           value: "1"
         - name: NUM_GPUS
@@ -224,13 +224,17 @@ spec:
           value: "128"
 
         - name: VLLM_GPU_MEM
-          # 0.30 was the prior tight-fit value; with the audit landed (Bug #1
-          # temperature divisor + single-adapter r=64 on F1 backward + 512-tok
-          # completions) memory pressure rose ~1.5 GiB above what 0.30 fit.
-          # 0.25 frees ~4 GiB for training; vLLM still has 20 GB for KV cache.
+          # 0.30 restored after the shared-base KL ref refactor returned
+          # ~15 GB / rank to the training-side budget. The prior 0.25 was an
+          # OOM mitigation when the duplicate-base ref model + 512-tok
+          # completions + r=64 single adapter were all in play simultaneously.
+          # With the ref model now a frozen LoRA (~50 MB) the training side
+          # has the headroom for batch=2 + 384-tok completions at 0.30.
           # NOTE: do NOT switch to PYTORCH_ALLOC_CONF=expandable_segments:True
-          # — incompatible with vLLM sleep-mode (commit eefeb7c, c65eeb8).
-          value: "0.25"
+          # on vLLM 0.12.x — incompatible with sleep-mode CuMemAllocator
+          # (commit eefeb7c, c65eeb8). The fix landed in vLLM 0.20.1 (PR
+          # #40812) and would need a CUDA-13 docker image rebuild to use.
+          value: "0.30"
         - name: GIT_BRANCH
           value: "grpo-kl-ref-fix"
 
